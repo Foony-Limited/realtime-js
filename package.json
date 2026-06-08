@@ -1,0 +1,57 @@
+{
+  "name": "@foony/realtime",
+  "version": "0.0.1",
+  "description": "TypeScript SDK for the Foony Realtime service.",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Foony-Limited/realtime-js.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Foony-Limited/realtime-js/issues"
+  },
+  "homepage": "https://github.com/Foony-Limited/realtime-js#readme",
+  "keywords": [
+    "foony",
+    "realtime",
+    "websocket",
+    "typescript"
+  ],
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "lib",
+    "src/**/*.ts",
+    "!src/**/*.test.ts"
+  ],
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "import": "./lib/index.js"
+    },
+    "./server": {
+      "types": "./lib/server.d.ts",
+      "import": "./lib/server.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "6.0.3",
+    "vitest": "^4.0.14",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
