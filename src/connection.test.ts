@@ -15,7 +15,7 @@ import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
 
 type Harness = {
   readonly server: WebSocketServer;
-  readonly url: string;
+  readonly endpoint: string;
   /** All client connections opened against the fake edge. */
   readonly sockets: NodeWebSocket[];
   readonly authFrames: AuthFrame[];
@@ -80,7 +80,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
     });
   });
-  return { authFrames, server, url: `ws://127.0.0.1:${address.port}`, sockets };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -103,7 +103,7 @@ describe('Connection end-to-end (fake edge)', () => {
 
   it('connects, publishes, and receives the echo', async () => {
     const realtime = new Realtime({
-      url: harness.url,
+      endpoint: harness.endpoint,
       token: 'GOOD',
       autoReconnect: false,
       webSocket: NodeWebSocket as unknown as typeof WebSocket,
@@ -114,35 +114,45 @@ describe('Connection end-to-end (fake edge)', () => {
 
     const channel = realtime.channels.get('chat:1');
     const received: unknown[] = [];
-    channel.subscribe((message) => received.push(message.data));
+    const namedReceived: unknown[] = [];
+    channel.on((message) => received.push(message.data));
+    channel.on('hello', (message) => namedReceived.push(message.data));
+    const nextHello = channel.once('hello');
     await channel.publish('hello', { text: 'world' });
 
     await waitFor(() => received.length === 1, 'message echo');
+    await expect(nextHello).resolves.toMatchObject({ data: { text: 'world' } });
     expect(received[0]).toEqual({ text: 'world' });
+    expect(namedReceived[0]).toEqual({ text: 'world' });
     await realtime.close();
   });
 
   it('drives presence enter/update/leave via the SDK surface', async () => {
     const realtime = new Realtime({
-      url: harness.url,
+      endpoint: harness.endpoint,
       token: 'GOOD',
       autoReconnect: false,
       webSocket: NodeWebSocket as unknown as typeof WebSocket,
     });
     const channel = realtime.channels.get('chat:1');
     const events: string[] = [];
-    channel.presence.subscribe((event) => events.push(event.action));
+    const enterEvents: string[] = [];
+    channel.presence.on((event) => events.push(event.action));
+    channel.presence.on('enter', (event) => enterEvents.push(event.action));
+    const nextLeave = channel.presence.once('leave');
     await channel.presence.enter({ name: 'Alice' });
     await channel.presence.update({ name: 'Alicia' });
     await channel.presence.leave();
     await waitFor(() => events.length === 3, 'presence events');
+    await expect(nextLeave).resolves.toMatchObject({ action: 'leave' });
     expect(events).toEqual(['enter', 'update', 'leave']);
+    expect(enterEvents).toEqual(['enter']);
     await realtime.close();
   });
 
   it('rejects connect when the server sends an auth err frame', async () => {
     const realtime = new Realtime({
-      url: harness.url,
+      endpoint: harness.endpoint,
       token: 'BAD',
       autoReconnect: false,
       webSocket: NodeWebSocket as unknown as typeof WebSocket,
@@ -152,7 +162,7 @@ describe('Connection end-to-end (fake edge)', () => {
 
   it('sends key auth credentials when configured with a Realtime key', async () => {
     const realtime = new Realtime({
-      url: harness.url,
+      endpoint: harness.endpoint,
       key: 'my-app.kid_test:sk_test',
       clientId: 'direct-client',
       autoReconnect: false,
@@ -166,6 +176,77 @@ describe('Connection end-to-end (fake edge)', () => {
     });
     await realtime.close();
   });
+
+  it('uses the default realtime endpoint when endpoint is omitted', async () => {
+    const urls: string[] = [];
+    const realtime = new Realtime({
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: createCapturingWebSocket(urls),
+    });
+
+    await realtime.connect();
+
+    expect(urls).toEqual(['wss://realtime.foony.com']);
+    await realtime.close();
+  });
+
+  it('prefixes schemeless endpoints with wss', async () => {
+    const urls: string[] = [];
+    const realtime = new Realtime({
+      endpoint: 'realtime.example.com',
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: createCapturingWebSocket(urls),
+    });
+
+    await realtime.connect();
+
+    expect(urls).toEqual(['wss://realtime.example.com']);
+    await realtime.close();
+  });
+
+  it('emits connection events through connection.on/off/once', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const allStates: string[] = [];
+    const allOnceStates: string[] = [];
+    const connectedStates: string[] = [];
+    const connectedOnceStates: string[] = [];
+    const removedByOffAllStates: string[] = [];
+    const removedByListenerStates: string[] = [];
+
+    realtime.connection.on((state) => removedByOffAllStates.push(state));
+    realtime.connection.off();
+    const removedListener = (state: string): void => {
+      removedByListenerStates.push(state);
+    };
+    realtime.connection.on(removedListener);
+    realtime.connection.off(removedListener);
+    const offAllStates = realtime.connection.on((state) => allStates.push(state));
+    realtime.connection.once((state) => allOnceStates.push(state));
+    const offConnectedStates = realtime.connection.on('connected', (state) => connectedStates.push(state));
+    realtime.connection.once('connected', (state) => connectedOnceStates.push(state));
+    const connected = realtime.connection.once('connected');
+
+    await realtime.connect();
+
+    await expect(connected).resolves.toEqual({ state: 'connected' });
+    expect(allStates).toEqual(['connecting', 'connected']);
+    expect(allOnceStates).toEqual(['connecting']);
+    expect(connectedStates).toEqual(['connected']);
+    expect(connectedOnceStates).toEqual(['connected']);
+    expect(removedByOffAllStates).toEqual([]);
+    expect(removedByListenerStates).toEqual([]);
+    offAllStates();
+    offConnectedStates();
+    await realtime.close();
+    expect(allStates).toEqual(['connecting', 'connected']);
+  });
 });
 
 /** Poll until `predicate` is true or 2s elapses. */
@@ -176,4 +257,69 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+function createCapturingWebSocket(urls: string[]): typeof WebSocket {
+  type FakeListener = (event: Event) => void;
+
+  class CapturingWebSocket {
+    readyState = 1;
+    private readonly listenersByType = new Map<string, Set<FakeListener>>();
+
+    constructor(url: string | URL) {
+      urls.push(String(url));
+      setTimeout(() => this.dispatch('open', {} as Event), 0);
+    }
+
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+      if (typeof listener !== 'function') {
+        return;
+      }
+      let listeners = this.listenersByType.get(type);
+      if (!listeners) {
+        listeners = new Set();
+        this.listenersByType.set(type, listeners);
+      }
+      listeners.add(listener as FakeListener);
+    }
+
+    removeEventListener(type: string, listener: EventListenerOrEventListenerObject): void {
+      if (typeof listener !== 'function') {
+        return;
+      }
+      this.listenersByType.get(type)?.delete(listener as FakeListener);
+    }
+
+    send(raw: string): void {
+      const frame = JSON.parse(raw) as ClientFrame;
+      if (frame.t !== 'auth') {
+        return;
+      }
+      const connected: ServerFrame = {
+        t: 'connected',
+        connectionId: 'conn-default',
+        keepAliveMs: 30_000,
+        clientId: 'alice',
+      };
+      setTimeout(() => {
+        this.dispatch('message', { data: JSON.stringify(connected) } as MessageEvent);
+      }, 0);
+    }
+
+    close(): void {
+      this.readyState = 3;
+    }
+
+    private dispatch(type: string, event: Event): void {
+      const listeners = this.listenersByType.get(type);
+      if (!listeners) {
+        return;
+      }
+      for (const listener of [...listeners]) {
+        listener(event);
+      }
+    }
+  }
+
+  return CapturingWebSocket as unknown as typeof WebSocket;
 }

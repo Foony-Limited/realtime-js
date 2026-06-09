@@ -20,7 +20,6 @@ The package ships compiled ESM output and TypeScript declarations.
 import { Realtime } from '@foony/realtime';
 
 const realtime = new Realtime({
-  url: 'wss://realtime.foony.com',
   authCallback: async () => {
     const response = await fetch('/api/realtime/token');
     return await response.text();
@@ -29,13 +28,13 @@ const realtime = new Realtime({
 
 const channel = realtime.channels.get('chat:room-1');
 
-channel.subscribe((message) => {
+channel.on((message) => {
   console.log('chat message:', message.data);
 });
 
 await channel.publish('chat', { text: 'hello world' });
 
-channel.presence.subscribe((event) => {
+channel.presence.on((event) => {
   console.log(event.action, event.clientId, event.data);
 });
 await channel.presence.enter({ name: 'Alice' });
@@ -75,10 +74,12 @@ Use the printed token in the SDK:
 
 ```ts
 const realtime = new Realtime({
-  url: 'ws://localhost:3000',
+  endpoint: 'ws://localhost:3000',
   token: process.env.FOONY_REALTIME_DEV_TOKEN!,
 });
 ```
+
+Omit `endpoint` in production to use `wss://realtime.foony.com`.
 
 ## Channel names
 
@@ -90,11 +91,15 @@ server rejects invalid names with error code `40001` (`BadFrame`).
 
 - `Realtime` — top-level client. Owns the WebSocket; channels attach lazily.
 - `client.channels.get(name)` — returns a stable `Channel` for that name.
-- `channel.subscribe(fn)` — message listener; returns an unsubscribe fn.
+- `channel.on(fn)` — message listener; returns an unsubscribe fn.
+- `channel.on(name, fn)` — message listener for one message name.
 - `channel.publish(name, data)` — publish one message; resolves on ack.
-- `channel.presence.subscribe(fn)` — presence listener.
+- `channel.presence.on(fn)` — presence listener.
 - `channel.presence.enter|update|leave(data?)` — mutate this connection's membership.
-- `client.onStateChange(fn)` — observe `connecting | connected | disconnected | closed | failed`.
+- `client.connection.on(fn)` — observe all connection events.
+- `client.connection.on('connected', fn)` — observe one connection event.
+- `client.connection.off()` — remove all connection listeners.
+- `client.connection.once('connected')` — await the next matching connection event.
 
 ## Reconnect
 

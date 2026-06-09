@@ -4,22 +4,17 @@
  */
 
 import { Channel } from './channel.js';
-import {
-  Connection,
-  type ConnectionOptions,
-  type ConnectionState,
-  type ConnectionStateListener,
-} from './connection.js';
+import { Connection, type ConnectionOptions, type ConnectionState } from './connection.js';
 
 /** Options for the Realtime client; mirrors ConnectionOptions. */
 export type RealtimeOptions = ConnectionOptions;
 
 /**
- * Realtime client — call `new Realtime({ url, token })` and use
+ * Realtime client — call `new Realtime({ token })` and use
  * `client.channels.get('chat:1')` to start sending and receiving.
  */
 export class Realtime {
-  private readonly connection: Connection;
+  readonly connection: Connection;
   private readonly channelsByName = new Map<string, Channel>();
 
   /** Map-like accessor for channels. Stable instance per name. */
@@ -36,7 +31,7 @@ export class Realtime {
       const channel = this.channelsByName.get(name);
       if (!channel) return;
       this.channelsByName.delete(name);
-      this.connection.removeChannelListeners(name);
+      this.connection['unregisterChannel'](name);
       channel.detach().catch(() => {});
     },
   };
@@ -71,10 +66,5 @@ export class Realtime {
   /** Server-confirmed client id (from the JWT), populated after auth. */
   getClientId(): string | null {
     return this.connection.getClientId();
-  }
-
-  /** Register a connection-state listener. Returns an unsubscribe fn. */
-  onStateChange(listener: ConnectionStateListener): () => void {
-    return this.connection.onStateChange(listener);
   }
 }

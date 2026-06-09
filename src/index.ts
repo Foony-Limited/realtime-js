@@ -8,12 +8,29 @@
  */
 
 export { Realtime, type RealtimeOptions } from './realtime.js';
-export { Channel, Presence, type UnsubscribeFn } from './channel.js';
+export {
+  Channel,
+  Presence,
+  type ChannelEventListener,
+  type ChannelEventResult,
+  type ChannelEventType,
+  type PresenceEventResult,
+  type PresenceEventType,
+  type UnsubscribeFn,
+} from './channel.js';
 export {
   Connection,
+  DEFAULT_REALTIME_ENDPOINT,
+  TypedEventEmitter,
+  type ConnectionEventEmitter,
+  type ConnectionEventListener,
+  type ConnectionEventResult,
+  type ConnectionEventType,
   type ConnectionOptions,
   type ConnectionState,
   type ConnectionStateListener,
+  type EventEmitter,
+  type EventUnsubscribeFn,
   type MessageListener,
   type PresenceEventListener,
 } from './connection.js';

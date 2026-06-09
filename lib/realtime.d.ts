@@ -3,15 +3,15 @@
  * `channels.get(name)` registry — the public entry point for app code.
  */
 import { Channel } from './channel.js';
-import { type ConnectionOptions, type ConnectionState, type ConnectionStateListener } from './connection.js';
+import { Connection, type ConnectionOptions, type ConnectionState } from './connection.js';
 /** Options for the Realtime client; mirrors ConnectionOptions. */
 export type RealtimeOptions = ConnectionOptions;
 /**
- * Realtime client — call `new Realtime({ url, token })` and use
+ * Realtime client — call `new Realtime({ token })` and use
  * `client.channels.get('chat:1')` to start sending and receiving.
  */
 export declare class Realtime {
-    private readonly connection;
+    readonly connection: Connection;
     private readonly channelsByName;
     /** Map-like accessor for channels. Stable instance per name. */
     readonly channels: {
@@ -29,7 +29,5 @@ export declare class Realtime {
     getConnectionId(): string | null;
     /** Server-confirmed client id (from the JWT), populated after auth. */
     getClientId(): string | null;
-    /** Register a connection-state listener. Returns an unsubscribe fn. */
-    onStateChange(listener: ConnectionStateListener): () => void;
 }
 //# sourceMappingURL=realtime.d.ts.map

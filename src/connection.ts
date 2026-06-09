@@ -21,6 +21,135 @@ import type {
   UnsubscribeFrame,
 } from './wire.js';
 
+/** Function returned from listener registration APIs to remove a listener. */
+export type EventUnsubscribeFn = () => void;
+
+/** Public shape for typed event emitters exposed by the SDK. */
+export type EventEmitter<EventType extends PropertyKey, CallbackType extends (...args: any[]) => void, ResultType> = {
+  /** Listen to every event emitted by this emitter. Returns an unsubscribe function. */
+  on(listener: CallbackType): EventUnsubscribeFn;
+  /** Listen only to `event`. Returns an unsubscribe function. */
+  on(event: EventType, listener: CallbackType): EventUnsubscribeFn;
+  /** Remove every listener from this emitter. */
+  off(): void;
+  /** Remove `listener` wherever it was registered on this emitter. */
+  off(listener: CallbackType): void;
+  /** Remove `listener` only from `event`. */
+  off(event: EventType, listener: CallbackType): void;
+  /** Resolve with the next `event` emitted by this emitter. */
+  once(event: EventType): Promise<ResultType>;
+  /** Invoke `listener` one time for the next event emitted by this emitter. */
+  once(listener: CallbackType): void;
+  /** Invoke `listener` one time for the next matching `event`. */
+  once(event: EventType, listener: CallbackType): void;
+};
+
+/**
+ * Small typed EventEmitter used by SDK surfaces that need both catch-all and
+ * event-specific listeners.
+ */
+export class TypedEventEmitter<EventType extends PropertyKey, CallbackType extends (...args: any[]) => void, ResultType>
+  implements EventEmitter<EventType, CallbackType, ResultType>
+{
+  private readonly listeners = new Set<CallbackType>();
+  private readonly listenersByEvent = new Map<EventType, Set<CallbackType>>();
+  private readonly toResult: (event: EventType, args: Parameters<CallbackType>) => ResultType;
+
+  constructor(toResult: (event: EventType, args: Parameters<CallbackType>) => ResultType) {
+    this.toResult = toResult;
+  }
+
+  on(listener: CallbackType): EventUnsubscribeFn;
+  on(event: EventType, listener: CallbackType): EventUnsubscribeFn;
+  on(first: EventType | CallbackType, second?: CallbackType): EventUnsubscribeFn {
+    if (typeof first === 'function' && second === undefined) {
+      const listener = first as CallbackType;
+      this.listeners.add(listener);
+      return () => this.off(listener);
+    }
+    if (second !== undefined) {
+      const event = first as EventType;
+      let listenersForEvent = this.listenersByEvent.get(event);
+      if (!listenersForEvent) {
+        listenersForEvent = new Set();
+        this.listenersByEvent.set(event, listenersForEvent);
+      }
+      listenersForEvent.add(second);
+      return () => this.off(event, second);
+    }
+    throw new Error('EventEmitter.on: pass a listener or an event and listener');
+  }
+
+  off(): void;
+  off(listener: CallbackType): void;
+  off(event: EventType, listener: CallbackType): void;
+  off(first?: EventType | CallbackType, second?: CallbackType): void {
+    if (first === undefined) {
+      this.listeners.clear();
+      this.listenersByEvent.clear();
+      return;
+    }
+    if (typeof first === 'function' && second === undefined) {
+      const listener = first as CallbackType;
+      this.listeners.delete(listener);
+      for (const listenersForEvent of this.listenersByEvent.values()) {
+        listenersForEvent.delete(listener);
+      }
+      return;
+    }
+    if (second !== undefined) {
+      const listenersForEvent = this.listenersByEvent.get(first as EventType);
+      listenersForEvent?.delete(second);
+      return;
+    }
+    throw new Error('EventEmitter.off: pass no args, a listener, or an event and listener');
+  }
+
+  once(event: EventType): Promise<ResultType>;
+  once(listener: CallbackType): void;
+  once(event: EventType, listener: CallbackType): void;
+  once(first: EventType | CallbackType, second?: CallbackType): Promise<ResultType> | void {
+    if (typeof first === 'function' && second === undefined) {
+      const listener = first as CallbackType;
+      const wrapped = ((...args: Parameters<CallbackType>) => {
+        this.off(wrapped);
+        listener(...args);
+      }) as CallbackType;
+      this.on(wrapped);
+      return;
+    }
+    const event = first as EventType;
+    if (second === undefined) {
+      return new Promise<ResultType>((resolve) => {
+        const wrapped = ((...args: Parameters<CallbackType>) => {
+          this.off(event, wrapped);
+          resolve(this.toResult(event, args));
+        }) as CallbackType;
+        this.on(event, wrapped);
+      });
+    }
+    const listener = second;
+    const wrapped = ((...args: Parameters<CallbackType>) => {
+      this.off(event, wrapped);
+      listener(...args);
+    }) as CallbackType;
+    this.on(event, wrapped);
+  }
+
+  emit(event: EventType, ...args: Parameters<CallbackType>): void {
+    for (const listener of [...this.listeners]) {
+      listener(...args);
+    }
+    const listenersForEvent = this.listenersByEvent.get(event);
+    if (!listenersForEvent) {
+      return;
+    }
+    for (const listener of [...listenersForEvent]) {
+      listener(...args);
+    }
+  }
+}
+
 /**
  * Frames the SDK can issue with `request()`. Each carries an `id` the
  * server echoes on the matching ack/err frame; Connection assigns the
@@ -34,8 +163,11 @@ export type AckableFrame =
 
 /** Options that control how Connection reaches the edge. */
 export type ConnectionOptions = {
-  /** ws:// or wss:// URL pointing at the realtime edge binary. */
-  readonly url: string;
+  /**
+   * Realtime edge host or absolute ws(s) URL. Defaults to
+   * `realtime.foony.com`, which resolves to `wss://realtime.foony.com`.
+   */
+  readonly endpoint?: string;
   /**
    * A Realtime API key in `appSlug.publicKeyId:privateKey` form. Convenient for trusted
    * quick starts and server-side scripts; browser apps should prefer JWTs
@@ -75,6 +207,9 @@ export type ConnectionOptions = {
   readonly maxReconnectDelayMs?: number;
 };
 
+/** Default Foony Realtime endpoint used when callers do not pass one. */
+export const DEFAULT_REALTIME_ENDPOINT = 'realtime.foony.com';
+
 /** Connection lifecycle states. */
 export type ConnectionState =
   | 'initialized'
@@ -85,8 +220,23 @@ export type ConnectionState =
   | 'closed'
   | 'failed';
 
-/** Listener for state transitions. */
-export type ConnectionStateListener = (state: ConnectionState, reason?: Error) => void;
+/** Connection event names are the same lifecycle states exposed by the SDK. */
+export type ConnectionEventType = ConnectionState;
+
+/** Listener for connection lifecycle events. */
+export type ConnectionEventListener = (state: ConnectionState, reason?: Error) => void;
+
+/** Result returned by promise-based `connection.once(event)`. */
+export type ConnectionEventResult = {
+  readonly state: ConnectionState;
+  readonly reason?: Error;
+};
+
+/** Event emitter exposed as methods on `Connection`. */
+export type ConnectionEventEmitter = EventEmitter<ConnectionEventType, ConnectionEventListener, ConnectionEventResult>;
+
+/** Backwards-compatible type alias for callers that named state listeners. */
+export type ConnectionStateListener = ConnectionEventListener;
 
 /** Internal record kept for every in-flight ack/err request. */
 type PendingRequest = {
@@ -100,13 +250,10 @@ export type MessageListener = (message: MessageFrame) => void;
 /** Listener invoked for every presence event frame on a channel. */
 export type PresenceEventListener = (event: PresenceEventFrame) => void;
 
-/**
- * Internal listener registry, keyed by channel name. Connection owns
- * the maps so reconnect can transparently re-subscribe.
- */
-type ChannelListeners = {
-  readonly messages: Set<MessageListener>;
-  readonly presence: Set<PresenceEventListener>;
+/** Per-channel dispatch callbacks owned by Channel instances. */
+type ChannelDispatchers = {
+  readonly message: (message: MessageFrame) => void;
+  readonly presence: (event: PresenceEventFrame) => void;
 };
 
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
@@ -118,7 +265,7 @@ const READY_STATE_OPEN = 1;
  * Connection is the transport layer. One Realtime client owns one
  * Connection; channels share it.
  */
-export class Connection {
+export class Connection extends TypedEventEmitter<ConnectionEventType, ConnectionEventListener, ConnectionEventResult> {
   readonly options: ConnectionOptions;
   private socket: WebSocket | null = null;
   private state: ConnectionState = 'initialized';
@@ -126,8 +273,7 @@ export class Connection {
   private serverClientId: string | null = null;
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingRequest>();
-  private readonly channelListeners = new Map<string, ChannelListeners>();
-  private readonly stateListeners = new Set<ConnectionStateListener>();
+  private readonly channelDispatchers = new Map<string, ChannelDispatchers>();
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
@@ -135,6 +281,10 @@ export class Connection {
   private readonly desiredSubscriptions = new Set<string>();
 
   constructor(options: ConnectionOptions) {
+    super((state, args) => {
+      const reason = args[1];
+      return reason === undefined ? { state } : { state, reason };
+    });
     const authMethods = Number(Boolean(options.token)) + Number(Boolean(options.authCallback)) + Number(Boolean(options.key));
     if (authMethods !== 1) {
       throw new Error('Connection: pass exactly one of options.token, options.authCallback, or options.key');
@@ -155,12 +305,6 @@ export class Connection {
   /** The client id encoded in the token, populated after auth. */
   getClientId(): string | null {
     return this.serverClientId;
-  }
-
-  /** Register a state-change listener. Returns an unsubscribe function. */
-  onStateChange(listener: ConnectionStateListener): () => void {
-    this.stateListeners.add(listener);
-    return () => this.stateListeners.delete(listener);
   }
 
   /**
@@ -218,32 +362,23 @@ export class Connection {
     this.sendRaw(frame);
   }
 
-  /**
-   * Register listeners for a channel. Connection remembers the
-   * registration so it can re-attach across reconnects, but actually
-   * issuing the `sub` frame is the caller's job (Channel does that).
-   */
-  addChannelListeners(channel: string): ChannelListeners {
-    let entry = this.channelListeners.get(channel);
-    if (!entry) {
-      entry = { messages: new Set(), presence: new Set() };
-      this.channelListeners.set(channel, entry);
-    }
-    return entry;
+  /** Register the Channel-owned dispatch callbacks used for inbound frames. */
+  private registerChannel(channel: string, dispatchers: ChannelDispatchers): void {
+    this.channelDispatchers.set(channel, dispatchers);
   }
 
-  /** Forget all listeners for a channel. Called from Channel.detach. */
-  removeChannelListeners(channel: string): void {
-    this.channelListeners.delete(channel);
+  /** Forget a channel's frame dispatch callbacks when the channel is released. */
+  private unregisterChannel(channel: string): void {
+    this.channelDispatchers.delete(channel);
   }
 
   /** Add `channel` to the set of subscriptions to restore on reconnect. */
-  rememberSubscription(channel: string): void {
+  private rememberSubscription(channel: string): void {
     this.desiredSubscriptions.add(channel);
   }
 
   /** Stop restoring this subscription on future reconnects. */
-  forgetSubscription(channel: string): void {
+  private forgetSubscription(channel: string): void {
     this.desiredSubscriptions.delete(channel);
   }
 
@@ -319,7 +454,7 @@ export class Connection {
     if (!ctor) {
       throw new Error('Connection: no WebSocket implementation available. Pass options.webSocket or upgrade to Node 22+.');
     }
-    return new ctor(this.options.url);
+    return new ctor(endpointToUrl(this.options.endpoint));
   }
 
   private async createAuthFrame(): Promise<AuthFrame> {
@@ -363,25 +498,17 @@ export class Connection {
             return;
           }
         }
-        // Unscoped errors (id 0 or missing) are surfaced via state-change
-        // listeners; SDK consumers can subscribe via onStateChange.
-        for (const listener of this.stateListeners) {
-          listener(this.state, new Error(`server error ${frame.code}: ${frame.message}`));
-        }
+        // Unscoped errors (id 0 or missing) are surfaced through the
+        // current connection event so consumers can observe transport errors.
+        this.emitState(this.state, new Error(`server error ${frame.code}: ${frame.message}`));
         return;
       }
       case 'msg': {
-        const listeners = this.channelListeners.get(frame.channel);
-        if (listeners) {
-          for (const listener of listeners.messages) listener(frame);
-        }
+        this.channelDispatchers.get(frame.channel)?.message(frame);
         return;
       }
       case 'presEvt': {
-        const listeners = this.channelListeners.get(frame.channel);
-        if (listeners) {
-          for (const listener of listeners.presence) listener(frame);
-        }
+        this.channelDispatchers.get(frame.channel)?.presence(frame);
         return;
       }
       case 'pong':
@@ -445,6 +572,21 @@ export class Connection {
   private setState(state: ConnectionState): void {
     if (this.state === state) return;
     this.state = state;
-    for (const listener of this.stateListeners) listener(state);
+    this.emitState(state);
   }
+
+  private emitState(state: ConnectionState, reason?: Error): void {
+    if (reason === undefined) {
+      this.emit(state, state);
+      return;
+    }
+    this.emit(state, state, reason);
+  }
+}
+
+function endpointToUrl(endpoint = DEFAULT_REALTIME_ENDPOINT): string {
+  if (/^wss?:\/\//u.test(endpoint)) {
+    return endpoint;
+  }
+  return `wss://${endpoint}`;
 }

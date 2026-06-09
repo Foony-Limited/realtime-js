@@ -15,15 +15,15 @@ import { WebSocket } from 'ws';
 import { Realtime } from '../lib/index.js';
 import { mintRealtimeToken } from '../lib/server.js';
 
-const url = process.env.FOONY_REALTIME_URL ?? 'ws://localhost:3000';
+const endpoint = process.env.FOONY_REALTIME_ENDPOINT ?? 'ws://localhost:3000';
 const signingKey = process.env.JWT_SIGNING_KEY ?? 'local-dev-key';
 const appId = process.env.FOONY_REALTIME_APP_ID ?? 'foony-dev';
 
 const aliceToken = mintRealtimeToken({ signingKey, appId, clientId: 'alice' });
 const bobToken = mintRealtimeToken({ signingKey, appId, clientId: 'bob' });
 
-const alice = new Realtime({ url, token: aliceToken, webSocket: WebSocket, autoReconnect: false });
-const bob = new Realtime({ url, token: bobToken, webSocket: WebSocket, autoReconnect: false });
+const alice = new Realtime({ endpoint, token: aliceToken, webSocket: WebSocket, autoReconnect: false });
+const bob = new Realtime({ endpoint, token: bobToken, webSocket: WebSocket, autoReconnect: false });
 
 await Promise.all([alice.connect(), bob.connect()]);
 console.log('connected', { alice: alice.getConnectionId(), bob: bob.getConnectionId() });
@@ -34,8 +34,8 @@ const bobChannel = bob.channels.get(channelName);
 
 const messagesReceivedByAlice = [];
 const presenceSeenByBob = [];
-aliceChannel.subscribe((message) => messagesReceivedByAlice.push(message));
-bobChannel.presence.subscribe((event) => presenceSeenByBob.push(event));
+aliceChannel.on((message) => messagesReceivedByAlice.push(message));
+bobChannel.presence.on((event) => presenceSeenByBob.push(event));
 
 await Promise.all([aliceChannel.attach(), bobChannel.attach()]);
 
