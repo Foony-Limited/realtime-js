@@ -136,7 +136,7 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
     this.on(event, wrapped);
   }
 
-  emit(event: EventType, ...args: Parameters<CallbackType>): void {
+  protected emit(event: EventType, ...args: Parameters<CallbackType>): void {
     for (const listener of [...this.listeners]) {
       listener(...args);
     }
@@ -341,7 +341,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * Send a frame that expects an ack. Returns the matching AckFrame, or
    * rejects with the server's ErrorFrame (wrapped in an Error).
    */
-  async request(frame: AckableFrame): Promise<AckFrame> {
+  private async request(frame: AckableFrame): Promise<AckFrame> {
     await this.connect();
     const id = this.nextRequestId++;
     const out = { ...frame, id } as ClientFrame;
@@ -357,7 +357,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   /** Send a fire-and-forget frame (no ack expected). */
-  async send(frame: ClientFrame): Promise<void> {
+  private async send(frame: ClientFrame): Promise<void> {
     await this.connect();
     this.sendRaw(frame);
   }

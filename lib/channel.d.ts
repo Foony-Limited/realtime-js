@@ -89,7 +89,7 @@ export declare class Presence extends TypedEventEmitter<PresenceEventType, Prese
     /** Remove this connection's presence entry. */
     leave(): Promise<void>;
     /** @internal Dispatch a presence frame from the Connection transport. */
-    emitPresence(event: PresenceEventFrame): void;
+    private emitPresence;
     private send;
 }
 //# sourceMappingURL=channel.d.ts.map

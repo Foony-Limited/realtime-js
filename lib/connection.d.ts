@@ -5,7 +5,7 @@
  * The class is intentionally protocol-aware but channel-agnostic — the
  * Channel and Realtime classes layer the public API on top.
  */
-import type { AckFrame, ClientFrame, MessageFrame, PresenceEventFrame, PresenceFrame, PublishFrame, SubscribeFrame, UnsubscribeFrame } from './wire.js';
+import type { MessageFrame, PresenceEventFrame, PresenceFrame, PublishFrame, SubscribeFrame, UnsubscribeFrame } from './wire.js';
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
 /** Public shape for typed event emitters exposed by the SDK. */
@@ -44,7 +44,7 @@ export declare class TypedEventEmitter<EventType extends PropertyKey, CallbackTy
     once(event: EventType): Promise<ResultType>;
     once(listener: CallbackType): void;
     once(event: EventType, listener: CallbackType): void;
-    emit(event: EventType, ...args: Parameters<CallbackType>): void;
+    protected emit(event: EventType, ...args: Parameters<CallbackType>): void;
 }
 /**
  * Frames the SDK can issue with `request()`. Each carries an `id` the
@@ -154,9 +154,9 @@ export declare class Connection extends TypedEventEmitter<ConnectionEventType, C
      * Send a frame that expects an ack. Returns the matching AckFrame, or
      * rejects with the server's ErrorFrame (wrapped in an Error).
      */
-    request(frame: AckableFrame): Promise<AckFrame>;
+    private request;
     /** Send a fire-and-forget frame (no ack expected). */
-    send(frame: ClientFrame): Promise<void>;
+    private send;
     /** Register the Channel-owned dispatch callbacks used for inbound frames. */
     private registerChannel;
     /** Forget a channel's frame dispatch callbacks when the channel is released. */

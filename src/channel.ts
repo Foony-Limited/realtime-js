@@ -43,7 +43,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelEventLis
     this.presence = new Presence(connection, name, this);
     this.connection['registerChannel'](this.name, {
       message: (message) => this.emit(message.name, message),
-      presence: (event) => this.presence.emitPresence(event),
+      presence: (event) => this.presence['emitPresence'](event),
     });
   }
 
@@ -57,7 +57,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelEventLis
     if (this.attached) return;
     if (this.attachPromise) return this.attachPromise;
     this.attachPromise = this.connection
-      .request({ t: 'sub', channel: this.name })
+      ['request']({ t: 'sub', channel: this.name })
       .then(() => {
         this.attached = true;
         this.connection['rememberSubscription'](this.name);
@@ -75,7 +75,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelEventLis
    */
   async detach(): Promise<void> {
     if (!this.attached) return;
-    await this.connection.request({ t: 'unsub', channel: this.name });
+    await this.connection['request']({ t: 'unsub', channel: this.name });
     this.attached = false;
     this.connection['forgetSubscription'](this.name);
   }
@@ -123,7 +123,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelEventLis
   /** Publish one application-level message to the channel. */
   async publish(name: string, data: unknown): Promise<void> {
     await this.attach();
-    await this.connection.request({ t: 'pub', channel: this.name, name, data });
+    await this.connection['request']({ t: 'pub', channel: this.name, name, data });
   }
 }
 
@@ -198,13 +198,13 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   }
 
   /** @internal Dispatch a presence frame from the Connection transport. */
-  emitPresence(event: PresenceEventFrame): void {
+  private emitPresence(event: PresenceEventFrame): void {
     this.emit(event.action, event);
   }
 
   private async send(action: PresenceAction, data: unknown): Promise<void> {
     await this.channel.attach();
-    await this.connection.request({
+    await this.connection['request']({
       t: 'pres',
       channel: this.channelName,
       action,
