@@ -1,6 +1,6 @@
 {
   "name": "@foony/realtime",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "TypeScript SDK for the Foony Realtime service.",
   "license": "GPL-3.0-only",
   "repository": {
@@ -18,10 +18,12 @@
     "typescript"
   ],
   "type": "module",
-  "main": "./lib/index.js",
+  "main": "./lib-cjs/index.js",
+  "module": "./lib/index.js",
   "types": "./lib/index.d.ts",
   "sideEffects": false,
   "files": [
+    "lib-cjs",
     "lib",
     "src/**/*.ts",
     "!src/**/*.test.ts"
@@ -29,15 +31,19 @@
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
-      "import": "./lib/index.js"
+      "import": "./lib/index.js",
+      "require": "./lib-cjs/index.js",
+      "default": "./lib/index.js"
     },
     "./server": {
       "types": "./lib/server.d.ts",
-      "import": "./lib/server.js"
+      "import": "./lib/server.js",
+      "require": "./lib-cjs/server.js",
+      "default": "./lib/server.js"
     }
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsc -p tsconfig.cjs.json && node ./scripts/write-cjs-package-json.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
