@@ -15,7 +15,15 @@ export declare class Realtime {
     private readonly channelsByName;
     /** Map-like accessor for channels. Stable instance per name. */
     readonly channels: {
+        /**
+         * Gets a channel by `name` (or creates the channel if it doesn't yet exist). `name` may only
+         * consist of the characters: `/[a-zA-Z0-9._-:]+/`, and may not start with a ':'.
+         */
         get: (name: string) => Channel;
+        /**
+         * Releases a channel by `name`. The channel will be detached and removed from the client.
+         * If the channel is not found, this is a no-op.
+         */
         release: (name: string) => void;
     };
     constructor(options: RealtimeOptions);
