@@ -1,6 +1,6 @@
 {
   "name": "@foony/realtime",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "TypeScript SDK for the Foony Realtime service.",
   "license": "GPL-3.0-only",
   "repository": {
@@ -50,14 +50,16 @@
   "publishConfig": {
     "access": "public"
   },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
   "devDependencies": {
     "@types/node": "^22.13.0",
     "@types/ws": "^8.5.13",
     "typescript": "6.0.3",
-    "vitest": "^4.0.14",
-    "ws": "^8.18.0"
+    "vitest": "^4.0.14"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   }
 }

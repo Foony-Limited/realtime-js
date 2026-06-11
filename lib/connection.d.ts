@@ -79,9 +79,9 @@ export type ConnectionOptions = {
      */
     readonly authCallback?: () => Promise<string> | string;
     /**
-     * Override the global WebSocket constructor. Mostly useful in tests;
-     * defaults to `globalThis.WebSocket` which is present in browsers and
-     * Node 22+.
+     * Override the WebSocket constructor. Mostly useful in tests; defaults
+     * to `globalThis.WebSocket` (browsers and Node 22+), falling back to
+     * the `ws` package on older Node runtimes.
      */
     readonly webSocket?: typeof WebSocket;
     /**

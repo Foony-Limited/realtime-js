@@ -177,6 +177,25 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('falls back to the ws package when no global WebSocket exists (Node < 22)', async () => {
+    // Simulate Node 20 by hiding the global; the SDK should lazily load `ws`.
+    const globalWithSocket = globalThis as typeof globalThis & { WebSocket?: typeof WebSocket };
+    const originalWebSocket = globalWithSocket.WebSocket;
+    delete globalWithSocket.WebSocket;
+    try {
+      const realtime = new Realtime({
+        endpoint: harness.endpoint,
+        token: 'GOOD',
+        autoReconnect: false,
+      });
+      await realtime.connect();
+      expect(realtime.getConnectionId()).toBe('conn-1');
+      await realtime.close();
+    } finally {
+      globalWithSocket.WebSocket = originalWebSocket;
+    }
+  });
+
   it('uses the default realtime endpoint when endpoint is omitted', async () => {
     const urls: string[] = [];
     const realtime = new Realtime({

@@ -6,6 +6,39 @@
  * The class is intentionally protocol-aware but channel-agnostic — the
  * Channel and Realtime classes layer the public API on top.
  */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Connection = exports.DEFAULT_REALTIME_ENDPOINT = exports.TypedEventEmitter = void 0;
 /**
@@ -219,7 +252,7 @@ class Connection extends TypedEventEmitter {
     // ---- internals ----
     async doConnect() {
         this.setState('connecting');
-        const ws = this.makeSocket();
+        const ws = await this.makeSocket();
         this.socket = ws;
         const authFrame = await this.createAuthFrame();
         return new Promise((resolve, reject) => {
@@ -280,10 +313,12 @@ class Connection extends TypedEventEmitter {
             ws.addEventListener('close', onClose, { once: true });
         });
     }
-    makeSocket() {
-        const ctor = this.options.webSocket ?? globalThis.WebSocket;
+    async makeSocket() {
+        const ctor = this.options.webSocket ??
+            globalThis.WebSocket ??
+            (await loadNodeWebSocket());
         if (!ctor) {
-            throw new Error('Connection: no WebSocket implementation available. Pass options.webSocket or upgrade to Node 22+.');
+            throw new Error('Connection: no WebSocket implementation available. Pass options.webSocket or install the "ws" package.');
         }
         return new ctor(endpointToUrl(this.options.endpoint));
     }
@@ -412,6 +447,21 @@ class Connection extends TypedEventEmitter {
     }
 }
 exports.Connection = Connection;
+/**
+ * Lazily load the `ws` package for Node < 22, where there is no global
+ * WebSocket. The specifier is built at runtime so browser bundlers (which
+ * always have a global WebSocket) do not try to resolve or bundle `ws`.
+ */
+async function loadNodeWebSocket() {
+    try {
+        const specifier = 'ws';
+        const mod = (await Promise.resolve(`${specifier}`).then(s => __importStar(require(s))));
+        return mod.WebSocket ?? mod.default;
+    }
+    catch {
+        return undefined;
+    }
+}
 function endpointToUrl(endpoint = exports.DEFAULT_REALTIME_ENDPOINT) {
     if (/^wss?:\/\//u.test(endpoint)) {
         return endpoint;

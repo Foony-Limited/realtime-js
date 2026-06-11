@@ -188,9 +188,9 @@ export type ConnectionOptions = {
    */
   readonly authCallback?: () => Promise<string> | string;
   /**
-   * Override the global WebSocket constructor. Mostly useful in tests;
-   * defaults to `globalThis.WebSocket` which is present in browsers and
-   * Node 22+.
+   * Override the WebSocket constructor. Mostly useful in tests; defaults
+   * to `globalThis.WebSocket` (browsers and Node 22+), falling back to
+   * the `ws` package on older Node runtimes.
    */
   readonly webSocket?: typeof WebSocket;
   /**
@@ -386,7 +386,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
   private async doConnect(): Promise<void> {
     this.setState('connecting');
-    const ws = this.makeSocket();
+    const ws = await this.makeSocket();
     this.socket = ws;
     const authFrame = await this.createAuthFrame();
 
@@ -449,10 +449,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     });
   }
 
-  private makeSocket(): WebSocket {
-    const ctor = this.options.webSocket ?? (globalThis as typeof globalThis & { WebSocket?: typeof WebSocket }).WebSocket;
+  private async makeSocket(): Promise<WebSocket> {
+    const ctor =
+      this.options.webSocket ??
+      (globalThis as typeof globalThis & { WebSocket?: typeof WebSocket }).WebSocket ??
+      (await loadNodeWebSocket());
     if (!ctor) {
-      throw new Error('Connection: no WebSocket implementation available. Pass options.webSocket or upgrade to Node 22+.');
+      throw new Error('Connection: no WebSocket implementation available. Pass options.webSocket or install the "ws" package.');
     }
     return new ctor(endpointToUrl(this.options.endpoint));
   }
@@ -581,6 +584,21 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       return;
     }
     this.emit(state, state, reason);
+  }
+}
+
+/**
+ * Lazily load the `ws` package for Node < 22, where there is no global
+ * WebSocket. The specifier is built at runtime so browser bundlers (which
+ * always have a global WebSocket) do not try to resolve or bundle `ws`.
+ */
+async function loadNodeWebSocket(): Promise<typeof WebSocket | undefined> {
+  try {
+    const specifier = 'ws';
+    const mod = (await import(/* @vite-ignore */ specifier)) as { WebSocket?: typeof WebSocket; default?: typeof WebSocket };
+    return mod.WebSocket ?? mod.default;
+  } catch {
+    return undefined;
   }
 }
 
