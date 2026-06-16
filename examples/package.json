@@ -1,0 +1,25 @@
+{
+  "name": "@foony/realtime-examples",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Runnable client + server examples for the @foony/realtime SDK, wired to the local src so you can test the latest features.",
+  "scripts": {
+    "client": "vite",
+    "build": "vite build",
+    "bot": "tsx server/bot.ts"
+  },
+  "dependencies": {
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react-swc": "^4.2.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.2.4"
+  }
+}
