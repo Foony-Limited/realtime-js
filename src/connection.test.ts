@@ -115,15 +115,49 @@ describe('Connection end-to-end (fake edge)', () => {
     const channel = realtime.channels.get('chat:1');
     const received: unknown[] = [];
     const namedReceived: unknown[] = [];
-    channel.on((message) => received.push(message.data));
-    channel.on('hello', (message) => namedReceived.push(message.data));
-    const nextHello = channel.once('hello');
+    const states: string[] = [];
+    channel.on((stateChange) => states.push(stateChange.current));
+    channel.subscribe((message) => received.push(message.data));
+    channel.subscribe('hello', (message) => namedReceived.push(message.data));
+    const nextHello = new Promise<unknown>((resolve) => {
+      const off = channel.subscribe('hello', (message) => {
+        off();
+        resolve(message);
+      });
+    });
     await channel.publish('hello', { text: 'world' });
 
     await waitFor(() => received.length === 1, 'message echo');
     await expect(nextHello).resolves.toMatchObject({ data: { text: 'world' } });
     expect(received[0]).toEqual({ text: 'world' });
     expect(namedReceived[0]).toEqual({ text: 'world' });
+    expect(states).toEqual(['attaching', 'attached']);
+    await realtime.close();
+  });
+
+  it('subscribes one listener to a list of message names', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:1');
+    const received: string[] = [];
+    const unsubscribe = channel.subscribe(['chat.message', 'chat.system'], (message) => received.push(message.name));
+    await channel.publish('chat.message', { text: 'hi' });
+    await channel.publish('chat.system', { text: 'joined' });
+    await channel.publish('chat.ignored', { text: 'nope' });
+
+    await waitFor(() => received.length === 2, 'list subscription');
+    expect(received).toEqual(['chat.message', 'chat.system']);
+
+    unsubscribe();
+    await channel.publish('chat.message', { text: 'after' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(received).toEqual(['chat.message', 'chat.system']);
     await realtime.close();
   });
 

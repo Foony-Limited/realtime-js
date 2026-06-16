@@ -37,16 +37,23 @@ export type PresenceAction = 'enter' | 'leave' | 'update';
 
 /** First frame after the WebSocket handshake. Carries either a JWT token or API key. */
 export type AuthFrame = {
+  /** Frame discriminator: authentication handshake. */
   readonly t: 'auth';
+  /** JWT minted by your server for token auth; mutually exclusive with `key`. */
   readonly token?: string;
+  /** API key for direct key auth from trusted servers; mutually exclusive with `token`. */
   readonly key?: string;
+  /** Stable identifier for this client, surfaced to others in presence. */
   readonly clientId?: string;
 };
 
 /** Start delivering messages + presence for `channel`. */
 export type SubscribeFrame = {
+  /** Frame discriminator: subscribe request. */
   readonly t: 'sub';
+  /** Channel to start receiving messages and presence for. */
   readonly channel: string;
+  /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
   /** Optional resume cursor; when set, replay messages with id > this. */
   readonly lastMessageId?: string;
@@ -54,31 +61,45 @@ export type SubscribeFrame = {
 
 /** Stop delivering messages + presence for `channel`. */
 export type UnsubscribeFrame = {
+  /** Frame discriminator: unsubscribe request. */
   readonly t: 'unsub';
+  /** Channel to stop receiving messages and presence for. */
   readonly channel: string;
+  /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
 };
 
 /** Publish a single application-level message to `channel`. */
 export type PublishFrame = {
+  /** Frame discriminator: publish request. */
   readonly t: 'pub';
+  /** Channel to publish the message to. */
   readonly channel: string;
+  /** Application-level event name subscribers filter on. */
   readonly name: string;
+  /** Arbitrary JSON-serializable payload delivered to subscribers. */
   readonly data: unknown;
+  /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
 };
 
 /** Mutate the publisher's presence membership in `channel`. */
 export type PresenceFrame = {
+  /** Frame discriminator: presence mutation request. */
   readonly t: 'pres';
+  /** Channel whose presence set is being mutated. */
   readonly channel: string;
+  /** Presence transition to apply (enter, leave, or update). */
   readonly action: PresenceAction;
+  /** Optional presence payload attached to an enter or update. */
   readonly data?: unknown;
+  /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
 };
 
 /** Application-level liveness probe. Server replies with `pong`. */
 export type PingFrame = {
+  /** Frame discriminator: liveness probe; server replies with `pong`. */
   readonly t: 'ping';
 };
 
@@ -86,59 +107,89 @@ export type PingFrame = {
 
 /** Sent once after a successful auth handshake. */
 export type ConnectedFrame = {
+  /** Frame discriminator: post-auth confirmation. */
   readonly t: 'connected';
+  /** Server-assigned identifier for this connection. */
   readonly connectionId: string;
+  /** Interval, in ms, the client should ping within to stay connected. */
   readonly keepAliveMs: number;
+  /** Resolved client id for this connection (from auth or server-assigned). */
   readonly clientId: string;
 };
 
 /** Acks a client request that does not need a structured reply. */
 export type AckFrame = {
+  /** Frame discriminator: request acknowledgement. */
   readonly t: 'ack';
+  /** Echoes the id of the client request being acknowledged. */
   readonly id: number;
 };
 
 /** Server-originated channel message. */
 export type MessageFrame = {
+  /** Frame discriminator: channel message. */
   readonly t: 'msg';
+  /** Channel the message was published to. */
   readonly channel: string;
+  /** Application-level event name the message was published under. */
   readonly name: string;
+  /** Message payload as published. */
   readonly data: unknown;
+  /** Server publish time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
+  /** Unique, ordered message id usable as a history resume cursor. */
   readonly messageId: string;
+  /** Client id of the publisher, when known. */
   readonly clientId?: string;
 };
 
 /** Server-originated presence transition. */
 export type PresenceEventFrame = {
+  /** Frame discriminator: presence transition. */
   readonly t: 'presEvt';
+  /** Channel the presence transition occurred on. */
   readonly channel: string;
+  /** Which presence transition occurred (enter, leave, or update). */
   readonly action: PresenceAction;
+  /** Client id of the member whose presence changed. */
   readonly clientId: string;
+  /** Connection id of the member whose presence changed. */
   readonly connectionId: string;
+  /** Presence payload supplied on enter/update, if any. */
   readonly data?: unknown;
+  /** Transition time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
 };
 
 /** Protocol or authorization error related to a specific client request. */
 export type ErrorFrame = {
+  /** Frame discriminator: error response. */
   readonly t: 'err';
+  /** Id of the client request that failed, when the error is request-scoped. */
   readonly id?: number;
+  /** Machine-readable error code; see {@link ErrorCode}. */
   readonly code: number;
+  /** Human-readable error description for logging and debugging. */
   readonly message: string;
 };
 
 /** Response to `ping`. */
 export type PongFrame = {
+  /** Frame discriminator: reply to `ping`. */
   readonly t: 'pong';
 };
 
 /** Response to `hist`. Messages oldest-first. */
 export type HistoryResponseFrame = {
+  /** Frame discriminator: history query result. */
   readonly t: 'histRes';
+  /** Echoes the id of the `hist` request this responds to. */
   readonly id: number;
+  /** Channel the history was queried for. */
   readonly channel: string;
+  /** Matching messages, ordered oldest-first. */
   readonly messages: readonly MessageFrame[];
+  /** True when older messages remain beyond this page. */
   readonly more?: boolean;
 };
 
@@ -166,11 +217,17 @@ export type ServerFrame =
  * `internal/wire` constants — keep in sync.
  */
 export const ErrorCode = {
+  /** Malformed or unparseable frame. */
   BadFrame: 40001,
+  /** Authentication failed (bad token or key). */
   BadAuth: 40101,
+  /** Previously valid auth has expired; re-authenticate. */
   AuthExpired: 40102,
+  /** Authenticated but not permitted for this channel or action. */
   Forbidden: 40300,
+  /** Referenced resource (e.g. channel) does not exist. */
   NotFound: 40400,
+  /** Unexpected server-side error. */
   Server: 50000,
 } as const;
 

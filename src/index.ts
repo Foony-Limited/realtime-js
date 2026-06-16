@@ -3,8 +3,6 @@
  *
  * Public surface: a `Realtime` class, a `channels.get(name)` registry,
  * and per-channel `subscribe` / `publish` / `presence` methods.
- *
- * For server-side token minting see `@foony/realtime/server`.
  */
 
 export { Realtime, type RealtimeOptions } from './realtime.js';
@@ -14,6 +12,9 @@ export {
   type ChannelEventListener,
   type ChannelEventResult,
   type ChannelEventType,
+  type ChannelState,
+  type ChannelStateChange,
+  type ChannelStateListener,
   type PresenceEventResult,
   type PresenceEventType,
   type UnsubscribeFn,

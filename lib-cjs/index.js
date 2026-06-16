@@ -4,8 +4,6 @@
  *
  * Public surface: a `Realtime` class, a `channels.get(name)` registry,
  * and per-channel `subscribe` / `publish` / `presence` methods.
- *
- * For server-side token minting see `@foony/realtime/server`.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ErrorCode = exports.TypedEventEmitter = exports.DEFAULT_REALTIME_ENDPOINT = exports.Connection = exports.Presence = exports.Channel = exports.Realtime = void 0;
