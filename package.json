@@ -1,6 +1,6 @@
 {
   "name": "@foony/realtime",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "TypeScript SDK for the Foony Realtime service.",
   "license": "GPL-3.0-only",
   "repository": {
@@ -34,12 +34,6 @@
       "import": "./lib/index.js",
       "require": "./lib-cjs/index.js",
       "default": "./lib/index.js"
-    },
-    "./server": {
-      "types": "./lib/server.d.ts",
-      "import": "./lib/server.js",
-      "require": "./lib-cjs/server.js",
-      "default": "./lib/server.js"
     }
   },
   "scripts": {

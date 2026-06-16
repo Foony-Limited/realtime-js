@@ -40,25 +40,11 @@ channel.presence.on((event) => {
 await channel.presence.enter({ name: 'Alice' });
 ```
 
-### Node / server (token minting)
+### Node / server (browser auth)
 
-```ts
-import { mintRealtimeToken } from '@foony/realtime/server';
-
-app.get('/api/realtime/token', (req, res) => {
-  const token = mintRealtimeToken({
-    signingKey: process.env.REALTIME_JWT_SIGNING_KEY!,
-    appId: 'foony',
-    clientId: req.user.id,
-    capability: '{"chat:*":["subscribe","publish","presence"]}',
-    ttlMs: 15 * 60 * 1000,
-  });
-  res.type('text/plain').send(token);
-});
-```
-
-The signing key must exactly match the `JWT_SIGNING_KEY` env var the
-realtime edge binary boots with.
+Browser clients should fetch a short-lived JWT from your backend via the SDK's `authCallback`
+option. Your backend obtains that JWT by exchanging its Realtime API key at the service's
+`POST /auth/token` endpoint — the signing key never leaves Foony's infrastructure.
 
 ## Local development against the realtime backend
 
