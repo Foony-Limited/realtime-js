@@ -2,7 +2,7 @@
   "name": "@foony/realtime",
   "version": "0.0.4",
   "description": "TypeScript SDK for the Foony Realtime service.",
-  "license": "GPL-3.0-only",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Foony-Limited/realtime-js.git"

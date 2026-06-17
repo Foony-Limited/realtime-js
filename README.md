@@ -114,3 +114,7 @@ npm test
 
 Runs wire unit tests plus an in-process end-to-end test that drives the
 SDK against a fake edge built on `ws`. No external services required.
+
+## License
+
+[Apache-2.0](./LICENSE) © Foony Limited
