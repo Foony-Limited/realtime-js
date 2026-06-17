@@ -219,6 +219,20 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     await this.connection['publish']({ t: 'pub', channel: this.name, name, data });
   }
 
+  /**
+   * Fetch recent messages for this channel, oldest-first. Does not interleave
+   * with the live subscription. Pass `start` (a message id) to page backward.
+   */
+  async history(params?: { readonly limit?: number; readonly start?: string }): Promise<{ readonly messages: readonly MessageFrame[]; readonly more: boolean }> {
+    const response = await this.connection['requestHistory']({
+      t: 'hist',
+      channel: this.name,
+      ...(params?.limit === undefined ? {} : { limit: params.limit }),
+      ...(params?.start === undefined ? {} : { start: params.start }),
+    });
+    return { messages: response.messages, more: response.more ?? false };
+  }
+
   /** Drive the state machine from connection lifecycle changes. */
   private onConnectionState(state: ConnectionState, reason?: Error): void {
     if (state === 'disconnected' && this.channelState === 'attached') {

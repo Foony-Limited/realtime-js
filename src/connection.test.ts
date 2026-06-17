@@ -66,6 +66,20 @@ async function startFakeEdge(): Promise<Harness> {
           return;
         }
       }
+      if (frame.t === 'hist') {
+        const histRes: ServerFrame = {
+          t: 'histRes',
+          id: frame.id,
+          channel: frame.channel,
+          messages: [
+            { t: 'msg', channel: frame.channel, name: 'msg', data: { n: 0 }, messageId: 'h-0', timestamp: 1, clientId: 'alice' },
+            { t: 'msg', channel: frame.channel, name: 'msg', data: { n: 1 }, messageId: 'h-1', timestamp: 2, clientId: 'alice' },
+          ],
+          more: true,
+        };
+        socket.send(JSON.stringify(histRes));
+        return;
+      }
       if (frame.t === 'sub' || frame.t === 'unsub' || frame.t === 'pub' || frame.t === 'pres') {
         const ack: ServerFrame = { t: 'ack', id: frame.id };
         socket.send(JSON.stringify(ack));
@@ -148,6 +162,23 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(received[0]).toEqual({ text: 'world' });
     expect(namedReceived[0]).toEqual({ text: 'world' });
     expect(states).toEqual(['attaching', 'attached']);
+    await realtime.close();
+  });
+
+  it('requests history and resolves with the histRes frame', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:1');
+    const page = await channel.history({ limit: 50 });
+    expect(page.more).toBe(true);
+    expect(page.messages.map((message) => message.messageId)).toEqual(['h-0', 'h-1']);
+    expect(page.messages[0]?.data).toEqual({ n: 0 });
     await realtime.close();
   });
 

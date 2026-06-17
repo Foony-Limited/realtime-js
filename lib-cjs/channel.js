@@ -136,6 +136,19 @@ class Channel extends connection_js_1.TypedEventEmitter {
         void this.attach().catch(() => { });
         await this.connection['publish']({ t: 'pub', channel: this.name, name, data });
     }
+    /**
+     * Fetch recent messages for this channel, oldest-first. Does not interleave
+     * with the live subscription. Pass `start` (a message id) to page backward.
+     */
+    async history(params) {
+        const response = await this.connection['requestHistory']({
+            t: 'hist',
+            channel: this.name,
+            ...(params?.limit === undefined ? {} : { limit: params.limit }),
+            ...(params?.start === undefined ? {} : { start: params.start }),
+        });
+        return { messages: response.messages, more: response.more ?? false };
+    }
     /** Drive the state machine from connection lifecycle changes. */
     onConnectionState(state, reason) {
         if (state === 'disconnected' && this.channelState === 'attached') {

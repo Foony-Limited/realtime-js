@@ -8,7 +8,7 @@
  * `unsubscribe` carry application *messages* (open-ended event names).
  */
 import { TypedEventEmitter, type Connection, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
-import type { PresenceAction, PresenceEventFrame } from './wire.js';
+import type { MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
 /** Listener handle returned by `subscribe` — call to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
 /**
@@ -118,6 +118,17 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
      * @param data - The data to publish.
      */
     publish(name: string, data: unknown): Promise<void>;
+    /**
+     * Fetch recent messages for this channel, oldest-first. Does not interleave
+     * with the live subscription. Pass `start` (a message id) to page backward.
+     */
+    history(params?: {
+        readonly limit?: number;
+        readonly start?: string;
+    }): Promise<{
+        readonly messages: readonly MessageFrame[];
+        readonly more: boolean;
+    }>;
     /** Drive the state machine from connection lifecycle changes. */
     private onConnectionState;
     /** True while the channel is in an attach-related state worth transitioning out of. */

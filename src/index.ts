@@ -42,6 +42,7 @@ export {
   type ConnectedFrame,
   type ErrorFrame,
   type FrameType,
+  type HistoryFrame,
   type HistoryResponseFrame,
   type MessageFrame,
   type PingFrame,

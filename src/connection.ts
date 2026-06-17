@@ -12,6 +12,8 @@ import type {
   ClientFrame,
   ConnectedFrame,
   ErrorFrame,
+  HistoryFrame,
+  HistoryResponseFrame,
   MessageFrame,
   PresenceEventFrame,
   PresenceFrame,
@@ -250,6 +252,12 @@ type PendingRequest = {
   readonly reject: (error: Error) => void;
 };
 
+/** Internal record kept for every in-flight history request (resolved by `histRes`). */
+type PendingHistoryRequest = {
+  readonly resolve: (frame: HistoryResponseFrame) => void;
+  readonly reject: (error: Error) => void;
+};
+
 /** A publish tracked until the server acks it. */
 type OutstandingPublish = {
   /** The publish frame to send. Includes a stable id for exactly-once deduplication. */
@@ -307,6 +315,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private serverClientId: string | null = null;
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingRequest>();
+  private readonly pendingHistory = new Map<number, PendingHistoryRequest>();
   private readonly channelDispatchers = new Map<string, ChannelDispatchers>();
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -373,6 +382,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       pending.reject(new Error('connection closed'));
     }
     this.pending.clear();
+    for (const pending of this.pendingHistory.values()) {
+      pending.reject(new Error('connection closed'));
+    }
+    this.pendingHistory.clear();
     this.failOutstandingPublishes(new Error('connection closed'));
   }
 
@@ -390,6 +403,26 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         this.sendRaw(out);
       } catch (err) {
         this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  /**
+   * Send a `hist` frame and resolve with the matching `histRes`, or reject
+   * with the server's error. Unlike `request`, history is correlated to a
+   * dedicated response frame rather than a bare ack.
+   */
+  private async requestHistory(frame: Omit<HistoryFrame, 'id'>): Promise<HistoryResponseFrame> {
+    await this.connect();
+    const id = this.nextRequestId++;
+    const out = { ...frame, id } as ClientFrame;
+    return new Promise<HistoryResponseFrame>((resolve, reject) => {
+      this.pendingHistory.set(id, { resolve, reject });
+      try {
+        this.sendRaw(out);
+      } catch (err) {
+        this.pendingHistory.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -619,6 +652,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           if (this.settlePublish(frame.id, new Error(`server error ${frame.code}: ${frame.message}`))) {
             return;
           }
+          const pendingHistory = this.pendingHistory.get(frame.id);
+          if (pendingHistory) {
+            this.pendingHistory.delete(frame.id);
+            pendingHistory.reject(new Error(`server error ${frame.code}: ${frame.message}`));
+            return;
+          }
         }
         // Unscoped errors (id 0 or missing) are surfaced through the
         // current connection event so consumers can observe transport errors.
@@ -633,12 +672,19 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         this.channelDispatchers.get(frame.channel)?.presence(frame);
         return;
       }
+      case 'histRes': {
+        const pending = this.pendingHistory.get(frame.id);
+        if (pending) {
+          this.pendingHistory.delete(frame.id);
+          pending.resolve(frame);
+        }
+        return;
+      }
       case 'pong':
       case 'connected':
-      case 'histRes':
         // Connected can only fire once (we removed the auth listener
-        // above); pong and histRes are unused in the MVP — silent
-        // forwarding keeps the switch exhaustive.
+        // above); pong is unused in the MVP — silent forwarding keeps
+        // the switch exhaustive.
         return;
     }
   };

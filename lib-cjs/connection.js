@@ -165,6 +165,7 @@ class Connection extends TypedEventEmitter {
     serverClientId = null;
     nextRequestId = 1;
     pending = new Map();
+    pendingHistory = new Map();
     channelDispatchers = new Map();
     connectPromise = null;
     reconnectTimer = null;
@@ -227,6 +228,10 @@ class Connection extends TypedEventEmitter {
             pending.reject(new Error('connection closed'));
         }
         this.pending.clear();
+        for (const pending of this.pendingHistory.values()) {
+            pending.reject(new Error('connection closed'));
+        }
+        this.pendingHistory.clear();
         this.failOutstandingPublishes(new Error('connection closed'));
     }
     /**
@@ -244,6 +249,26 @@ class Connection extends TypedEventEmitter {
             }
             catch (err) {
                 this.pending.delete(id);
+                reject(err instanceof Error ? err : new Error(String(err)));
+            }
+        });
+    }
+    /**
+     * Send a `hist` frame and resolve with the matching `histRes`, or reject
+     * with the server's error. Unlike `request`, history is correlated to a
+     * dedicated response frame rather than a bare ack.
+     */
+    async requestHistory(frame) {
+        await this.connect();
+        const id = this.nextRequestId++;
+        const out = { ...frame, id };
+        return new Promise((resolve, reject) => {
+            this.pendingHistory.set(id, { resolve, reject });
+            try {
+                this.sendRaw(out);
+            }
+            catch (err) {
+                this.pendingHistory.delete(id);
                 reject(err instanceof Error ? err : new Error(String(err)));
             }
         });
@@ -462,6 +487,12 @@ class Connection extends TypedEventEmitter {
                     if (this.settlePublish(frame.id, new Error(`server error ${frame.code}: ${frame.message}`))) {
                         return;
                     }
+                    const pendingHistory = this.pendingHistory.get(frame.id);
+                    if (pendingHistory) {
+                        this.pendingHistory.delete(frame.id);
+                        pendingHistory.reject(new Error(`server error ${frame.code}: ${frame.message}`));
+                        return;
+                    }
                 }
                 // Unscoped errors (id 0 or missing) are surfaced through the
                 // current connection event so consumers can observe transport errors.
@@ -476,12 +507,19 @@ class Connection extends TypedEventEmitter {
                 this.channelDispatchers.get(frame.channel)?.presence(frame);
                 return;
             }
+            case 'histRes': {
+                const pending = this.pendingHistory.get(frame.id);
+                if (pending) {
+                    this.pendingHistory.delete(frame.id);
+                    pending.resolve(frame);
+                }
+                return;
+            }
             case 'pong':
             case 'connected':
-            case 'histRes':
                 // Connected can only fire once (we removed the auth listener
-                // above); pong and histRes are unused in the MVP — silent
-                // forwarding keeps the switch exhaustive.
+                // above); pong is unused in the MVP — silent forwarding keeps
+                // the switch exhaustive.
                 return;
         }
     };

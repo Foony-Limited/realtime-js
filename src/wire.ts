@@ -103,6 +103,20 @@ export type PresenceFrame = {
   readonly id: number;
 };
 
+/** Request recent messages for `channel`. Server replies with `histRes`. */
+export type HistoryFrame = {
+  /** Frame discriminator: history query. */
+  readonly t: 'hist';
+  /** Channel to read history for. */
+  readonly channel: string;
+  /** Maximum number of messages to return (server caps this). */
+  readonly limit?: number;
+  /** Cursor: when set, page backward from this message id (exclusive). */
+  readonly start?: string;
+  /** Client request id echoed back on the matching `histRes` / `err` frame. */
+  readonly id: number;
+};
+
 /** Application-level liveness probe. Server replies with `pong`. */
 export type PingFrame = {
   /** Frame discriminator: liveness probe; server replies with `pong`. */
@@ -206,6 +220,7 @@ export type ClientFrame =
   | UnsubscribeFrame
   | PublishFrame
   | PresenceFrame
+  | HistoryFrame
   | PingFrame;
 
 /** Any frame the server may send. */

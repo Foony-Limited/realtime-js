@@ -142,6 +142,7 @@ export declare class Connection extends TypedEventEmitter<ConnectionEventType, C
     private serverClientId;
     private nextRequestId;
     private readonly pending;
+    private readonly pendingHistory;
     private readonly channelDispatchers;
     private connectPromise;
     private reconnectTimer;
@@ -171,6 +172,12 @@ export declare class Connection extends TypedEventEmitter<ConnectionEventType, C
      * rejects with the server's ErrorFrame (wrapped in an Error).
      */
     private request;
+    /**
+     * Send a `hist` frame and resolve with the matching `histRes`, or reject
+     * with the server's error. Unlike `request`, history is correlated to a
+     * dedicated response frame rather than a bare ack.
+     */
+    private requestHistory;
     /**
      * Publish a message, resolving on the server ack. When connected, sends
      * immediately. When the connection is establishing or temporarily down and
