@@ -19,6 +19,10 @@ type Harness = {
   /** All client connections opened against the fake edge. */
   readonly sockets: NodeWebSocket[];
   readonly authFrames: AuthFrame[];
+  /** Every publish frame the edge received (across reconnects), in order. */
+  readonly publishFrames: { messageId?: string; name: string }[];
+  /** Mutable test controls. Set `dropNextPublish` to drop the next publish before acking. */
+  readonly control: { dropNextPublish: boolean };
 };
 
 async function startFakeEdge(): Promise<Harness> {
@@ -27,6 +31,8 @@ async function startFakeEdge(): Promise<Harness> {
   const address = server.address() as AddressInfo;
   const sockets: NodeWebSocket[] = [];
   const authFrames: AuthFrame[] = [];
+  const publishFrames: { messageId?: string; name: string }[] = [];
+  const control = { dropNextPublish: false };
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
@@ -49,6 +55,16 @@ async function startFakeEdge(): Promise<Harness> {
         };
         socket.send(JSON.stringify(connected));
         return;
+      }
+      if (frame.t === 'pub') {
+        publishFrames.push({ messageId: frame.messageId, name: frame.name });
+        if (control.dropNextPublish) {
+          control.dropNextPublish = false;
+          // Simulate the socket dying in the gap between receiving the publish and
+          // acking it: the client must resend on reconnect (deduped by messageId).
+          socket.close(1001, 'drop before ack');
+          return;
+        }
       }
       if (frame.t === 'sub' || frame.t === 'unsub' || frame.t === 'pub' || frame.t === 'pres') {
         const ack: ServerFrame = { t: 'ack', id: frame.id };
@@ -80,7 +96,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
     });
   });
-  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, control };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -299,6 +315,65 @@ describe('Connection end-to-end (fake edge)', () => {
     offConnectedStates();
     await realtime.close();
     expect(allStates).toEqual(['connecting', 'connected']);
+  });
+
+  it('queues a publish made while disconnected and flushes it on reconnect', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const received: unknown[] = [];
+    const channel = realtime.channels.get('chat:q');
+    channel.subscribe((message) => received.push(message.data));
+    await realtime.connect();
+
+    // Drop the connection from the server side and wait until the client notices.
+    const disconnected = new Promise<void>((resolve) => {
+      const off = realtime.connection.on((state) => {
+        if (state === 'disconnected') {
+          off();
+          resolve();
+        }
+      });
+    });
+    harness.sockets[0]?.terminate();
+    await disconnected;
+
+    // Published while down: must not reject, and resolves only once flushed on reconnect.
+    await channel.publish('hello', { text: 'buffered' });
+    await waitFor(() => received.length >= 1, 'queued publish echo');
+    expect(received).toContainEqual({ text: 'buffered' });
+
+    await realtime.close();
+  });
+
+  it('resends an in-flight publish on reconnect with the same message id', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const channel = realtime.channels.get('chat:r');
+    await realtime.connect();
+
+    // The edge drops the next publish's socket before acking it. The publish must not
+    // hang or reject — it is resent on reconnect and resolves on the resend's ack.
+    harness.control.dropNextPublish = true;
+    await channel.publish('hello', { text: 'inflight' });
+
+    // The original and the resend carried the SAME client message id, so the stream's
+    // dedup window collapses them to one message (exactly-once).
+    const ids = harness.publishFrames.map((frame) => frame.messageId);
+    expect(ids.length).toBe(2);
+    expect(ids[0]).toBeTruthy();
+    expect(ids[0]).toBe(ids[1]);
+
+    await realtime.close();
   });
 });
 

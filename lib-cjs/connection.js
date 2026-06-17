@@ -139,8 +139,23 @@ const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 /** WebSocket.OPEN — duplicated here so we do not depend on a global. */
 const READY_STATE_OPEN = 1;
 /**
+ * A client-assigned message id for a publish — `<unixMillis>-<random>`, so it is
+ * roughly time-sortable like the server's ids. Generated once per publish and reused
+ * across resends, so the server's dedup window can collapse a retried publish.
+ */
+function newClientMessageId() {
+    const random = Math.floor(Math.random() * 0x1_0000_0000).toString(16).padStart(8, '0');
+    return `${Date.now()}-${random}`;
+}
+/**
  * Connection is the transport layer. One Realtime client owns one
  * Connection; channels share it.
+ *
+ * Several methods here are `private` yet called from the sibling `Channel` and
+ * `Realtime` classes via index access (e.g. `connection['rememberSubscription']`).
+ * That is intentional: they form the SDK-internal contract between those classes,
+ * and `private` keeps them off the public `@foony/realtime` type surface. A search
+ * for `this.method(` will not find these call sites — look for `['method']` too.
  */
 class Connection extends TypedEventEmitter {
     options;
@@ -156,6 +171,10 @@ class Connection extends TypedEventEmitter {
     reconnectAttempt = 0;
     /** Channels the SDK has asked to be subscribed to; re-sent on reconnect. */
     desiredSubscriptions = new Set();
+    /** Publishes awaiting ack, keyed by client messageId; (re)sent on (re)connect. */
+    outstandingPublishes = new Map();
+    /** Maps a send attempt's request id back to its publish messageId, to route ack/err. */
+    publishRequestIds = new Map();
     constructor(options) {
         super((state, args) => {
             const reason = args[1];
@@ -208,6 +227,7 @@ class Connection extends TypedEventEmitter {
             pending.reject(new Error('connection closed'));
         }
         this.pending.clear();
+        this.failOutstandingPublishes(new Error('connection closed'));
     }
     /**
      * Send a frame that expects an ack. Returns the matching AckFrame, or
@@ -228,10 +248,83 @@ class Connection extends TypedEventEmitter {
             }
         });
     }
-    /** Send a fire-and-forget frame (no ack expected). */
-    async send(frame) {
-        await this.connect();
-        this.sendRaw(frame);
+    /**
+     * Publish a message, resolving on the server ack. When connected, sends
+     * immediately. When the connection is establishing or temporarily down and
+     * `queueMessages` is enabled (the default), the publish is buffered and sent on
+     * the next successful (re)connect. A publish that was already in flight when the
+     * connection dropped is resent on reconnect (its stable `messageId` dedupes it
+     * server-side). With `queueMessages` disabled, or in a terminal connection state,
+     * it rejects fast.
+     */
+    async publish(input) {
+        const frame = { ...input, messageId: newClientMessageId() };
+        const queueMessages = this.options.queueMessages ?? true;
+        const queueable = this.state === 'initialized' || this.state === 'connecting' || this.state === 'disconnected';
+        if (this.state !== 'connected' && !(queueMessages && queueable)) {
+            throw new Error(`Connection.publish: cannot publish while ${this.state}${queueMessages ? '' : ' (queueMessages disabled)'}`);
+        }
+        return new Promise((resolve, reject) => {
+            const outstanding = { frame, resolve, reject, requestId: null };
+            this.outstandingPublishes.set(frame.messageId, outstanding);
+            if (this.state === 'connected') {
+                this.sendPublish(outstanding);
+            }
+            else {
+                // Buffered: kick a connect so it drains even if no reconnect is pending yet
+                // (e.g. the very first publish); reconnect backoff drives subsequent retries.
+                void this.connect().catch(() => { });
+            }
+        });
+    }
+    /** Send an outstanding publish on the current socket under a fresh request id. */
+    sendPublish(outstanding) {
+        const id = this.nextRequestId++;
+        outstanding.requestId = id;
+        this.publishRequestIds.set(id, outstanding.frame.messageId);
+        try {
+            this.sendRaw({ ...outstanding.frame, id });
+        }
+        catch {
+            // Socket not actually open; leave it outstanding to (re)send on the next connect.
+            this.publishRequestIds.delete(id);
+            outstanding.requestId = null;
+        }
+    }
+    /** (Re)send every outstanding publish not currently in flight. Called on (re)connect. */
+    flushOutstandingPublishes() {
+        for (const outstanding of this.outstandingPublishes.values()) {
+            if (outstanding.requestId === null) {
+                this.sendPublish(outstanding);
+            }
+        }
+    }
+    /** Settle the outstanding publish for `requestId`. Returns false if it wasn't a publish. */
+    settlePublish(requestId, error) {
+        const messageId = this.publishRequestIds.get(requestId);
+        if (messageId === undefined)
+            return false;
+        this.publishRequestIds.delete(requestId);
+        const outstanding = this.outstandingPublishes.get(messageId);
+        if (outstanding) {
+            this.outstandingPublishes.delete(messageId);
+            if (error) {
+                outstanding.reject(error);
+            }
+            else {
+                outstanding.resolve();
+            }
+        }
+        return true;
+    }
+    /** Reject every outstanding publish — used when no resend path remains. */
+    failOutstandingPublishes(error) {
+        this.publishRequestIds.clear();
+        const outstanding = [...this.outstandingPublishes.values()];
+        this.outstandingPublishes.clear();
+        for (const item of outstanding) {
+            item.reject(error);
+        }
     }
     /** Register the Channel-owned dispatch callbacks used for inbound frames. */
     registerChannel(channel, dispatchers) {
@@ -285,6 +378,7 @@ class Connection extends TypedEventEmitter {
                     this.setState('connected');
                     resolve();
                     this.restoreSubscriptionsOnReconnect();
+                    this.flushOutstandingPublishes();
                 }
                 else if (parsed.t === 'err') {
                     const errFrame = parsed;
@@ -352,7 +446,9 @@ class Connection extends TypedEventEmitter {
                 if (pending) {
                     this.pending.delete(frame.id);
                     pending.resolve(frame);
+                    return;
                 }
+                this.settlePublish(frame.id, null);
                 return;
             }
             case 'err': {
@@ -361,6 +457,9 @@ class Connection extends TypedEventEmitter {
                     if (pending) {
                         this.pending.delete(frame.id);
                         pending.reject(new Error(`server error ${frame.code}: ${frame.message}`));
+                        return;
+                    }
+                    if (this.settlePublish(frame.id, new Error(`server error ${frame.code}: ${frame.message}`))) {
                         return;
                     }
                 }
@@ -388,11 +487,25 @@ class Connection extends TypedEventEmitter {
     };
     handleClose(_event) {
         this.socket = null;
+        // The dead socket's request ids will never be acked; drop the mappings.
+        this.publishRequestIds.clear();
         if (this.state === 'closing' || this.state === 'closed') {
             this.setState('closed');
+            this.failOutstandingPublishes(new Error('connection closed'));
             return;
         }
         this.setState('disconnected');
+        const willRetry = this.options.autoReconnect !== false && (this.options.queueMessages ?? true);
+        if (willRetry) {
+            // Keep outstanding publishes (in-flight + buffered) to resend on reconnect.
+            for (const outstanding of this.outstandingPublishes.values()) {
+                outstanding.requestId = null;
+            }
+        }
+        else {
+            // No resend path remains → don't leave publishes hanging.
+            this.failOutstandingPublishes(new Error('connection closed'));
+        }
         if (this.options.autoReconnect === false)
             return;
         this.scheduleReconnect();

@@ -205,6 +205,12 @@ export type ConnectionOptions = {
   readonly initialReconnectDelayMs?: number;
   /** Cap on the reconnect backoff (default 30000ms). */
   readonly maxReconnectDelayMs?: number;
+  /**
+   * If true (the default), publishes made while the connection is establishing or
+   * temporarily down are queued locally and flushed on (re)connect. If false,
+   * publishing while not connected rejects immediately.
+   */
+  readonly queueMessages?: boolean;
 };
 
 /** Default Foony Realtime endpoint used when callers do not pass one. */
@@ -244,6 +250,18 @@ type PendingRequest = {
   readonly reject: (error: Error) => void;
 };
 
+/** A publish tracked until the server acks it. */
+type OutstandingPublish = {
+  /** The publish frame to send. Includes a stable id for exactly-once deduplication. */
+  readonly frame: Omit<PublishFrame, 'id'>;
+  /** Callback to resolve the publish promise when the server acks it. */
+  readonly resolve: () => void;
+  /** Callback to reject the publish promise if the server sends an error. */
+  readonly reject: (error: Error) => void;
+  /** The id of the current send attempt, or null when the publish is buffered (not yet sent, or awaiting resend after a disconnect). */
+  requestId: number | null;
+};
+
 /** Listener invoked for every message frame on a channel. */
 export type MessageListener = (message: MessageFrame) => void;
 
@@ -262,8 +280,24 @@ const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 const READY_STATE_OPEN = 1;
 
 /**
+ * A client-assigned message id for a publish — `<unixMillis>-<random>`, so it is
+ * roughly time-sortable like the server's ids. Generated once per publish and reused
+ * across resends, so the server's dedup window can collapse a retried publish.
+ */
+function newClientMessageId(): string {
+  const random = Math.floor(Math.random() * 0x1_0000_0000).toString(16).padStart(8, '0');
+  return `${Date.now()}-${random}`;
+}
+
+/**
  * Connection is the transport layer. One Realtime client owns one
  * Connection; channels share it.
+ *
+ * Several methods here are `private` yet called from the sibling `Channel` and
+ * `Realtime` classes via index access (e.g. `connection['rememberSubscription']`).
+ * That is intentional: they form the SDK-internal contract between those classes,
+ * and `private` keeps them off the public `@foony/realtime` type surface. A search
+ * for `this.method(` will not find these call sites — look for `['method']` too.
  */
 export class Connection extends TypedEventEmitter<ConnectionEventType, ConnectionEventListener, ConnectionEventResult> {
   readonly options: ConnectionOptions;
@@ -279,6 +313,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private reconnectAttempt = 0;
   /** Channels the SDK has asked to be subscribed to; re-sent on reconnect. */
   private readonly desiredSubscriptions = new Set<string>();
+  /** Publishes awaiting ack, keyed by client messageId; (re)sent on (re)connect. */
+  private readonly outstandingPublishes = new Map<string, OutstandingPublish>();
+  /** Maps a send attempt's request id back to its publish messageId, to route ack/err. */
+  private readonly publishRequestIds = new Map<number, string>();
 
   constructor(options: ConnectionOptions) {
     super((state, args) => {
@@ -335,6 +373,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       pending.reject(new Error('connection closed'));
     }
     this.pending.clear();
+    this.failOutstandingPublishes(new Error('connection closed'));
   }
 
   /**
@@ -356,10 +395,84 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     });
   }
 
-  /** Send a fire-and-forget frame (no ack expected). */
-  private async send(frame: ClientFrame): Promise<void> {
-    await this.connect();
-    this.sendRaw(frame);
+  /**
+   * Publish a message, resolving on the server ack. When connected, sends
+   * immediately. When the connection is establishing or temporarily down and
+   * `queueMessages` is enabled (the default), the publish is buffered and sent on
+   * the next successful (re)connect. A publish that was already in flight when the
+   * connection dropped is resent on reconnect (its stable `messageId` dedupes it
+   * server-side). With `queueMessages` disabled, or in a terminal connection state,
+   * it rejects fast.
+   */
+  private async publish(input: Omit<PublishFrame, 'id' | 'messageId'>): Promise<void> {
+    const frame = { ...input, messageId: newClientMessageId() };
+    const queueMessages = this.options.queueMessages ?? true;
+    const queueable =
+      this.state === 'initialized' || this.state === 'connecting' || this.state === 'disconnected';
+    if (this.state !== 'connected' && !(queueMessages && queueable)) {
+      throw new Error(`Connection.publish: cannot publish while ${this.state}${queueMessages ? '' : ' (queueMessages disabled)'}`);
+    }
+    return new Promise<void>((resolve, reject) => {
+      const outstanding: OutstandingPublish = { frame, resolve, reject, requestId: null };
+      this.outstandingPublishes.set(frame.messageId, outstanding);
+      if (this.state === 'connected') {
+        this.sendPublish(outstanding);
+      } else {
+        // Buffered: kick a connect so it drains even if no reconnect is pending yet
+        // (e.g. the very first publish); reconnect backoff drives subsequent retries.
+        void this.connect().catch(() => {});
+      }
+    });
+  }
+
+  /** Send an outstanding publish on the current socket under a fresh request id. */
+  private sendPublish(outstanding: OutstandingPublish): void {
+    const id = this.nextRequestId++;
+    outstanding.requestId = id;
+    this.publishRequestIds.set(id, outstanding.frame.messageId);
+    try {
+      this.sendRaw({ ...outstanding.frame, id });
+    } catch {
+      // Socket not actually open; leave it outstanding to (re)send on the next connect.
+      this.publishRequestIds.delete(id);
+      outstanding.requestId = null;
+    }
+  }
+
+  /** (Re)send every outstanding publish not currently in flight. Called on (re)connect. */
+  private flushOutstandingPublishes(): void {
+    for (const outstanding of this.outstandingPublishes.values()) {
+      if (outstanding.requestId === null) {
+        this.sendPublish(outstanding);
+      }
+    }
+  }
+
+  /** Settle the outstanding publish for `requestId`. Returns false if it wasn't a publish. */
+  private settlePublish(requestId: number, error: Error | null): boolean {
+    const messageId = this.publishRequestIds.get(requestId);
+    if (messageId === undefined) return false;
+    this.publishRequestIds.delete(requestId);
+    const outstanding = this.outstandingPublishes.get(messageId);
+    if (outstanding) {
+      this.outstandingPublishes.delete(messageId);
+      if (error) {
+        outstanding.reject(error);
+      } else {
+        outstanding.resolve();
+      }
+    }
+    return true;
+  }
+
+  /** Reject every outstanding publish — used when no resend path remains. */
+  private failOutstandingPublishes(error: Error): void {
+    this.publishRequestIds.clear();
+    const outstanding = [...this.outstandingPublishes.values()];
+    this.outstandingPublishes.clear();
+    for (const item of outstanding) {
+      item.reject(error);
+    }
   }
 
   /** Register the Channel-owned dispatch callbacks used for inbound frames. */
@@ -419,6 +532,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           this.setState('connected');
           resolve();
           this.restoreSubscriptionsOnReconnect();
+          this.flushOutstandingPublishes();
         } else if (parsed.t === 'err') {
           const errFrame = parsed as ErrorFrame;
           ws.close(1002, `auth error ${errFrame.code}`);
@@ -489,7 +603,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         if (pending) {
           this.pending.delete(frame.id);
           pending.resolve(frame);
+          return;
         }
+        this.settlePublish(frame.id, null);
         return;
       }
       case 'err': {
@@ -498,6 +614,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           if (pending) {
             this.pending.delete(frame.id);
             pending.reject(new Error(`server error ${frame.code}: ${frame.message}`));
+            return;
+          }
+          if (this.settlePublish(frame.id, new Error(`server error ${frame.code}: ${frame.message}`))) {
             return;
           }
         }
@@ -526,11 +645,24 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
   private handleClose(_event: CloseEvent): void {
     this.socket = null;
+    // The dead socket's request ids will never be acked; drop the mappings.
+    this.publishRequestIds.clear();
     if (this.state === 'closing' || this.state === 'closed') {
       this.setState('closed');
+      this.failOutstandingPublishes(new Error('connection closed'));
       return;
     }
     this.setState('disconnected');
+    const willRetry = this.options.autoReconnect !== false && (this.options.queueMessages ?? true);
+    if (willRetry) {
+      // Keep outstanding publishes (in-flight + buffered) to resend on reconnect.
+      for (const outstanding of this.outstandingPublishes.values()) {
+        outstanding.requestId = null;
+      }
+    } else {
+      // No resend path remains → don't leave publishes hanging.
+      this.failOutstandingPublishes(new Error('connection closed'));
+    }
     if (this.options.autoReconnect === false) return;
     this.scheduleReconnect();
   }

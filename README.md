@@ -98,12 +98,19 @@ transition if you need it.
 
 Pass `autoReconnect: false` to disable retries entirely (useful in tests).
 
+Publishes made while the connection is establishing or temporarily down are
+queued locally and flushed on the next successful (re)connect — so a publish
+during a brief blip resolves rather than rejects. A publish that was already in
+flight when the connection dropped is resent on reconnect too. Every publish
+carries a stable client-assigned id, so the server collapses any duplicate that
+a resend would otherwise create (exactly-once). Pass `queueMessages: false` to
+disable buffering/resend and reject such publishes immediately.
+
 ## Tests
 
 ```bash
 npm test
 ```
 
-Runs unit tests (wire + token mint) plus an in-process end-to-end test
-that drives the SDK against a fake edge built on `ws`. No external
-services required.
+Runs wire unit tests plus an in-process end-to-end test that drives the
+SDK against a fake edge built on `ws`. No external services required.

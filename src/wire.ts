@@ -79,6 +79,12 @@ export type PublishFrame = {
   readonly name: string;
   /** Arbitrary JSON-serializable payload delivered to subscribers. */
   readonly data: unknown;
+  /**
+   * Client-assigned message id, stable across resends. The server uses it as the
+   * JetStream dedup key (`Nats-Msg-Id`), so a publish resent after a reconnect is
+   * collapsed to one message (exactly-once).
+   */
+  readonly messageId: string;
   /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
 };
@@ -231,4 +237,5 @@ export const ErrorCode = {
   Server: 50000,
 } as const;
 
+/** Union of the {@link ErrorCode} member names (e.g. `'Forbidden'`), for typing error handlers. */
 export type ErrorCodeName = keyof typeof ErrorCode;

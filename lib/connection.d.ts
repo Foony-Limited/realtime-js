@@ -96,6 +96,12 @@ export type ConnectionOptions = {
     readonly initialReconnectDelayMs?: number;
     /** Cap on the reconnect backoff (default 30000ms). */
     readonly maxReconnectDelayMs?: number;
+    /**
+     * If true (the default), publishes made while the connection is establishing or
+     * temporarily down are queued locally and flushed on (re)connect. If false,
+     * publishing while not connected rejects immediately.
+     */
+    readonly queueMessages?: boolean;
 };
 /** Default Foony Realtime endpoint used when callers do not pass one. */
 export declare const DEFAULT_REALTIME_ENDPOINT = "realtime.foony.com";
@@ -121,6 +127,12 @@ export type PresenceEventListener = (event: PresenceEventFrame) => void;
 /**
  * Connection is the transport layer. One Realtime client owns one
  * Connection; channels share it.
+ *
+ * Several methods here are `private` yet called from the sibling `Channel` and
+ * `Realtime` classes via index access (e.g. `connection['rememberSubscription']`).
+ * That is intentional: they form the SDK-internal contract between those classes,
+ * and `private` keeps them off the public `@foony/realtime` type surface. A search
+ * for `this.method(` will not find these call sites — look for `['method']` too.
  */
 export declare class Connection extends TypedEventEmitter<ConnectionEventType, ConnectionEventListener, ConnectionEventResult> {
     readonly options: ConnectionOptions;
@@ -136,6 +148,10 @@ export declare class Connection extends TypedEventEmitter<ConnectionEventType, C
     private reconnectAttempt;
     /** Channels the SDK has asked to be subscribed to; re-sent on reconnect. */
     private readonly desiredSubscriptions;
+    /** Publishes awaiting ack, keyed by client messageId; (re)sent on (re)connect. */
+    private readonly outstandingPublishes;
+    /** Maps a send attempt's request id back to its publish messageId, to route ack/err. */
+    private readonly publishRequestIds;
     constructor(options: ConnectionOptions);
     /** Current connection state. */
     getState(): ConnectionState;
@@ -155,8 +171,24 @@ export declare class Connection extends TypedEventEmitter<ConnectionEventType, C
      * rejects with the server's ErrorFrame (wrapped in an Error).
      */
     private request;
-    /** Send a fire-and-forget frame (no ack expected). */
-    private send;
+    /**
+     * Publish a message, resolving on the server ack. When connected, sends
+     * immediately. When the connection is establishing or temporarily down and
+     * `queueMessages` is enabled (the default), the publish is buffered and sent on
+     * the next successful (re)connect. A publish that was already in flight when the
+     * connection dropped is resent on reconnect (its stable `messageId` dedupes it
+     * server-side). With `queueMessages` disabled, or in a terminal connection state,
+     * it rejects fast.
+     */
+    private publish;
+    /** Send an outstanding publish on the current socket under a fresh request id. */
+    private sendPublish;
+    /** (Re)send every outstanding publish not currently in flight. Called on (re)connect. */
+    private flushOutstandingPublishes;
+    /** Settle the outstanding publish for `requestId`. Returns false if it wasn't a publish. */
+    private settlePublish;
+    /** Reject every outstanding publish — used when no resend path remains. */
+    private failOutstandingPublishes;
     /** Register the Channel-owned dispatch callbacks used for inbound frames. */
     private registerChannel;
     /** Forget a channel's frame dispatch callbacks when the channel is released. */

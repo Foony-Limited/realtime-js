@@ -3,8 +3,9 @@
  * Channel + Presence public API. Wraps the Connection layer with
  * per-channel state.
  *
- * Mirrors Ably's split: `on` / `once` / `off` observe the channel's
- * lifecycle *state* (a closed set of events), while `subscribe` /
+ * The channel deliberately exposes two separate listener surfaces so callers
+ * never confuse lifecycle with data: `on` / `once` / `off` observe the
+ * channel's lifecycle *state* (a closed set of events), while `subscribe` /
  * `unsubscribe` carry application *messages* (open-ended event names).
  */
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -129,8 +130,11 @@ class Channel extends connection_js_1.TypedEventEmitter {
      * @param data - The data to publish.
      */
     async publish(name, data) {
-        await this.attach();
-        await this.connection['request']({ t: 'pub', channel: this.name, name, data });
+        // Attach so the publisher also receives this channel's live messages, but don't
+        // block the publish on it: when the connection is down, queueMessages buffers the
+        // publish and the subscription is restored on reconnect.
+        void this.attach().catch(() => { });
+        await this.connection['publish']({ t: 'pub', channel: this.name, name, data });
     }
     /** Drive the state machine from connection lifecycle changes. */
     onConnectionState(state, reason) {

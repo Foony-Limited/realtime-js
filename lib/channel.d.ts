@@ -2,8 +2,9 @@
  * Channel + Presence public API. Wraps the Connection layer with
  * per-channel state.
  *
- * Mirrors Ably's split: `on` / `once` / `off` observe the channel's
- * lifecycle *state* (a closed set of events), while `subscribe` /
+ * The channel deliberately exposes two separate listener surfaces so callers
+ * never confuse lifecycle with data: `on` / `once` / `off` observe the
+ * channel's lifecycle *state* (a closed set of events), while `subscribe` /
  * `unsubscribe` carry application *messages* (open-ended event names).
  */
 import { TypedEventEmitter, type Connection, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
@@ -12,7 +13,8 @@ import type { PresenceAction, PresenceEventFrame } from './wire.js';
 export type UnsubscribeFn = EventUnsubscribeFn;
 /**
  * Channel lifecycle states. A channel walks this set as it attaches to
- * and detaches from the server; mirrors Ably's `ChannelState`.
+ * and detaches from the server, exposed so callers can react to (re)attach
+ * and failure transitions.
  */
 export type ChannelState = 
 /** Created locally; no attach has been attempted yet. */
@@ -31,7 +33,7 @@ export type ChannelState =
  | 'failed';
 /**
  * Events emitted to channel state listeners: every {@link ChannelState}
- * plus `update`. Mirrors Ably's `ChannelEvent`.
+ * plus `update` (a no-transition re-confirmation, e.g. a resume).
  */
 export type ChannelEventType = ChannelState
 /**
@@ -40,10 +42,7 @@ export type ChannelEventType = ChannelState
  * resumed after a reconnect). Carries `resumed` on the state change.
  */
  | 'update';
-/**
- * Payload delivered to channel state listeners on every {@link ChannelEventType}.
- * Mirrors Ably's `ChannelStateChange`.
- */
+/** Payload delivered to channel state listeners on every {@link ChannelEventType}. */
 export type ChannelStateChange = {
     /** State the channel is now in. */
     readonly current: ChannelState;
