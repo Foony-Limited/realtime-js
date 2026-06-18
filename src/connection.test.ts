@@ -20,7 +20,7 @@ type Harness = {
   readonly sockets: NodeWebSocket[];
   readonly authFrames: AuthFrame[];
   /** Every publish frame the edge received (across reconnects), in order. */
-  readonly publishFrames: { messageId?: string; name: string }[];
+  readonly publishFrames: { messageId?: string; name: string; ttlMs?: number }[];
   /** Mutable test controls. Set `dropNextPublish` to drop the next publish before acking. */
   readonly control: { dropNextPublish: boolean };
 };
@@ -57,7 +57,7 @@ async function startFakeEdge(): Promise<Harness> {
         return;
       }
       if (frame.t === 'pub') {
-        publishFrames.push({ messageId: frame.messageId, name: frame.name });
+        publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs });
         if (control.dropNextPublish) {
           control.dropNextPublish = false;
           // Simulate the socket dying in the gap between receiving the publish and
@@ -179,6 +179,26 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(page.more).toBe(true);
     expect(page.messages.map((message) => message.messageId)).toEqual(['h-0', 'h-1']);
     expect(page.messages[0]?.data).toEqual({ n: 0 });
+    await realtime.close();
+  });
+
+  it('sends ttlMs on publish when requested, and omits it otherwise', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:1');
+    await channel.publish('chat.message', { text: 'persist me' }, { ttlMs: 31_536_000_000 });
+    await channel.publish('chat.typing', { state: 'started' });
+
+    await waitFor(() => harness.publishFrames.length === 2, 'two publishes received');
+    const [persisted, ephemeral] = harness.publishFrames;
+    expect(persisted?.ttlMs).toBe(31_536_000_000);
+    expect(ephemeral?.ttlMs).toBeUndefined();
     await realtime.close();
   });
 

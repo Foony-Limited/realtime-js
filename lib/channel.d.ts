@@ -116,8 +116,13 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
      *
      * @param name - The event name.
      * @param data - The data to publish.
+     * @param options - Optional publish controls. `ttlMs` requests how long the
+     *   message is retained for history (server-clamped to your plan ceiling);
+     *   omit it for the short ephemeral default.
      */
-    publish(name: string, data: unknown): Promise<void>;
+    publish(name: string, data: unknown, options?: {
+        readonly ttlMs?: number;
+    }): Promise<void>;
     /**
      * Fetch recent messages for this channel, oldest-first. Does not interleave
      * with the live subscription. Pass `start` (a message id) to page backward.

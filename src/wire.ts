@@ -85,6 +85,12 @@ export type PublishFrame = {
    * collapsed to one message (exactly-once).
    */
   readonly messageId: string;
+  /**
+   * Requested retention for this message, in milliseconds. The server clamps it
+   * to your plan's ceiling; omit it for the short default (ephemeral). Set a
+   * larger value to opt into durable history.
+   */
+  readonly ttlMs?: number;
   /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
 };

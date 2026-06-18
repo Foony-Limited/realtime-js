@@ -210,13 +210,22 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    *
    * @param name - The event name.
    * @param data - The data to publish.
+   * @param options - Optional publish controls. `ttlMs` requests how long the
+   *   message is retained for history (server-clamped to your plan ceiling);
+   *   omit it for the short ephemeral default.
    */
-  async publish(name: string, data: unknown): Promise<void> {
+  async publish(name: string, data: unknown, options?: { readonly ttlMs?: number }): Promise<void> {
     // Attach so the publisher also receives this channel's live messages, but don't
     // block the publish on it: when the connection is down, queueMessages buffers the
     // publish and the subscription is restored on reconnect.
     void this.attach().catch(() => {});
-    await this.connection['publish']({ t: 'pub', channel: this.name, name, data });
+    await this.connection['publish']({
+      t: 'pub',
+      channel: this.name,
+      name,
+      data,
+      ...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+    });
   }
 
   /**
