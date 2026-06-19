@@ -69,6 +69,12 @@ export type PublishFrame = {
      * larger value to opt into durable history.
      */
     readonly ttlMs?: number;
+    /**
+     * How `data` is encoded, e.g. `cipher+aes-256-gcm/base64` for an encrypted
+     * payload. Opaque to the server, which stores and forwards it verbatim; only
+     * SDKs interpret it. Absent means `data` is the plain JSON value.
+     */
+    readonly encoding?: string;
     /** Client request id echoed back on the matching `ack` / `err` frame. */
     readonly id: number;
 };
@@ -82,6 +88,8 @@ export type PresenceFrame = {
     readonly action: PresenceAction;
     /** Optional presence payload attached to an enter or update. */
     readonly data?: unknown;
+    /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+    readonly encoding?: string;
     /** Client request id echoed back on the matching `ack` / `err` frame. */
     readonly id: number;
 };
@@ -137,6 +145,8 @@ export type MessageFrame = {
     readonly messageId: string;
     /** Client id of the publisher, when known. */
     readonly clientId?: string;
+    /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+    readonly encoding?: string;
 };
 /** Server-originated presence transition. */
 export type PresenceEventFrame = {
@@ -152,6 +162,8 @@ export type PresenceEventFrame = {
     readonly connectionId: string;
     /** Presence payload supplied on enter/update, if any. */
     readonly data?: unknown;
+    /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+    readonly encoding?: string;
     /** Transition time in milliseconds since the Unix epoch. */
     readonly timestamp: number;
 };

@@ -8,6 +8,7 @@
  * `unsubscribe` carry application *messages* (open-ended event names).
  */
 import { TypedEventEmitter, type Connection, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
+import { Cipher, type CipherParams } from './crypto.js';
 import type { MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
 /** Listener handle returned by `subscribe` — call to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
@@ -76,9 +77,12 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
     readonly presence: Presence;
     private readonly connection;
     private readonly messages;
+    private readonly cipher;
+    /** Serializes async decryption so encrypted messages keep their arrival order. */
+    private decryptChain;
     private attachPromise;
     private channelState;
-    constructor(connection: Connection, name: string);
+    constructor(connection: Connection, name: string, cipher?: CipherParams);
     /** Current channel lifecycle state. */
     get state(): ChannelState;
     /**
@@ -134,6 +138,13 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
         readonly messages: readonly MessageFrame[];
         readonly more: boolean;
     }>;
+    /**
+     * Deliver an inbound message frame to subscribers, decrypting first when a
+     * cipher is set. Decryption is serialized through a per-channel promise chain
+     * so messages are emitted in arrival order even though decrypt is async.
+     * A frame whose `encoding` isn't a cipher encoding passes through unchanged.
+     */
+    private deliverMessage;
     /** Drive the state machine from connection lifecycle changes. */
     private onConnectionState;
     /** True while the channel is in an attach-related state worth transitioning out of. */
@@ -148,7 +159,10 @@ export declare class Presence extends TypedEventEmitter<PresenceEventType, Prese
     private readonly connection;
     private readonly channelName;
     private readonly channel;
-    constructor(connection: Connection, channelName: string, channel: Channel);
+    private readonly cipher;
+    /** Serializes async decryption so presence events keep their arrival order. */
+    private decryptChain;
+    constructor(connection: Connection, channelName: string, channel: Channel, cipher: Cipher | null);
     /**
      * Register a listener for presence events. Implicitly attaches the
      * underlying channel — presence events arrive on the same WebSocket
@@ -170,7 +184,11 @@ export declare class Presence extends TypedEventEmitter<PresenceEventType, Prese
     update(data?: unknown): Promise<void>;
     /** Remove this connection's presence entry. */
     leave(): Promise<void>;
-    /** @internal Dispatch a presence frame from the Connection transport. */
+    /**
+     * @internal Dispatch a presence frame from the Connection transport,
+     * decrypting its data first when a cipher is set. Decryption is serialized
+     * through a promise chain so events keep their arrival order.
+     */
     private emitPresence;
     private send;
 }

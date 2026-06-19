@@ -5,9 +5,16 @@
 
 import { Channel } from './channel.js';
 import { Connection, type ConnectionOptions, type ConnectionState } from './connection.js';
+import type { CipherParams } from './crypto.js';
 
 /** Options for the Realtime client; mirrors ConnectionOptions. */
 export type RealtimeOptions = ConnectionOptions;
+
+/** Per-channel options passed to `channels.get(name, options)`. */
+export type ChannelOptions = {
+  /** Enable end-to-end payload encryption on this channel. */
+  readonly cipher?: CipherParams;
+};
 
 /**
  * Realtime client — call `new Realtime({ token })` and use
@@ -22,11 +29,14 @@ export class Realtime {
     /**
      * Gets a channel by `name` (or creates the channel if it doesn't yet exist). `name` may only
      * consist of the characters: `/[a-zA-Z0-9._-:]+/`, and may not start with a ':'.
+     *
+     * `options` (e.g. `cipher`) apply when the channel is first created; passing different
+     * options to a later `get` of the same name returns the existing instance unchanged.
      */
-    get: (name: string): Channel => {
+    get: (name: string, options?: ChannelOptions): Channel => {
       let existing = this.channelsByName.get(name);
       if (!existing) {
-        existing = new Channel(this.connection, name);
+        existing = new Channel(this.connection, name, options?.cipher);
         this.channelsByName.set(name, existing);
       }
       return existing;

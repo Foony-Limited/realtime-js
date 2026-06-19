@@ -1,6 +1,6 @@
 {
   "name": "@foony/realtime",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for the Foony Realtime service.",
   "license": "Apache-2.0",
   "repository": {
@@ -26,7 +26,8 @@
     "lib-cjs",
     "lib",
     "src/**/*.ts",
-    "!src/**/*.test.ts"
+    "!src/**/*.test.ts",
+    "CHANGELOG.md"
   ],
   "exports": {
     ".": {

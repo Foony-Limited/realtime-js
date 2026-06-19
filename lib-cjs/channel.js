@@ -11,6 +11,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Presence = exports.Channel = void 0;
 const connection_js_1 = require("./connection.js");
+const crypto_js_1 = require("./crypto.js");
 /**
  * One subscription handle per (channel, listener) pair. Channels are
  * value-equal by name on a given Realtime client — calling
@@ -24,15 +25,19 @@ class Channel extends connection_js_1.TypedEventEmitter {
     presence;
     connection;
     messages = new ChannelMessageEmitter((_event, args) => args[0]);
+    cipher;
+    /** Serializes async decryption so encrypted messages keep their arrival order. */
+    decryptChain = Promise.resolve();
     attachPromise = null;
     channelState = 'initialized';
-    constructor(connection, name) {
+    constructor(connection, name, cipher) {
         super((_event, args) => args[0]);
         this.connection = connection;
         this.name = name;
-        this.presence = new Presence(connection, name, this);
+        this.cipher = cipher ? new crypto_js_1.Cipher(cipher) : null;
+        this.presence = new Presence(connection, name, this, this.cipher);
         this.connection['registerChannel'](this.name, {
-            message: (message) => this.messages.dispatch(message),
+            message: (message) => this.deliverMessage(message),
             presence: (event) => this.presence['emitPresence'](event),
         });
         this.connection.on((state, reason) => this.onConnectionState(state, reason));
@@ -137,11 +142,15 @@ class Channel extends connection_js_1.TypedEventEmitter {
         // block the publish on it: when the connection is down, queueMessages buffers the
         // publish and the subscription is restored on reconnect.
         void this.attach().catch(() => { });
+        // With a cipher set, the edge only ever sees ciphertext; `encoding` tells the
+        // receiving SDK how to read it.
+        const encrypted = this.cipher ? await this.cipher.encrypt(data) : null;
         await this.connection['publish']({
             t: 'pub',
             channel: this.name,
             name,
-            data,
+            data: encrypted ? encrypted.data : data,
+            ...(encrypted ? { encoding: encrypted.encoding } : {}),
             ...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
         });
     }
@@ -156,7 +165,34 @@ class Channel extends connection_js_1.TypedEventEmitter {
             ...(params?.limit === undefined ? {} : { limit: params.limit }),
             ...(params?.start === undefined ? {} : { start: params.start }),
         });
-        return { messages: response.messages, more: response.more ?? false };
+        if (!this.cipher) {
+            return { messages: response.messages, more: response.more ?? false };
+        }
+        const cipher = this.cipher;
+        const messages = await Promise.all(response.messages.map((frame) => decryptFrame(cipher, frame).catch(() => frame)));
+        return { messages, more: response.more ?? false };
+    }
+    /**
+     * Deliver an inbound message frame to subscribers, decrypting first when a
+     * cipher is set. Decryption is serialized through a per-channel promise chain
+     * so messages are emitted in arrival order even though decrypt is async.
+     * A frame whose `encoding` isn't a cipher encoding passes through unchanged.
+     */
+    deliverMessage(frame) {
+        if (!this.cipher || !(0, crypto_js_1.isCipherEncoding)(frame.encoding)) {
+            this.messages.dispatch(frame);
+            return;
+        }
+        const cipher = this.cipher;
+        this.decryptChain = this.decryptChain.then(async () => {
+            try {
+                this.messages.dispatch(await decryptFrame(cipher, frame));
+            }
+            catch (error) {
+                // A failed decrypt (wrong key / tampered) is dropped rather than delivered as garbage.
+                console.warn(`[realtime] failed to decrypt message on channel ${this.name}:`, error);
+            }
+        });
     }
     /** Drive the state machine from connection lifecycle changes. */
     onConnectionState(state, reason) {
@@ -209,11 +245,15 @@ class Presence extends connection_js_1.TypedEventEmitter {
     connection;
     channelName;
     channel;
-    constructor(connection, channelName, channel) {
+    cipher;
+    /** Serializes async decryption so presence events keep their arrival order. */
+    decryptChain = Promise.resolve();
+    constructor(connection, channelName, channel, cipher) {
         super((_event, args) => args[0]);
         this.connection = connection;
         this.channelName = channelName;
         this.channel = channel;
+        this.cipher = cipher;
     }
     on(first, second) {
         const unsubscribe = second === undefined ? super.on(first) : super.on(first, second);
@@ -249,17 +289,40 @@ class Presence extends connection_js_1.TypedEventEmitter {
     async leave() {
         await this.send('leave', undefined);
     }
-    /** @internal Dispatch a presence frame from the Connection transport. */
+    /**
+     * @internal Dispatch a presence frame from the Connection transport,
+     * decrypting its data first when a cipher is set. Decryption is serialized
+     * through a promise chain so events keep their arrival order.
+     */
     emitPresence(event) {
-        this.emit(event.action, event);
+        if (!this.cipher || !(0, crypto_js_1.isCipherEncoding)(event.encoding)) {
+            this.emit(event.action, event);
+            return;
+        }
+        const cipher = this.cipher;
+        const encoding = event.encoding;
+        this.decryptChain = this.decryptChain.then(async () => {
+            try {
+                const data = await cipher.decrypt(encoding, event.data);
+                const { encoding: _encoding, ...rest } = event;
+                this.emit(event.action, { ...rest, data });
+            }
+            catch (error) {
+                console.warn(`[realtime] failed to decrypt presence on channel ${this.channelName}:`, error);
+            }
+        });
     }
     async send(action, data) {
         await this.channel.attach();
+        // Encrypt the presence payload so the edge only sees ciphertext (matching messages).
+        const encrypted = this.cipher !== null && data !== undefined ? await this.cipher.encrypt(data) : null;
+        const payload = encrypted ? encrypted.data : data;
         await this.connection['request']({
             t: 'pres',
             channel: this.channelName,
             action,
-            ...(data === undefined ? {} : { data }),
+            ...(payload === undefined ? {} : { data: payload }),
+            ...(encrypted ? { encoding: encrypted.encoding } : {}),
         });
     }
 }
@@ -279,5 +342,18 @@ class ChannelMessageEmitter extends connection_js_1.TypedEventEmitter {
 /** Coerce an unknown thrown value into an Error for state-change reasons. */
 function asError(error) {
     return error instanceof Error ? error : new Error(String(error));
+}
+/**
+ * Return a copy of `frame` with its encrypted payload decrypted and its cipher
+ * `encoding` stripped (the delivered data is now plaintext). Frames without a
+ * cipher encoding are returned unchanged. Rejects if decryption fails.
+ */
+async function decryptFrame(cipher, frame) {
+    if (!(0, crypto_js_1.isCipherEncoding)(frame.encoding)) {
+        return frame;
+    }
+    const data = await cipher.decrypt(frame.encoding, frame.data);
+    const { encoding: _encoding, ...rest } = frame;
+    return { ...rest, data };
 }
 //# sourceMappingURL=channel.js.map

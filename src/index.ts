@@ -5,7 +5,14 @@
  * and per-channel `subscribe` / `publish` / `presence` methods.
  */
 
-export { Realtime, type RealtimeOptions } from './realtime.js';
+export { Realtime, type RealtimeOptions, type ChannelOptions } from './realtime.js';
+export {
+  Cipher,
+  generateRandomKey,
+  type CipherParams,
+  type CipherAlgorithm,
+  type EncryptResult,
+} from './crypto.js';
 export {
   Channel,
   Presence,

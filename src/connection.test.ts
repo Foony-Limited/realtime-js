@@ -10,7 +10,7 @@ import { AddressInfo } from 'node:net';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { Realtime } from './index.js';
+import { Realtime, generateRandomKey } from './index.js';
 import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
 
 type Harness = {
@@ -20,7 +20,7 @@ type Harness = {
   readonly sockets: NodeWebSocket[];
   readonly authFrames: AuthFrame[];
   /** Every publish frame the edge received (across reconnects), in order. */
-  readonly publishFrames: { messageId?: string; name: string; ttlMs?: number }[];
+  readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string }[];
   /** Mutable test controls. Set `dropNextPublish` to drop the next publish before acking. */
   readonly control: { dropNextPublish: boolean };
 };
@@ -57,7 +57,7 @@ async function startFakeEdge(): Promise<Harness> {
         return;
       }
       if (frame.t === 'pub') {
-        publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs });
+        publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs, data: frame.data, encoding: frame.encoding });
         if (control.dropNextPublish) {
           control.dropNextPublish = false;
           // Simulate the socket dying in the gap between receiving the publish and
@@ -92,6 +92,8 @@ async function startFakeEdge(): Promise<Harness> {
             messageId: 'msg-1',
             timestamp: Date.now(),
             clientId: 'alice',
+            // The real edge forwards `encoding` opaquely; mirror that so encrypted echoes decode.
+            ...(frame.encoding === undefined ? {} : { encoding: frame.encoding }),
           };
           socket.send(JSON.stringify(msg));
         }
@@ -104,6 +106,7 @@ async function startFakeEdge(): Promise<Harness> {
             connectionId: `conn-${nextConnIndex}`,
             timestamp: Date.now(),
             ...((frame as { data?: unknown }).data === undefined ? {} : { data: (frame as { data?: unknown }).data }),
+            ...((frame as { encoding?: string }).encoding === undefined ? {} : { encoding: (frame as { encoding?: string }).encoding }),
           };
           socket.send(JSON.stringify(evt));
         }
@@ -179,6 +182,55 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(page.more).toBe(true);
     expect(page.messages.map((message) => message.messageId)).toEqual(['h-0', 'h-1']);
     expect(page.messages[0]?.data).toEqual({ n: 0 });
+    await realtime.close();
+  });
+
+  it('encrypts payloads on the wire and decrypts them for subscribers', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const key = await generateRandomKey();
+    const channel = realtime.channels.get('secret:1', { cipher: { key } });
+    const received: unknown[] = [];
+    channel.subscribe((message) => received.push(message.data));
+
+    await channel.publish('msg', { secret: 'hello' });
+
+    // The fake edge echoes the published frame; the channel decrypts it for the listener.
+    await waitFor(() => received.length === 1, 'decrypted echo');
+    expect(received[0]).toEqual({ secret: 'hello' });
+
+    // What actually traversed the wire was ciphertext (base64 string) under a cipher encoding.
+    const sent = harness.publishFrames[0];
+    expect(sent?.encoding).toBe('cipher+aes-256-gcm/base64');
+    expect(typeof sent?.data).toBe('string');
+    expect(sent?.data).not.toContain('hello');
+    await realtime.close();
+  });
+
+  it('encrypts presence data and decrypts presence events', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const key = await generateRandomKey();
+    const channel = realtime.channels.get('secret:2', { cipher: { key } });
+    const seen: unknown[] = [];
+    channel.presence.subscribe((event) => seen.push(event.data));
+
+    await channel.presence.enter({ name: 'alice' });
+
+    await waitFor(() => seen.length >= 1, 'decrypted presence event');
+    expect(seen[0]).toEqual({ name: 'alice' });
     await realtime.close();
   });
 
