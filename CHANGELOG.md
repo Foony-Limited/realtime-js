@@ -3,6 +3,15 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.6.0
+
+### Changed
+
+- **Auto-batching is enabled by passing a `batch` config, not a flag.** The
+  `enabled` field has been removed from `BatchOptions`; `{ batch: { intervalMs } }`
+  (or any `batch` object, even `{}`) now turns batching on. There is no longer a
+  way to pass a `batch` object with batching disabled — omit `batch` instead.
+
 ## 0.5.0
 
 ### Changed
