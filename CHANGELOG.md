@@ -11,6 +11,11 @@ All notable changes to `@foony/realtime`. Format loosely follows
   `enabled` field has been removed from `BatchOptions`; `{ batch: { intervalMs } }`
   (or any `batch` object, even `{}`) now turns batching on. There is no longer a
   way to pass a `batch` object with batching disabled — omit `batch` instead.
+- **`intervalMs` is now a throttle, not a fixed buffer delay.** A publish is sent
+  immediately unless a batch went out within the last `intervalMs`, in which case
+  it's buffered until the window elapses. Publishes spaced further apart than
+  `intervalMs` no longer incur batching latency and are never batched together;
+  only bursts faster than `intervalMs` coalesce.
 
 ## 0.5.0
 

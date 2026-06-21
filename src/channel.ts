@@ -24,9 +24,11 @@ export type UnsubscribeFn = EventUnsubscribeFn;
  */
 export type BatchOptions = {
   /**
-   * How long to buffer before flushing, in ms. 0 (default) coalesces publishes
-   * made in the same tick with no added latency; a larger value batches more at
-   * the cost of up to `intervalMs` extra latency.
+   * Minimum gap between batch sends, in ms, applied as a throttle: a publish is
+   * sent right away unless a batch went out within the last `intervalMs`, in
+   * which case it's buffered until the window elapses. Publishes spaced further
+   * apart than `intervalMs` are never batched (no added latency); only bursts
+   * faster than `intervalMs` coalesce. 0 (default) throttles nothing.
    */
   readonly intervalMs?: number;
   /** Flush early once this many messages are buffered. Default 200. */
@@ -124,6 +126,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   /** Buffered single publishes awaiting flush, when batching is enabled. */
   private batchBuffer: BufferedPublish[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the last batch was sent, to throttle sends to one per `intervalMs`. */
+  private lastFlushMs = 0;
   private attachPromise: Promise<void> | null = null;
   private channelState: ChannelState = 'initialized';
 
@@ -319,8 +323,9 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
 
   /**
    * Flush any buffered (auto-batched) publishes now, as a single batch frame.
-   * Runs automatically on the configured interval, when the buffer is full, and
-   * on detach; call it to force an immediate send. No-op when nothing is buffered.
+   * Runs automatically once the throttle window elapses, when the buffer is
+   * full, and on detach; call it to force an immediate send. No-op when nothing
+   * is buffered.
    */
   flush(): void {
     if (this.batchTimer !== null) {
@@ -332,6 +337,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     }
     const pending = this.batchBuffer;
     this.batchBuffer = [];
+    this.lastFlushMs = Date.now();
     void this.connection['publish']({
       t: 'pub',
       channel: this.name,
@@ -360,7 +366,12 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       if (this.batchBuffer.length >= this.batch.maxMessages) {
         this.flush();
       } else if (this.batchTimer === null) {
-        this.batchTimer = setTimeout(() => this.flush(), this.batch.intervalMs);
+        // Throttle, don't fixed-delay: send right away unless a batch went out
+        // within `intervalMs`, in which case wait out the rest of the window.
+        // Publishes spaced further apart than `intervalMs` thus never batch.
+        const sinceLast = Date.now() - this.lastFlushMs;
+        const wait = sinceLast >= this.batch.intervalMs ? 0 : this.batch.intervalMs - sinceLast;
+        this.batchTimer = setTimeout(() => this.flush(), wait);
       }
     });
   }

@@ -524,6 +524,33 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('throttles batches: leading publish sends at once, follow-ups within the window coalesce', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      batch: { intervalMs: 100 },
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:throttle');
+    // No batch has been sent recently, so the first publish is not throttled — it
+    // goes out immediately rather than waiting out the 100ms window.
+    await channel.publish('a', 1);
+    expect(harness.publishFrames).toHaveLength(1);
+    expect(harness.publishFrames[0]?.messages?.map((member) => member.name)).toEqual(['a']);
+
+    // These land within the window of the send above, so they buffer and ship as
+    // one later batch instead of going out immediately.
+    const rest = Promise.all([channel.publish('b', 2), channel.publish('c', 3)]);
+    expect(harness.publishFrames).toHaveLength(1);
+    await rest;
+    expect(harness.publishFrames).toHaveLength(2);
+    expect(harness.publishFrames[1]?.messages?.map((member) => member.name)).toEqual(['b', 'c']);
+    await realtime.close();
+  });
+
   it('encrypts each batch member and decrypts them on receipt', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,
