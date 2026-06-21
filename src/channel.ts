@@ -19,11 +19,10 @@ export type UnsubscribeFn = EventUnsubscribeFn;
  * Automatic publish batching. When enabled, single `publish(name, data)` calls
  * are buffered and flushed as one batch frame (one stored, dedupable message),
  * trading a little latency for fewer messages and less transport overhead.
- * Disabled by default. Array publishes and `batchPublish` are never buffered.
+ * Batching is off unless a batch config is provided. Array publishes and
+ * `batchPublish` are never buffered.
  */
 export type BatchOptions = {
-  /** Turn batching on for the channel. Default false. */
-  readonly enabled?: boolean;
   /**
    * How long to buffer before flushing, in ms. 0 (default) coalesces publishes
    * made in the same tick with no added latency; a larger value batches more at
@@ -134,7 +133,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.name = name;
     this.cipher = cipher ? new Cipher(cipher) : null;
     this.batch = {
-      enabled: batch?.enabled ?? false,
+      // Passing a batch config (even `{}`) opts the channel into batching.
+      enabled: batch !== undefined,
       intervalMs: batch?.intervalMs ?? 0,
       maxMessages: batch?.maxMessages ?? DEFAULT_BATCH_MAX_MESSAGES,
     };

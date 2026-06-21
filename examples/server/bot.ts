@@ -27,7 +27,7 @@ const messageName = process.env.MESSAGE_NAME ?? 'chat.message';
 const intervalMs = Number(process.env.INTERVAL_MS ?? 3000);
 
 console.log(`[bot] connecting with API key, channel=${channelName}`);
-const realtime = new Realtime({clientId, key: apiKey});
+const realtime = new Realtime({clientId, key: apiKey, batch: {intervalMs: 25}});
 realtime.connection.on((state, reason) => {
   console.log(`[bot] connection -> ${state}${reason ? ` (${reason.message})` : ''}`);
 });

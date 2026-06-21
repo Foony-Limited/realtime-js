@@ -510,7 +510,7 @@ describe('Connection end-to-end (fake edge)', () => {
       endpoint: harness.endpoint,
       token: 'GOOD',
       autoReconnect: false,
-      batch: { enabled: true, intervalMs: 0 },
+      batch: { intervalMs: 0 },
       webSocket: NodeWebSocket as unknown as typeof WebSocket,
     });
     await realtime.connect();
