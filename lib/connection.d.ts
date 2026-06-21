@@ -56,7 +56,7 @@ export type AckableFrame = Omit<SubscribeFrame, 'id'> | Omit<UnsubscribeFrame, '
 export type ConnectionOptions = {
     /**
      * Realtime edge host or absolute ws(s) URL. Defaults to
-     * `realtime.foony.com`, which resolves to `wss://realtime.foony.com`.
+     * `realtime.foony.io`, which resolves to `wss://realtime.foony.io`.
      */
     readonly endpoint?: string;
     /**
@@ -104,7 +104,7 @@ export type ConnectionOptions = {
     readonly queueMessages?: boolean;
 };
 /** Default Foony Realtime endpoint used when callers do not pass one. */
-export declare const DEFAULT_REALTIME_ENDPOINT = "realtime.foony.com";
+export declare const DEFAULT_REALTIME_ENDPOINT = "realtime.foony.io";
 /** Connection lifecycle states. */
 export type ConnectionState = 'initialized' | 'connecting' | 'connected' | 'disconnected' | 'closing' | 'closed' | 'failed';
 /** Connection event names are the same lifecycle states exposed by the SDK. */

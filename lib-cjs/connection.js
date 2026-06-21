@@ -133,7 +133,7 @@ class TypedEventEmitter {
 }
 exports.TypedEventEmitter = TypedEventEmitter;
 /** Default Foony Realtime endpoint used when callers do not pass one. */
-exports.DEFAULT_REALTIME_ENDPOINT = 'realtime.foony.com';
+exports.DEFAULT_REALTIME_ENDPOINT = 'realtime.foony.io';
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 /** WebSocket.OPEN — duplicated here so we do not depend on a global. */

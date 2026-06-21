@@ -360,7 +360,7 @@ describe('Connection end-to-end (fake edge)', () => {
 
     await realtime.connect();
 
-    expect(urls).toEqual(['wss://realtime.foony.com']);
+    expect(urls).toEqual(['wss://realtime.foony.io']);
     await realtime.close();
   });
 

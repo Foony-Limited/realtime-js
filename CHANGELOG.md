@@ -3,6 +3,14 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.5.0
+
+### Changed
+
+- **Default endpoint moved to `realtime.foony.io`.** The Realtime SaaS now lives on
+  `foony.io`, so `DEFAULT_REALTIME_ENDPOINT` (used when `endpoint` is
+  omitted) has been changed to `realtime.foony.io`.
+
 ## 0.4.0
 
 ### Added
