@@ -10,10 +10,38 @@
 
 import { TypedEventEmitter, type Connection, type ConnectionState, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
 import { Cipher, isCipherEncoding, type CipherParams } from './crypto.js';
-import type { MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
+import type { BatchMember, MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
 
 /** Listener handle returned by `subscribe` — call to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
+
+/**
+ * Automatic publish batching. When enabled, single `publish(name, data)` calls
+ * are buffered and flushed as one batch frame (one stored, dedupable message),
+ * trading a little latency for fewer messages and less transport overhead.
+ * Disabled by default. Array publishes and `batchPublish` are never buffered.
+ */
+export type BatchOptions = {
+  /** Turn batching on for the channel. Default false. */
+  readonly enabled?: boolean;
+  /**
+   * How long to buffer before flushing, in ms. 0 (default) coalesces publishes
+   * made in the same tick with no added latency; a larger value batches more at
+   * the cost of up to `intervalMs` extra latency.
+   */
+  readonly intervalMs?: number;
+  /** Flush early once this many messages are buffered. Default 200. */
+  readonly maxMessages?: number;
+};
+
+/** One buffered publish awaiting the next flush. */
+type BufferedPublish = {
+  readonly member: BatchMember;
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+};
+
+const DEFAULT_BATCH_MAX_MESSAGES = 200;
 
 /**
  * Channel lifecycle states. A channel walks this set as it attaches to
@@ -92,14 +120,24 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   private readonly cipher: Cipher | null;
   /** Serializes async decryption so encrypted messages keep their arrival order. */
   private decryptChain: Promise<void> = Promise.resolve();
+  /** Resolved auto-batch config (defaults applied). */
+  private readonly batch: { readonly enabled: boolean; readonly intervalMs: number; readonly maxMessages: number };
+  /** Buffered single publishes awaiting flush, when batching is enabled. */
+  private batchBuffer: BufferedPublish[] = [];
+  private batchTimer: ReturnType<typeof setTimeout> | null = null;
   private attachPromise: Promise<void> | null = null;
   private channelState: ChannelState = 'initialized';
 
-  constructor(connection: Connection, name: string, cipher?: CipherParams) {
+  constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions) {
     super((_event, args) => args[0]);
     this.connection = connection;
     this.name = name;
     this.cipher = cipher ? new Cipher(cipher) : null;
+    this.batch = {
+      enabled: batch?.enabled ?? false,
+      intervalMs: batch?.intervalMs ?? 0,
+      maxMessages: batch?.maxMessages ?? DEFAULT_BATCH_MAX_MESSAGES,
+    };
     this.presence = new Presence(connection, name, this, this.cipher);
     this.connection['registerChannel'](this.name, {
       message: (message) => this.deliverMessage(message),
@@ -144,6 +182,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * `unsubscribe()` to clear them.
    */
   async detach(): Promise<void> {
+    // Don't strand buffered auto-batched publishes on detach.
+    this.flush();
     if (this.channelState === 'initialized' || this.channelState === 'detached' || this.channelState === 'detaching') return;
     this.transition('detaching');
     try {
@@ -219,21 +259,109 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    *   message is retained for history (server-clamped to your plan ceiling);
    *   omit it for the short ephemeral default.
    */
-  async publish(name: string, data: unknown, options?: { readonly ttlMs?: number }): Promise<void> {
+  publish(name: string, data: unknown, options?: { readonly ttlMs?: number }): Promise<void>;
+  /**
+   * Publish a batch of messages in a single frame under one message id. The
+   * batch is the atomic unit: the server stores and dedups it as one durable
+   * message (so a resend is collapsed), while subscribers receive the members
+   * individually. Reduces stored-message count and transport overhead.
+   *
+   * @param messages - The messages to publish, each with its own `name`/`data`.
+   * @param options - Optional publish controls (e.g. `ttlMs`).
+   */
+  publish(messages: ReadonlyArray<{ readonly name: string; readonly data: unknown }>, options?: { readonly ttlMs?: number }): Promise<void>;
+  async publish(
+    nameOrMessages: string | ReadonlyArray<{ readonly name: string; readonly data: unknown }>,
+    dataOrOptions?: unknown,
+    options?: { readonly ttlMs?: number },
+  ): Promise<void> {
     // Attach so the publisher also receives this channel's live messages, but don't
     // block the publish on it: when the connection is down, queueMessages buffers the
     // publish and the subscription is restored on reconnect.
     void this.attach().catch(() => {});
-    // With a cipher set, the edge only ever sees ciphertext; `encoding` tells the
-    // receiving SDK how to read it.
-    const encrypted = this.cipher ? await this.cipher.encrypt(data) : null;
+    if (typeof nameOrMessages === 'string') {
+      const member = await this.toMember(nameOrMessages, dataOrOptions);
+      // Buffer single publishes when batching is on — but not when a per-message
+      // ttl override is set (a batch shares one ttl), so send those immediately.
+      if (this.batch.enabled && options?.ttlMs === undefined) {
+        return this.enqueue(member);
+      }
+      await this.connection['publish']({
+        t: 'pub',
+        channel: this.name,
+        name: member.name,
+        data: member.data,
+        ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+        ...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+      });
+      return;
+    }
+    const opts = dataOrOptions as { readonly ttlMs?: number } | undefined;
+    const members = await Promise.all(nameOrMessages.map((message) => this.toMember(message.name, message.data)));
     await this.connection['publish']({
       t: 'pub',
       channel: this.name,
-      name,
-      data: encrypted ? encrypted.data : data,
-      ...(encrypted ? { encoding: encrypted.encoding } : {}),
-      ...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+      name: '',
+      data: null,
+      messages: members,
+      ...(opts?.ttlMs === undefined ? {} : { ttlMs: opts.ttlMs }),
+    });
+  }
+
+  /** Build a wire batch member, encrypting `data` per-member when a cipher is set. */
+  private async toMember(name: string, data: unknown): Promise<BatchMember> {
+    if (!this.cipher) {
+      return { name, data };
+    }
+    const { encoding, data: encrypted } = await this.cipher.encrypt(data);
+    return { name, data: encrypted, encoding };
+  }
+
+  /**
+   * Flush any buffered (auto-batched) publishes now, as a single batch frame.
+   * Runs automatically on the configured interval, when the buffer is full, and
+   * on detach; call it to force an immediate send. No-op when nothing is buffered.
+   */
+  flush(): void {
+    if (this.batchTimer !== null) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
+    }
+    if (this.batchBuffer.length === 0) {
+      return;
+    }
+    const pending = this.batchBuffer;
+    this.batchBuffer = [];
+    void this.connection['publish']({
+      t: 'pub',
+      channel: this.name,
+      name: '',
+      data: null,
+      messages: pending.map((entry) => entry.member),
+    }).then(
+      () => {
+        for (const entry of pending) {
+          entry.resolve();
+        }
+      },
+      (error: unknown) => {
+        const wrapped = asError(error);
+        for (const entry of pending) {
+          entry.reject(wrapped);
+        }
+      },
+    );
+  }
+
+  /** Buffer a member for the next flush, scheduling or forcing a flush as needed. */
+  private enqueue(member: BatchMember): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.batchBuffer.push({ member, resolve, reject });
+      if (this.batchBuffer.length >= this.batch.maxMessages) {
+        this.flush();
+      } else if (this.batchTimer === null) {
+        this.batchTimer = setTimeout(() => this.flush(), this.batch.intervalMs);
+      }
     });
   }
 
@@ -248,21 +376,38 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       ...(params?.limit === undefined ? {} : { limit: params.limit }),
       ...(params?.start === undefined ? {} : { start: params.start }),
     });
+    // Expand any batch frames into their member frames before decrypting.
+    const expanded = response.messages.flatMap(expandBatch);
     if (!this.cipher) {
-      return { messages: response.messages, more: response.more ?? false };
+      return { messages: expanded, more: response.more ?? false };
     }
     const cipher = this.cipher;
-    const messages = await Promise.all(response.messages.map((frame) => decryptFrame(cipher, frame).catch(() => frame)));
+    const messages = await Promise.all(expanded.map((frame) => decryptFrame(cipher, frame).catch(() => frame)));
     return { messages, more: response.more ?? false };
   }
 
   /**
-   * Deliver an inbound message frame to subscribers, decrypting first when a
-   * cipher is set. Decryption is serialized through a per-channel promise chain
-   * so messages are emitted in arrival order even though decrypt is async.
-   * A frame whose `encoding` isn't a cipher encoding passes through unchanged.
+   * Deliver an inbound frame to subscribers. A batch frame is expanded into its
+   * member frames (in order) first; each member is then dispatched like a single
+   * message.
    */
   private deliverMessage(frame: MessageFrame): void {
+    if (frame.messages !== undefined && frame.messages.length > 0) {
+      for (let index = 0; index < frame.messages.length; index++) {
+        this.deliverSingle(memberFrame(frame, frame.messages[index]!, index));
+      }
+      return;
+    }
+    this.deliverSingle(frame);
+  }
+
+  /**
+   * Dispatch one message frame, decrypting first when a cipher is set.
+   * Decryption is serialized through a per-channel promise chain so messages
+   * are emitted in arrival order even though decrypt is async. A frame whose
+   * `encoding` isn't a cipher encoding passes through unchanged.
+   */
+  private deliverSingle(frame: MessageFrame): void {
     if (!this.cipher || !isCipherEncoding(frame.encoding)) {
       this.messages.dispatch(frame);
       return;
@@ -449,6 +594,28 @@ class ChannelMessageEmitter extends TypedEventEmitter<string, MessageListener, M
 /** Coerce an unknown thrown value into an Error for state-change reasons. */
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/** Build a per-member message frame from a batch frame; member id is `<batchId>:<index>`. */
+function memberFrame(base: MessageFrame, member: BatchMember, index: number): MessageFrame {
+  return {
+    t: 'msg',
+    channel: base.channel,
+    name: member.name,
+    data: member.data,
+    timestamp: base.timestamp,
+    messageId: `${base.messageId}:${index}`,
+    ...(base.clientId === undefined ? {} : { clientId: base.clientId }),
+    ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+  };
+}
+
+/** Expand a batch frame into its member frames; a non-batch frame is returned as a single-item array. */
+function expandBatch(frame: MessageFrame): MessageFrame[] {
+  if (frame.messages !== undefined && frame.messages.length > 0) {
+    return frame.messages.map((member, index) => memberFrame(frame, member, index));
+  }
+  return [frame];
 }
 
 /**

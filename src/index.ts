@@ -5,7 +5,14 @@
  * and per-channel `subscribe` / `publish` / `presence` methods.
  */
 
-export { Realtime, type RealtimeOptions, type ChannelOptions } from './realtime.js';
+export {
+  Realtime,
+  type RealtimeOptions,
+  type ChannelOptions,
+  type BatchSpec,
+  type BatchMessage,
+  type BatchPublishResult,
+} from './realtime.js';
 export {
   Cipher,
   generateRandomKey,
@@ -16,6 +23,7 @@ export {
 export {
   Channel,
   Presence,
+  type BatchOptions,
   type ChannelEventListener,
   type ChannelEventResult,
   type ChannelEventType,
@@ -45,6 +53,7 @@ export {
 export {
   type AckFrame,
   type AuthFrame,
+  type BatchMember,
   type ClientFrame,
   type ConnectedFrame,
   type ErrorFrame,

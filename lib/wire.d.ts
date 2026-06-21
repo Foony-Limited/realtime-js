@@ -16,6 +16,20 @@
 export type FrameType = 'auth' | 'sub' | 'unsub' | 'pub' | 'pres' | 'hist' | 'ping' | 'connected' | 'ack' | 'msg' | 'presEvt' | 'err' | 'pong' | 'histRes';
 /** Recognized presence transition values. */
 export type PresenceAction = 'enter' | 'leave' | 'update';
+/**
+ * One member of a batch publish. A batch bundles many messages into a single
+ * `pub`/`msg` frame under one `messageId` (the batch is the atomic unit), so the
+ * server stores and dedups it as one durable message while subscribers see the
+ * members individually. `encoding` is per-member (each is encrypted on its own).
+ */
+export type BatchMember = {
+    /** Application-level event name subscribers filter on. */
+    readonly name: string;
+    /** Arbitrary JSON-serializable payload. */
+    readonly data: unknown;
+    /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+    readonly encoding?: string;
+};
 /** First frame after the WebSocket handshake. Carries either a JWT token or API key. */
 export type AuthFrame = {
     /** Frame discriminator: authentication handshake. */
@@ -47,7 +61,12 @@ export type UnsubscribeFrame = {
     /** Client request id echoed back on the matching `ack` / `err` frame. */
     readonly id: number;
 };
-/** Publish a single application-level message to `channel`. */
+/**
+ * Publish a message to `channel`. Single by default (`name` + `data`); set
+ * `messages` to publish a batch — many messages under one `messageId`, stored
+ * and deduped by the server as one durable message. When `messages` is present,
+ * `name`/`data` are ignored.
+ */
 export type PublishFrame = {
     /** Frame discriminator: publish request. */
     readonly t: 'pub';
@@ -57,6 +76,8 @@ export type PublishFrame = {
     readonly name: string;
     /** Arbitrary JSON-serializable payload delivered to subscribers. */
     readonly data: unknown;
+    /** Batch members; when set, this is a batch publish and `name`/`data` are ignored. */
+    readonly messages?: readonly BatchMember[];
     /**
      * Client-assigned message id, stable across resends. The server uses it as the
      * JetStream dedup key (`Nats-Msg-Id`), so a publish resent after a reconnect is
@@ -147,6 +168,8 @@ export type MessageFrame = {
     readonly clientId?: string;
     /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
     readonly encoding?: string;
+    /** Batch members; when set, this frame carries a batch and `name`/`data` are ignored. */
+    readonly messages?: readonly BatchMember[];
 };
 /** Server-originated presence transition. */
 export type PresenceEventFrame = {

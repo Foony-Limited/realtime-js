@@ -2,15 +2,46 @@
  * Realtime is the top-level client class. It owns a Connection and a
  * `channels.get(name)` registry — the public entry point for app code.
  */
-import { Channel } from './channel.js';
+import { Channel, type BatchOptions } from './channel.js';
 import { Connection, type ConnectionOptions, type ConnectionState } from './connection.js';
 import type { CipherParams } from './crypto.js';
-/** Options for the Realtime client; mirrors ConnectionOptions. */
-export type RealtimeOptions = ConnectionOptions;
+/** Options for the Realtime client; the connection options plus a default batch config. */
+export type RealtimeOptions = ConnectionOptions & {
+    /** Default auto-batching for every channel; overridable per channel. Disabled by default. */
+    readonly batch?: BatchOptions;
+};
 /** Per-channel options passed to `channels.get(name, options)`. */
 export type ChannelOptions = {
     /** Enable end-to-end payload encryption on this channel. */
     readonly cipher?: CipherParams;
+    /** Auto-batching for this channel; overrides the client-level default. */
+    readonly batch?: BatchOptions;
+};
+/** One message in a {@link BatchSpec}. */
+export type BatchMessage = {
+    /** Application-level event name. */
+    readonly name: string;
+    /** Arbitrary JSON-serializable payload. */
+    readonly data: unknown;
+};
+/** A batch-publish spec: send `messages` to each of `channels`. Mirrors Ably's BatchSpec. */
+export type BatchSpec = {
+    /** One channel name or a list of them. */
+    readonly channels: string | readonly string[];
+    /** One message or a list of them, published to every channel in `channels`. */
+    readonly messages: BatchMessage | readonly BatchMessage[];
+};
+/** Per-channel outcome from {@link Realtime.batchPublish}. */
+export type BatchPublishResult = {
+    /** Number of channels published successfully. */
+    readonly successCount: number;
+    /** Number of channels that failed. */
+    readonly failureCount: number;
+    /** One entry per (spec × channel); `error` is set when that channel failed. */
+    readonly results: ReadonlyArray<{
+        readonly channel: string;
+        readonly error?: Error;
+    }>;
 };
 /**
  * Realtime client — call `new Realtime({ token })` and use
@@ -19,6 +50,7 @@ export type ChannelOptions = {
 export declare class Realtime {
     readonly connection: Connection;
     private readonly channelsByName;
+    private readonly batchDefault;
     /** Map-like accessor for channels. Stable instance per name. */
     readonly channels: {
         /**
@@ -40,6 +72,16 @@ export declare class Realtime {
     connect(): Promise<void>;
     /** Close the WebSocket and release every channel. */
     close(): Promise<void>;
+    /**
+     * Publish messages to many channels in one call (Ably-compatible). Each spec
+     * sends its `messages` to each of its `channels`; messages to a single channel
+     * go as one idempotent batch frame. This is publish-only — it does not attach
+     * or subscribe the channels (so it scales to many channels), and it sends
+     * payloads as-is (use `channel.publish` for an end-to-end-encrypted channel).
+     *
+     * @returns Per-channel success/failure; one channel failing does not fail the others.
+     */
+    batchPublish(specs: BatchSpec | readonly BatchSpec[]): Promise<BatchPublishResult>;
     /** Current connection state. */
     getState(): ConnectionState;
     /** Server-issued connection id, populated after auth. */

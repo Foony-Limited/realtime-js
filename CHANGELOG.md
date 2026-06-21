@@ -3,6 +3,28 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.4.0
+
+### Added
+
+- **Message batching.** `channel.publish(messages[])` and 
+  `realtime.batchPublish({ channels, messages })` bundle multiple messages into one
+  frame that the edge stores and dedups as a single message, reducing costs and
+  increasing maximum throughput. Subscribers still process the members individually
+  (same reduced cost, and no DevEx overhead).
+- **Opt-in auto-batching.** `{ batch: { enabled, intervalMs, maxMessages } }` on
+  the `Realtime` client sets a default that can be overridden via
+  `channels.get(name, { batch })`). Single `publish` calls are buffered and
+  flushed as one batch (`intervalMs: 0` coalesces same-tick bursts). Disabled by
+  default. `channel.flush()` forces a flush.
+- New exports: `BatchSpec`, `BatchMessage`, `BatchPublishResult`, `BatchMember`,
+  `BatchOptions`.
+
+### Changed
+
+- `PublishFrame`/`MessageFrame` gained an optional `messages` array (batch
+  members), and presence/encoding stay per-member for encrypted batches.
+
 ## 0.3.0
 
 ### Added

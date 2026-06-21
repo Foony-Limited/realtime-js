@@ -13,6 +13,24 @@ import type { MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js
 /** Listener handle returned by `subscribe` — call to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
 /**
+ * Automatic publish batching. When enabled, single `publish(name, data)` calls
+ * are buffered and flushed as one batch frame (one stored, dedupable message),
+ * trading a little latency for fewer messages and less transport overhead.
+ * Disabled by default. Array publishes and `batchPublish` are never buffered.
+ */
+export type BatchOptions = {
+    /** Turn batching on for the channel. Default false. */
+    readonly enabled?: boolean;
+    /**
+     * How long to buffer before flushing, in ms. 0 (default) coalesces publishes
+     * made in the same tick with no added latency; a larger value batches more at
+     * the cost of up to `intervalMs` extra latency.
+     */
+    readonly intervalMs?: number;
+    /** Flush early once this many messages are buffered. Default 200. */
+    readonly maxMessages?: number;
+};
+/**
  * Channel lifecycle states. A channel walks this set as it attaches to
  * and detaches from the server, exposed so callers can react to (re)attach
  * and failure transitions.
@@ -80,9 +98,14 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
     private readonly cipher;
     /** Serializes async decryption so encrypted messages keep their arrival order. */
     private decryptChain;
+    /** Resolved auto-batch config (defaults applied). */
+    private readonly batch;
+    /** Buffered single publishes awaiting flush, when batching is enabled. */
+    private batchBuffer;
+    private batchTimer;
     private attachPromise;
     private channelState;
-    constructor(connection: Connection, name: string, cipher?: CipherParams);
+    constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions);
     /** Current channel lifecycle state. */
     get state(): ChannelState;
     /**
@@ -128,6 +151,31 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
         readonly ttlMs?: number;
     }): Promise<void>;
     /**
+     * Publish a batch of messages in a single frame under one message id. The
+     * batch is the atomic unit: the server stores and dedups it as one durable
+     * message (so a resend is collapsed), while subscribers receive the members
+     * individually. Reduces stored-message count and transport overhead.
+     *
+     * @param messages - The messages to publish, each with its own `name`/`data`.
+     * @param options - Optional publish controls (e.g. `ttlMs`).
+     */
+    publish(messages: ReadonlyArray<{
+        readonly name: string;
+        readonly data: unknown;
+    }>, options?: {
+        readonly ttlMs?: number;
+    }): Promise<void>;
+    /** Build a wire batch member, encrypting `data` per-member when a cipher is set. */
+    private toMember;
+    /**
+     * Flush any buffered (auto-batched) publishes now, as a single batch frame.
+     * Runs automatically on the configured interval, when the buffer is full, and
+     * on detach; call it to force an immediate send. No-op when nothing is buffered.
+     */
+    flush(): void;
+    /** Buffer a member for the next flush, scheduling or forcing a flush as needed. */
+    private enqueue;
+    /**
      * Fetch recent messages for this channel, oldest-first. Does not interleave
      * with the live subscription. Pass `start` (a message id) to page backward.
      */
@@ -139,12 +187,18 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
         readonly more: boolean;
     }>;
     /**
-     * Deliver an inbound message frame to subscribers, decrypting first when a
-     * cipher is set. Decryption is serialized through a per-channel promise chain
-     * so messages are emitted in arrival order even though decrypt is async.
-     * A frame whose `encoding` isn't a cipher encoding passes through unchanged.
+     * Deliver an inbound frame to subscribers. A batch frame is expanded into its
+     * member frames (in order) first; each member is then dispatched like a single
+     * message.
      */
     private deliverMessage;
+    /**
+     * Dispatch one message frame, decrypting first when a cipher is set.
+     * Decryption is serialized through a per-channel promise chain so messages
+     * are emitted in arrival order even though decrypt is async. A frame whose
+     * `encoding` isn't a cipher encoding passes through unchanged.
+     */
+    private deliverSingle;
     /** Drive the state machine from connection lifecycle changes. */
     private onConnectionState;
     /** True while the channel is in an attach-related state worth transitioning out of. */

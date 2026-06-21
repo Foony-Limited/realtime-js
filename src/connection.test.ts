@@ -20,7 +20,7 @@ type Harness = {
   readonly sockets: NodeWebSocket[];
   readonly authFrames: AuthFrame[];
   /** Every publish frame the edge received (across reconnects), in order. */
-  readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string }[];
+  readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
   /** Mutable test controls. Set `dropNextPublish` to drop the next publish before acking. */
   readonly control: { dropNextPublish: boolean };
 };
@@ -31,7 +31,7 @@ async function startFakeEdge(): Promise<Harness> {
   const address = server.address() as AddressInfo;
   const sockets: NodeWebSocket[] = [];
   const authFrames: AuthFrame[] = [];
-  const publishFrames: { messageId?: string; name: string }[] = [];
+  const publishFrames: Harness['publishFrames'] = [];
   const control = { dropNextPublish: false };
   server.on('connection', (socket) => {
     sockets.push(socket);
@@ -57,7 +57,7 @@ async function startFakeEdge(): Promise<Harness> {
         return;
       }
       if (frame.t === 'pub') {
-        publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs, data: frame.data, encoding: frame.encoding });
+        publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs, data: frame.data, encoding: frame.encoding, channel: frame.channel, messages: frame.messages });
         if (control.dropNextPublish) {
           control.dropNextPublish = false;
           // Simulate the socket dying in the gap between receiving the publish and
@@ -89,11 +89,12 @@ async function startFakeEdge(): Promise<Harness> {
             channel: frame.channel,
             name: frame.name,
             data: frame.data,
-            messageId: 'msg-1',
+            messageId: `msg-${publishFrames.length}`,
             timestamp: Date.now(),
             clientId: 'alice',
-            // The real edge forwards `encoding` opaquely; mirror that so encrypted echoes decode.
+            // The real edge forwards `encoding` and batch `messages` opaquely.
             ...(frame.encoding === undefined ? {} : { encoding: frame.encoding }),
+            ...(frame.messages === undefined ? {} : { messages: frame.messages }),
           };
           socket.send(JSON.stringify(msg));
         }
@@ -450,6 +451,104 @@ describe('Connection end-to-end (fake edge)', () => {
     await waitFor(() => received.length >= 1, 'queued publish echo');
     expect(received).toContainEqual({ text: 'buffered' });
 
+    await realtime.close();
+  });
+
+  it('publishes an array as one batch frame and unpacks it into individual messages', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:batch');
+    const received: { name: string; data: unknown; id: string }[] = [];
+    channel.subscribe((message) => received.push({ name: message.name, data: message.data, id: message.messageId }));
+
+    await channel.publish([
+      { name: 'a', data: { n: 1 } },
+      { name: 'b', data: { n: 2 } },
+    ]);
+
+    // One wire frame carrying both members under a single message id.
+    expect(harness.publishFrames).toHaveLength(1);
+    expect(harness.publishFrames[0]?.messages).toHaveLength(2);
+    expect(harness.publishFrames[0]?.messageId).toBeTruthy();
+
+    // Delivered as two individual messages with `<batchId>:<index>` ids.
+    await waitFor(() => received.length === 2, 'batch unpack');
+    expect(received.map((message) => message.name)).toEqual(['a', 'b']);
+    expect(received[0]?.data).toEqual({ n: 1 });
+    expect(received[0]?.id.endsWith(':0')).toBe(true);
+    expect(received[1]?.id.endsWith(':1')).toBe(true);
+    await realtime.close();
+  });
+
+  it('batchPublish fans out to multiple channels and reports per-channel results', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const result = await realtime.batchPublish({ channels: ['c1', 'c2'], messages: [{ name: 'x', data: 1 }] });
+
+    expect(result.successCount).toBe(2);
+    expect(result.failureCount).toBe(0);
+    expect(result.results.map((entry) => entry.channel).sort()).toEqual(['c1', 'c2']);
+    // One batch frame per channel.
+    expect(harness.publishFrames.map((frame) => frame.channel).sort()).toEqual(['c1', 'c2']);
+    await realtime.close();
+  });
+
+  it('auto-batches buffered single publishes into one frame', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      batch: { enabled: true, intervalMs: 0 },
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:auto');
+    // Two publishes in the same tick coalesce into one batch frame; both resolve.
+    await Promise.all([channel.publish('a', 1), channel.publish('b', 2)]);
+
+    expect(harness.publishFrames).toHaveLength(1);
+    expect(harness.publishFrames[0]?.messages?.map((member) => member.name)).toEqual(['a', 'b']);
+    await realtime.close();
+  });
+
+  it('encrypts each batch member and decrypts them on receipt', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const key = await generateRandomKey();
+    const channel = realtime.channels.get('secret:batch', { cipher: { key } });
+    const received: unknown[] = [];
+    channel.subscribe((message) => received.push(message.data));
+
+    await channel.publish([
+      { name: 'a', data: { secret: 'one' } },
+      { name: 'b', data: { secret: 'two' } },
+    ]);
+
+    await waitFor(() => received.length === 2, 'encrypted batch unpack');
+    expect(received).toEqual([{ secret: 'one' }, { secret: 'two' }]);
+    // Each member traveled as ciphertext under a per-member cipher encoding.
+    const members = harness.publishFrames[0]?.messages ?? [];
+    expect(members.every((member) => member.encoding === 'cipher+aes-256-gcm/base64')).toBe(true);
+    expect(JSON.stringify(members)).not.toContain('one');
     await realtime.close();
   });
 
