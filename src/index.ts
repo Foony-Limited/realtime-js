@@ -14,6 +14,13 @@ export {
   type BatchPublishResult,
 } from './realtime.js';
 export {
+  Auth,
+  createJwt,
+  type Capability,
+  type CreateJwtParams,
+  type CreateJwtOptions,
+} from './auth.js';
+export {
   Cipher,
   generateRandomKey,
   type CipherParams,

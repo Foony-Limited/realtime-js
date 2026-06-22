@@ -3,6 +3,21 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.8.0
+
+### Added
+
+- **`auth.createJwt` — local JWT minting.** A trusted backend holding a
+  Realtime API key can now mint a short-lived, capability-scoped token for a
+  less-trusted client without a network round-trip: `realtime.auth.createJwt({
+  capability, clientId, ttlMs })` (or the standalone `createJwt(params, { key })`)
+  signs an HS256 token locally with the key secret. The token's `kid` header is
+  the public key name so the edge can look up the secret to verify it; the payload
+  carries only `sub`/`cap`/`iat`/`exp` — no secret material. The browser returns
+  the token from its `authCallback` and the edge verifies it on the handshake.
+  Exports: `Auth`, `createJwt`, and the `Capability` / `CreateJwtParams` /
+  `CreateJwtOptions` types.
+
 ## 0.7.0
 
 ### Added
@@ -73,7 +88,7 @@ All notable changes to `@foony/realtime`. Format loosely follows
   forwards opaquely; the IV is prepended to the ciphertext. New exports:
   `generateRandomKey`, `Cipher`, and the `CipherParams`, `CipherAlgorithm`,
   `EncryptResult`, and `ChannelOptions` types. Only `data` is encrypted; the
-  event `name` and `clientId` stay in clear (matching Ably).
+  event `name` and `clientId` stay in clear.
 
 ### Changed
 

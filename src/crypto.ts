@@ -9,7 +9,7 @@
  *
  * The payload itself stays in the message's existing `data` field; how to read
  * it is described by a separate `encoding` string (HTTP `Content-Encoding`
- * style, the same approach Ably uses). For an encrypted message that's
+ * style). For an encrypted message that's
  * `cipher+aes-256-gcm/base64`, and `data` is the base64 of `iv ‖ ciphertext ‖
  * tag`. Decoding unwinds the `/`-separated transforms right-to-left. The edge
  * passes `encoding` through opaquely — only the SDK interprets it.
