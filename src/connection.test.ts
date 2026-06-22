@@ -206,11 +206,12 @@ describe('Connection end-to-end (fake edge)', () => {
     await waitFor(() => received.length === 1, 'decrypted echo');
     expect(received[0]).toEqual({ secret: 'hello' });
 
-    // What actually traversed the wire was ciphertext (base64 string) under a cipher encoding.
-    const sent = harness.publishFrames[0];
-    expect(sent?.encoding).toBe('cipher+aes-256-gcm/base64');
-    expect(typeof sent?.data).toBe('string');
-    expect(sent?.data).not.toContain('hello');
+    // What actually traversed the wire was ciphertext (base64 string) under a
+    // cipher encoding. Single publishes auto-batch, so it ships as a batch member.
+    const member = harness.publishFrames[0]?.messages?.[0];
+    expect(member?.encoding).toBe('cipher+aes-256-gcm/base64');
+    expect(typeof member?.data).toBe('string');
+    expect(member?.data).not.toContain('hello');
     await realtime.close();
   });
 

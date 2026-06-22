@@ -16,19 +16,19 @@ import type { BatchMember, MessageFrame, PresenceAction, PresenceEventFrame } fr
 export type UnsubscribeFn = EventUnsubscribeFn;
 
 /**
- * Automatic publish batching. When enabled, single `publish(name, data)` calls
- * are buffered and flushed as one batch frame (one stored, dedupable message),
- * trading a little latency for fewer messages and less transport overhead.
- * Batching is off unless a batch config is provided. Array publishes and
- * `batchPublish` are never buffered.
+ * Tuning for automatic publish batching. Single `publish(name, data)` calls are
+ * always auto-batched: buffered and flushed as one batch frame (one stored,
+ * dedupable message), which massively raises per-channel throughput for little
+ * to no latency cost. This type only tunes that behavior; it is never needed to
+ * turn batching on. Array publishes and `batchPublish` are never buffered.
  */
 export type BatchOptions = {
   /**
-   * Minimum gap between batch sends, in ms, applied as a throttle: a publish is
+   * Minimum gap between batch sends, in ms, applied as a throttle. A publish is
    * sent right away unless a batch went out within the last `intervalMs`, in
-   * which case it's buffered until the window elapses. Publishes spaced further
-   * apart than `intervalMs` are never batched (no added latency); only bursts
-   * faster than `intervalMs` coalesce. 0 (default) throttles nothing.
+   * which case it waits until the window is up. Publishes spaced further apart
+   * than `intervalMs` are never batched together and add no latency. Only fast
+   * bursts get grouped into one batch. Default 10.
    */
   readonly intervalMs?: number;
   /** Flush early once this many messages are buffered. Default 200. */
@@ -42,6 +42,7 @@ type BufferedPublish = {
   readonly reject: (error: Error) => void;
 };
 
+const DEFAULT_BATCH_INTERVAL_MS = 10;
 const DEFAULT_BATCH_MAX_MESSAGES = 200;
 
 /**
@@ -122,8 +123,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   /** Serializes async decryption so encrypted messages keep their arrival order. */
   private decryptChain: Promise<void> = Promise.resolve();
   /** Resolved auto-batch config (defaults applied). */
-  private readonly batch: { readonly enabled: boolean; readonly intervalMs: number; readonly maxMessages: number };
-  /** Buffered single publishes awaiting flush, when batching is enabled. */
+  private readonly batch: { readonly intervalMs: number; readonly maxMessages: number };
+  /** Buffered single publishes awaiting the next auto-batch flush. */
   private batchBuffer: BufferedPublish[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
   /** When the last batch was sent, to throttle sends to one per `intervalMs`. */
@@ -137,9 +138,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.name = name;
     this.cipher = cipher ? new Cipher(cipher) : null;
     this.batch = {
-      // Passing a batch config (even `{}`) opts the channel into batching.
-      enabled: batch !== undefined,
-      intervalMs: batch?.intervalMs ?? 0,
+      intervalMs: batch?.intervalMs ?? DEFAULT_BATCH_INTERVAL_MS,
       maxMessages: batch?.maxMessages ?? DEFAULT_BATCH_MAX_MESSAGES,
     };
     this.presence = new Presence(connection, name, this, this.cipher);
@@ -285,9 +284,9 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     void this.attach().catch(() => {});
     if (typeof nameOrMessages === 'string') {
       const member = await this.toMember(nameOrMessages, dataOrOptions);
-      // Buffer single publishes when batching is on — but not when a per-message
-      // ttl override is set (a batch shares one ttl), so send those immediately.
-      if (this.batch.enabled && options?.ttlMs === undefined) {
+      // Auto-batch single publishes — but not when a per-message ttl override is
+      // set (a batch shares one ttl), so send those immediately.
+      if (options?.ttlMs === undefined) {
         return this.enqueue(member);
       }
       await this.connection['publish']({
