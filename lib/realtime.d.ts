@@ -2,6 +2,7 @@
  * Realtime is the top-level client class. It owns a Connection and a
  * `channels.get(name)` registry — the public entry point for app code.
  */
+import { Auth } from './auth.js';
 import { Channel, type BatchOptions } from './channel.js';
 import { Connection, type ConnectionOptions, type ConnectionState } from './connection.js';
 import type { CipherParams } from './crypto.js';
@@ -27,7 +28,7 @@ export type BatchMessage = {
     /** Arbitrary JSON-serializable payload. */
     readonly data: unknown;
 };
-/** A batch-publish spec: send `messages` to each of `channels`. Mirrors Ably's BatchSpec. */
+/** A batch-publish spec: send `messages` to each of `channels`. */
 export type BatchSpec = {
     /** One channel name or a list of them. */
     readonly channels: string | readonly string[];
@@ -52,6 +53,8 @@ export type BatchPublishResult = {
  */
 export declare class Realtime {
     readonly connection: Connection;
+    /** Token-minting namespace. Signs with the client's key. */
+    readonly auth: Auth;
     private readonly channelsByName;
     private readonly batchDefault;
     /** Map-like accessor for channels. Stable instance per name. */
@@ -76,7 +79,7 @@ export declare class Realtime {
     /** Close the WebSocket and release every channel. */
     close(): Promise<void>;
     /**
-     * Publish messages to many channels in one call (Ably-compatible). Each spec
+     * Publish messages to many channels in one call. Each spec
      * sends its `messages` to each of its `channels`; messages to a single channel
      * go as one idempotent batch frame. This is publish-only — it does not attach
      * or subscribe the channels (so it scales to many channels), and it sends

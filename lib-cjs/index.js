@@ -6,9 +6,12 @@
  * and per-channel `subscribe` / `publish` / `presence` methods.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ErrorCode = exports.TypedEventEmitter = exports.DEFAULT_REALTIME_ENDPOINT = exports.Connection = exports.Presence = exports.Channel = exports.generateRandomKey = exports.Cipher = exports.Realtime = void 0;
+exports.ErrorCode = exports.TypedEventEmitter = exports.DEFAULT_REALTIME_ENDPOINT = exports.Connection = exports.Presence = exports.Channel = exports.generateRandomKey = exports.Cipher = exports.createJwt = exports.Auth = exports.Realtime = void 0;
 var realtime_js_1 = require("./realtime.js");
 Object.defineProperty(exports, "Realtime", { enumerable: true, get: function () { return realtime_js_1.Realtime; } });
+var auth_js_1 = require("./auth.js");
+Object.defineProperty(exports, "Auth", { enumerable: true, get: function () { return auth_js_1.Auth; } });
+Object.defineProperty(exports, "createJwt", { enumerable: true, get: function () { return auth_js_1.createJwt; } });
 var crypto_js_1 = require("./crypto.js");
 Object.defineProperty(exports, "Cipher", { enumerable: true, get: function () { return crypto_js_1.Cipher; } });
 Object.defineProperty(exports, "generateRandomKey", { enumerable: true, get: function () { return crypto_js_1.generateRandomKey; } });

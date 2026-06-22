@@ -5,9 +5,10 @@
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Realtime = void 0;
+const auth_js_1 = require("./auth.js");
 const channel_js_1 = require("./channel.js");
 const connection_js_1 = require("./connection.js");
-/** Ably's batch limits, enforced client-side. */
+/** Batch limits, enforced client-side. */
 const MAX_BATCH_CHANNELS = 100;
 const MAX_BATCH_MESSAGES = 1000;
 /**
@@ -16,6 +17,8 @@ const MAX_BATCH_MESSAGES = 1000;
  */
 class Realtime {
     connection;
+    /** Token-minting namespace. Signs with the client's key. */
+    auth;
     channelsByName = new Map();
     batchDefault;
     /** Map-like accessor for channels. Stable instance per name. */
@@ -50,6 +53,7 @@ class Realtime {
     };
     constructor(options) {
         this.connection = new connection_js_1.Connection(options);
+        this.auth = new auth_js_1.Auth(() => this.connection.options.key);
         this.batchDefault = options.batch;
     }
     /** Eagerly open the WebSocket. Optional — channels attach lazily. */
@@ -64,7 +68,7 @@ class Realtime {
         await this.connection.close();
     }
     /**
-     * Publish messages to many channels in one call (Ably-compatible). Each spec
+     * Publish messages to many channels in one call. Each spec
      * sends its `messages` to each of its `channels`; messages to a single channel
      * go as one idempotent batch frame. This is publish-only — it does not attach
      * or subscribe the channels (so it scales to many channels), and it sends

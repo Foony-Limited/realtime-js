@@ -5,6 +5,7 @@
  * and per-channel `subscribe` / `publish` / `presence` methods.
  */
 export { Realtime, type RealtimeOptions, type ChannelOptions, type BatchSpec, type BatchMessage, type BatchPublishResult, } from './realtime.js';
+export { Auth, createJwt, type Capability, type CreateJwtParams, type CreateJwtOptions, } from './auth.js';
 export { Cipher, generateRandomKey, type CipherParams, type CipherAlgorithm, type EncryptResult, } from './crypto.js';
 export { Channel, Presence, type BatchOptions, type ChannelEventListener, type ChannelEventResult, type ChannelEventType, type ChannelState, type ChannelStateChange, type ChannelStateListener, type PresenceEventResult, type PresenceEventType, type UnsubscribeFn, } from './channel.js';
 export { Connection, DEFAULT_REALTIME_ENDPOINT, TypedEventEmitter, type ConnectionEventEmitter, type ConnectionEventListener, type ConnectionEventResult, type ConnectionEventType, type ConnectionOptions, type ConnectionState, type ConnectionStateListener, type EventEmitter, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener, } from './connection.js';
