@@ -3,6 +3,20 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.7.0
+
+### Added
+
+- **Transparent server-coalesced bundles + delivered-message dedup.** The edge
+  may now pack independent publishes on a channel (across clients) into one stream
+  record — an "envelope of envelopes" — to raise server-side throughput. The SDK
+  unwraps these bundles automatically, so subscribers still receive individual
+  messages, and it now **deduplicates delivered messages by `(clientId,
+  messageId)`**: a publisher retry never surfaces a message to a subscriber twice.
+  This preserves exactly-once *delivery* as a system-wide property even though the
+  publish path is at-least-once. Dedup is keyed on the server-stamped `clientId`,
+  so one client cannot suppress another's message by reusing an id. No API change.
+
 ## 0.6.0
 
 ### Changed

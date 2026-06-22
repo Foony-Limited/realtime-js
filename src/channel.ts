@@ -10,7 +10,7 @@
 
 import { TypedEventEmitter, type Connection, type ConnectionState, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
 import { Cipher, isCipherEncoding, type CipherParams } from './crypto.js';
-import type { BatchMember, MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
+import type { BatchMember, BundledMessage, MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
 
 /** Listener handle returned by `subscribe` — call to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
@@ -44,6 +44,13 @@ type BufferedPublish = {
 
 const DEFAULT_BATCH_INTERVAL_MS = 10;
 const DEFAULT_BATCH_MAX_MESSAGES = 200;
+
+/**
+ * Cap on the per-channel delivered-message dedup cache. Bounds memory; the window
+ * it covers (this many recent messages) comfortably exceeds any realistic
+ * publisher-retry or live/coalescing reorder gap.
+ */
+const DEDUP_CACHE_MAX = 8192;
 
 /**
  * Channel lifecycle states. A channel walks this set as it attaches to
@@ -131,6 +138,15 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   private lastFlushMs = 0;
   private attachPromise: Promise<void> | null = null;
   private channelState: ChannelState = 'initialized';
+  /**
+   * Bounded, insertion-ordered set of recently delivered (clientId, messageId)
+   * keys, for exactly-once delivery. The server coalesces publishes across
+   * clients into one record and does not dedup the individual messages within
+   * it, so a publisher retry can deliver a message twice — we drop the repeat
+   * here. Keyed on the server-stamped clientId, so one client cannot suppress
+   * another's message by reusing its id.
+   */
+  private readonly seenMessages = new Map<string, true>();
 
   constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions) {
     super((_event, args) => args[0]);
@@ -402,6 +418,15 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * message.
    */
   private deliverMessage(frame: MessageFrame): void {
+    // Server bundle ("envelope of envelopes"): unwrap each member back into a
+    // frame and re-deliver it — a member may itself be a client batch, so this
+    // recurses one level before reaching deliverSingle.
+    if (frame.bundle !== undefined && frame.bundle.length > 0) {
+      for (const member of frame.bundle) {
+        this.deliverMessage(bundledToFrame(frame.channel, member));
+      }
+      return;
+    }
     if (frame.messages !== undefined && frame.messages.length > 0) {
       for (let index = 0; index < frame.messages.length; index++) {
         this.deliverSingle(memberFrame(frame, frame.messages[index]!, index));
@@ -412,12 +437,35 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
+   * True if this (clientId, messageId) was already delivered — drops duplicates
+   * a publisher retry can introduce once the server coalesces. Records unseen
+   * keys, evicting the oldest past the cap.
+   */
+  private isDuplicate(frame: MessageFrame): boolean {
+    const key = `${frame.clientId ?? ''} ${frame.messageId}`;
+    if (this.seenMessages.has(key)) {
+      return true;
+    }
+    this.seenMessages.set(key, true);
+    if (this.seenMessages.size > DEDUP_CACHE_MAX) {
+      const oldest = this.seenMessages.keys().next().value;
+      if (oldest !== undefined) {
+        this.seenMessages.delete(oldest);
+      }
+    }
+    return false;
+  }
+
+  /**
    * Dispatch one message frame, decrypting first when a cipher is set.
    * Decryption is serialized through a per-channel promise chain so messages
    * are emitted in arrival order even though decrypt is async. A frame whose
    * `encoding` isn't a cipher encoding passes through unchanged.
    */
   private deliverSingle(frame: MessageFrame): void {
+    if (this.isDuplicate(frame)) {
+      return;
+    }
     if (!this.cipher || !isCipherEncoding(frame.encoding)) {
       this.messages.dispatch(frame);
       return;
@@ -617,6 +665,21 @@ function memberFrame(base: MessageFrame, member: BatchMember, index: number): Me
     messageId: `${base.messageId}:${index}`,
     ...(base.clientId === undefined ? {} : { clientId: base.clientId }),
     ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+  };
+}
+
+/** Build a full message frame from one server-bundle member, taking the channel from the carrying frame. */
+function bundledToFrame(channel: string, member: BundledMessage): MessageFrame {
+  return {
+    t: 'msg',
+    channel,
+    name: member.name,
+    data: member.data,
+    timestamp: member.timestamp,
+    messageId: member.messageId,
+    ...(member.clientId === undefined ? {} : { clientId: member.clientId }),
+    ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+    ...(member.messages === undefined ? {} : { messages: member.messages }),
   };
 }
 

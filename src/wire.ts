@@ -201,6 +201,30 @@ export type MessageFrame = {
   readonly encoding?: string;
   /** Batch members; when set, this frame carries a batch and `name`/`data` are ignored. */
   readonly messages?: readonly BatchMember[];
+  /**
+   * Server-coalesced bundle: several independent publishes the edge packed into
+   * one stream record. Each member is a full message with its own server-stamped
+   * `clientId` + `messageId` (and may itself be a client batch). When set,
+   * `name`/`data`/`messages` are ignored — the SDK unwraps the members and dedups
+   * by (clientId, messageId).
+   */
+  readonly bundle?: readonly BundledMessage[];
+};
+
+/**
+ * One member of a server-coalesced {@link MessageFrame.bundle}. It is a delivered
+ * message minus the redundant `t`/`channel` (taken from the carrying frame): its
+ * own id/clientId/timestamp/encoding, plus `messages` when the member was itself a
+ * client batch.
+ */
+export type BundledMessage = {
+  readonly name: string;
+  readonly data: unknown;
+  readonly timestamp: number;
+  readonly messageId: string;
+  readonly clientId?: string;
+  readonly encoding?: string;
+  readonly messages?: readonly BatchMember[];
 };
 
 /** Server-originated presence transition. */

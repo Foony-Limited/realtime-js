@@ -487,6 +487,51 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('unwraps a server bundle and dedups repeated (clientId, messageId) deliveries', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:bundle');
+    const received: { name: string; id: string; clientId?: string }[] = [];
+    channel.subscribe((message) => received.push({ name: message.name, id: message.messageId, clientId: message.clientId }));
+    await waitFor(() => harness.sockets.length > 0, 'edge socket');
+    const edge = harness.sockets[0]!;
+
+    // A server bundle of two members from different clients, delivered as one frame.
+    const bundle = JSON.stringify({
+      t: 'msg',
+      channel: 'chat:bundle',
+      bundle: [
+        { name: 'a', data: { n: 1 }, messageId: 'b1', clientId: 'alice', timestamp: 1 },
+        { name: 'b', data: { n: 2 }, messageId: 'b2', clientId: 'bob', timestamp: 2 },
+      ],
+    });
+    edge.send(bundle);
+    await waitFor(() => received.length === 2, 'bundle unwrap');
+    expect(received.map((message) => message.name)).toEqual(['a', 'b']);
+    expect(received.map((message) => message.id)).toEqual(['b1', 'b2']);
+
+    // Re-deliver the same bundle (a publisher retry coalesced into a fresh record)
+    // plus a standalone repeat — every (clientId, messageId) is already seen, so
+    // nothing new is delivered.
+    edge.send(bundle);
+    edge.send(JSON.stringify({ t: 'msg', channel: 'chat:bundle', name: 'a', data: { n: 1 }, messageId: 'b1', clientId: 'alice', timestamp: 1 }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(received).toHaveLength(2);
+
+    // The same messageId from a DIFFERENT client is NOT a duplicate — dedup keys on
+    // the server-stamped clientId, so one client cannot suppress another's message.
+    edge.send(JSON.stringify({ t: 'msg', channel: 'chat:bundle', name: 'c', data: {}, messageId: 'b1', clientId: 'carol', timestamp: 3 }));
+    await waitFor(() => received.length === 3, 'cross-client not deduped');
+    expect(received[2]?.clientId).toBe('carol');
+    await realtime.close();
+  });
+
   it('batchPublish fans out to multiple channels and reports per-channel results', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,

@@ -108,6 +108,15 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
     private lastFlushMs;
     private attachPromise;
     private channelState;
+    /**
+     * Bounded, insertion-ordered set of recently delivered (clientId, messageId)
+     * keys, for exactly-once delivery. The server coalesces publishes across
+     * clients into one record and does not dedup the individual messages within
+     * it, so a publisher retry can deliver a message twice — we drop the repeat
+     * here. Keyed on the server-stamped clientId, so one client cannot suppress
+     * another's message by reusing its id.
+     */
+    private readonly seenMessages;
     constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions);
     /** Current channel lifecycle state. */
     get state(): ChannelState;
@@ -196,6 +205,12 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
      * message.
      */
     private deliverMessage;
+    /**
+     * True if this (clientId, messageId) was already delivered — drops duplicates
+     * a publisher retry can introduce once the server coalesces. Records unseen
+     * keys, evicting the oldest past the cap.
+     */
+    private isDuplicate;
     /**
      * Dispatch one message frame, decrypting first when a cipher is set.
      * Decryption is serialized through a per-channel promise chain so messages
