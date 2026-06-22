@@ -38,6 +38,7 @@
     }
   },
   "scripts": {
+    "prepublishOnly": "npm run build && npm test",
     "build": "tsc && tsc -p tsconfig.cjs.json && node ./scripts/write-cjs-package-json.mjs",
     "test": "vitest run",
     "test:watch": "vitest"

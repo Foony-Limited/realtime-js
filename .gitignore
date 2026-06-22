@@ -1,4 +1,6 @@
 node_modules
+lib
+lib-cjs
 *.log
 coverage
 .DS_Store
