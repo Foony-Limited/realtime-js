@@ -13,18 +13,19 @@ import type { MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js
 /** Listener handle returned by `subscribe` — call to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
 /**
- * Automatic publish batching. When enabled, single `publish(name, data)` calls
- * are buffered and flushed as one batch frame (one stored, dedupable message),
- * trading a little latency for fewer messages and less transport overhead.
- * Disabled by default. Array publishes and `batchPublish` are never buffered.
+ * Tuning for automatic publish batching. Single `publish(name, data)` calls are
+ * always auto-batched: buffered and flushed as one batch frame (one stored,
+ * dedupable message), which massively raises per-channel throughput for little
+ * to no latency cost. This type only tunes that behavior; it is never needed to
+ * turn batching on. Array publishes and `batchPublish` are never buffered.
  */
 export type BatchOptions = {
-    /** Turn batching on for the channel. Default false. */
-    readonly enabled?: boolean;
     /**
-     * How long to buffer before flushing, in ms. 0 (default) coalesces publishes
-     * made in the same tick with no added latency; a larger value batches more at
-     * the cost of up to `intervalMs` extra latency.
+     * Minimum gap between batch sends, in ms, applied as a throttle. A publish is
+     * sent right away unless a batch went out within the last `intervalMs`, in
+     * which case it waits until the window is up. Publishes spaced further apart
+     * than `intervalMs` are never batched together and add no latency. Only fast
+     * bursts get grouped into one batch. Default 10.
      */
     readonly intervalMs?: number;
     /** Flush early once this many messages are buffered. Default 200. */
@@ -100,9 +101,11 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
     private decryptChain;
     /** Resolved auto-batch config (defaults applied). */
     private readonly batch;
-    /** Buffered single publishes awaiting flush, when batching is enabled. */
+    /** Buffered single publishes awaiting the next auto-batch flush. */
     private batchBuffer;
     private batchTimer;
+    /** When the last batch was sent, to throttle sends to one per `intervalMs`. */
+    private lastFlushMs;
     private attachPromise;
     private channelState;
     constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions);
@@ -169,8 +172,9 @@ export declare class Channel extends TypedEventEmitter<ChannelEventType, Channel
     private toMember;
     /**
      * Flush any buffered (auto-batched) publishes now, as a single batch frame.
-     * Runs automatically on the configured interval, when the buffer is full, and
-     * on detach; call it to force an immediate send. No-op when nothing is buffered.
+     * Runs automatically once the throttle window elapses, when the buffer is
+     * full, and on detach; call it to force an immediate send. No-op when nothing
+     * is buffered.
      */
     flush(): void;
     /** Buffer a member for the next flush, scheduling or forcing a flush as needed. */

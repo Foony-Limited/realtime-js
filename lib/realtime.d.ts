@@ -7,14 +7,17 @@ import { Connection, type ConnectionOptions, type ConnectionState } from './conn
 import type { CipherParams } from './crypto.js';
 /** Options for the Realtime client; the connection options plus a default batch config. */
 export type RealtimeOptions = ConnectionOptions & {
-    /** Default auto-batching for every channel; overridable per channel. Disabled by default. */
+    /**
+     * Tuning for the always-on auto-batching applied to every channel
+     * (overridable per channel). Batching is on by default; this only adjusts it.
+     */
     readonly batch?: BatchOptions;
 };
 /** Per-channel options passed to `channels.get(name, options)`. */
 export type ChannelOptions = {
     /** Enable end-to-end payload encryption on this channel. */
     readonly cipher?: CipherParams;
-    /** Auto-batching for this channel; overrides the client-level default. */
+    /** Auto-batch tuning for this channel; overrides the client-level default. */
     readonly batch?: BatchOptions;
 };
 /** One message in a {@link BatchSpec}. */

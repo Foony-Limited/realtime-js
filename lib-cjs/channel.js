@@ -12,6 +12,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.Presence = exports.Channel = void 0;
 const connection_js_1 = require("./connection.js");
 const crypto_js_1 = require("./crypto.js");
+const DEFAULT_BATCH_INTERVAL_MS = 10;
 const DEFAULT_BATCH_MAX_MESSAGES = 200;
 /**
  * One subscription handle per (channel, listener) pair. Channels are
@@ -31,9 +32,11 @@ class Channel extends connection_js_1.TypedEventEmitter {
     decryptChain = Promise.resolve();
     /** Resolved auto-batch config (defaults applied). */
     batch;
-    /** Buffered single publishes awaiting flush, when batching is enabled. */
+    /** Buffered single publishes awaiting the next auto-batch flush. */
     batchBuffer = [];
     batchTimer = null;
+    /** When the last batch was sent, to throttle sends to one per `intervalMs`. */
+    lastFlushMs = 0;
     attachPromise = null;
     channelState = 'initialized';
     constructor(connection, name, cipher, batch) {
@@ -42,8 +45,7 @@ class Channel extends connection_js_1.TypedEventEmitter {
         this.name = name;
         this.cipher = cipher ? new crypto_js_1.Cipher(cipher) : null;
         this.batch = {
-            enabled: batch?.enabled ?? false,
-            intervalMs: batch?.intervalMs ?? 0,
+            intervalMs: batch?.intervalMs ?? DEFAULT_BATCH_INTERVAL_MS,
             maxMessages: batch?.maxMessages ?? DEFAULT_BATCH_MAX_MESSAGES,
         };
         this.presence = new Presence(connection, name, this, this.cipher);
@@ -148,9 +150,9 @@ class Channel extends connection_js_1.TypedEventEmitter {
         void this.attach().catch(() => { });
         if (typeof nameOrMessages === 'string') {
             const member = await this.toMember(nameOrMessages, dataOrOptions);
-            // Buffer single publishes when batching is on — but not when a per-message
-            // ttl override is set (a batch shares one ttl), so send those immediately.
-            if (this.batch.enabled && options?.ttlMs === undefined) {
+            // Auto-batch single publishes — but not when a per-message ttl override is
+            // set (a batch shares one ttl), so send those immediately.
+            if (options?.ttlMs === undefined) {
                 return this.enqueue(member);
             }
             await this.connection['publish']({
@@ -184,8 +186,9 @@ class Channel extends connection_js_1.TypedEventEmitter {
     }
     /**
      * Flush any buffered (auto-batched) publishes now, as a single batch frame.
-     * Runs automatically on the configured interval, when the buffer is full, and
-     * on detach; call it to force an immediate send. No-op when nothing is buffered.
+     * Runs automatically once the throttle window elapses, when the buffer is
+     * full, and on detach; call it to force an immediate send. No-op when nothing
+     * is buffered.
      */
     flush() {
         if (this.batchTimer !== null) {
@@ -197,6 +200,7 @@ class Channel extends connection_js_1.TypedEventEmitter {
         }
         const pending = this.batchBuffer;
         this.batchBuffer = [];
+        this.lastFlushMs = Date.now();
         void this.connection['publish']({
             t: 'pub',
             channel: this.name,
@@ -222,7 +226,12 @@ class Channel extends connection_js_1.TypedEventEmitter {
                 this.flush();
             }
             else if (this.batchTimer === null) {
-                this.batchTimer = setTimeout(() => this.flush(), this.batch.intervalMs);
+                // Throttle, don't fixed-delay: send right away unless a batch went out
+                // within `intervalMs`, in which case wait out the rest of the window.
+                // Publishes spaced further apart than `intervalMs` thus never batch.
+                const sinceLast = Date.now() - this.lastFlushMs;
+                const wait = sinceLast >= this.batch.intervalMs ? 0 : this.batch.intervalMs - sinceLast;
+                this.batchTimer = setTimeout(() => this.flush(), wait);
             }
         });
     }
