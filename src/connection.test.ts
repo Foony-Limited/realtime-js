@@ -315,6 +315,51 @@ describe('Connection end-to-end (fake edge)', () => {
     await expect(realtime.connect()).rejects.toThrow(/auth failed/);
   });
 
+  it('goes terminal (failed) on an auth error with an unrefreshable static token', async () => {
+    const states: string[] = [];
+    let failReason: Error | undefined;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'BAD',
+      autoReconnect: true,
+      initialReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    realtime.connection.on((state, reason) => {
+      states.push(state);
+      if (state === 'failed') failReason = reason;
+    });
+    await realtime.connect().catch(() => undefined);
+    await waitFor(() => states.includes('failed'), 'failed state');
+    // A static bad token would be re-sent and rejected identically, so the
+    // reconnect loop must not run: exactly one auth attempt, no recovery.
+    const attemptsAtFailure = harness.authFrames.length;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(harness.authFrames.length).toBe(attemptsAtFailure);
+    expect(attemptsAtFailure).toBe(1);
+    expect(failReason?.message).toMatch(/auth failed/);
+    await realtime.close();
+  });
+
+  it('keeps retrying and recovers when an authCallback can re-mint the token', async () => {
+    let calls = 0;
+    const states: string[] = [];
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      authCallback: () => (calls++ === 0 ? 'BAD' : 'GOOD'),
+      autoReconnect: true,
+      initialReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    realtime.connection.on((state) => states.push(state));
+    // The first attempt rejects on the bad token; the background loop re-auths.
+    await realtime.connect().catch(() => undefined);
+    await waitFor(() => states.includes('connected'), 'reconnect after re-auth');
+    expect(states).not.toContain('failed');
+    expect(harness.authFrames.length).toBeGreaterThanOrEqual(2);
+    await realtime.close();
+  });
+
   it('sends key auth credentials when configured with a Realtime key', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,

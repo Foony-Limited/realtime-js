@@ -22,6 +22,7 @@ import type {
   SubscribeFrame,
   UnsubscribeFrame,
 } from './wire.js';
+import { ErrorCode } from './wire.js';
 
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
@@ -197,7 +198,9 @@ export type ConnectionOptions = {
   readonly webSocket?: typeof WebSocket;
   /**
    * If true, attempt to reconnect after unexpected disconnects with
-   * exponential backoff. Defaults to true.
+   * exponential backoff. Defaults to true. An auth error that cannot be
+   * recovered (a bad/expired static `token` or `key` with no `authCallback` to
+   * re-mint) still ends in the terminal `failed` state rather than retrying.
    */
   readonly autoReconnect?: boolean;
   /**
@@ -286,6 +289,13 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 /** WebSocket.OPEN — duplicated here so we do not depend on a global. */
 const READY_STATE_OPEN = 1;
+/**
+ * Close code used when we abort a handshake server-side errors. The WebSocket
+ * API only permits 1000 or 3000-4999 from application code; reserved codes such
+ * as 1002 make `close()` throw InvalidAccessError (strict in Node/undici), so we
+ * use an app-specific 4xxx code to signal a failed handshake.
+ */
+const CLOSE_CODE_HANDSHAKE_FAILED = 4001;
 
 /**
  * A client-assigned message id for a publish — `<unixMillis>-<random>`, so it is
@@ -295,6 +305,22 @@ const READY_STATE_OPEN = 1;
 function newClientMessageId(): string {
   const random = Math.floor(Math.random() * 0x1_0000_0000).toString(16).padStart(8, '0');
   return `${Date.now()}-${random}`;
+}
+
+/**
+ * Close a socket without ever throwing. `WebSocket.close()` throws synchronously
+ * on a reserved/invalid code, and in a message-event listener that throw escapes
+ * to `process.nextTick` and kills the process. We never want a teardown to crash
+ * the caller, so swallow any error here.
+ */
+function safeClose(ws: WebSocket, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch (err) {
+    // Already closing, closed, or an environment that rejects the code. We must
+    // not rethrow (it would crash the host), but log so a real bug isn't masked.
+    console.error(`[realtime] socket close(${code}) failed:`, err);
+  }
 }
 
 /**
@@ -320,6 +346,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
+  /**
+   * Set when a handshake fails with an auth error we cannot recover from (a bad
+   * or expired credential with no `authCallback` to re-mint). The pending socket
+   * close reads it to move to a terminal `failed` state instead of retrying a
+   * credential that will be rejected identically forever.
+   */
+  private fatalError: Error | null = null;
   /** Channels the SDK has asked to be subscribed to; re-sent on reconnect. */
   private readonly desiredSubscriptions = new Set<string>();
   /** Publishes awaiting ack, keyed by client messageId; (re)sent on (re)connect. */
@@ -551,7 +584,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           parsed = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString()) as ServerFrame;
         } catch (err) {
           reject(new Error(`failed to parse auth response: ${(err as Error).message}`));
-          ws.close(1002, 'bad auth response');
+          safeClose(ws, CLOSE_CODE_HANDSHAKE_FAILED, 'bad auth response');
           return;
         }
         if (parsed.t === 'connected') {
@@ -568,11 +601,18 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           this.flushOutstandingPublishes();
         } else if (parsed.t === 'err') {
           const errFrame = parsed as ErrorFrame;
-          ws.close(1002, `auth error ${errFrame.code}`);
+          const authError = errFrame.code === ErrorCode.BadAuth || errFrame.code === ErrorCode.AuthExpired;
+          // An auth rejection only retries if `authCallback` can produce a fresh
+          // credential next attempt; a static `token`/`key` would be re-sent and
+          // rejected identically, so treat that as terminal.
+          if (authError && !this.options.authCallback) {
+            this.fatalError = new Error(`auth failed: ${errFrame.code} ${errFrame.message}`);
+          }
+          safeClose(ws, CLOSE_CODE_HANDSHAKE_FAILED, `auth error ${errFrame.code}`);
           reject(new Error(`auth failed: ${errFrame.code} ${errFrame.message}`));
         } else {
           reject(new Error(`unexpected first frame: ${parsed.t}`));
-          ws.close(1002, 'unexpected frame');
+          safeClose(ws, CLOSE_CODE_HANDSHAKE_FAILED, 'unexpected frame');
         }
       };
 
@@ -689,7 +729,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
   };
 
-  private handleClose(_event: CloseEvent): void {
+  private handleClose(event: CloseEvent): void {
     this.socket = null;
     // The dead socket's request ids will never be acked; drop the mappings.
     this.publishRequestIds.clear();
@@ -698,7 +738,22 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       this.failOutstandingPublishes(new Error('connection closed'));
       return;
     }
-    this.setState('disconnected');
+    if (this.fatalError) {
+      // Unrecoverable auth failure: stop here rather than retry a credential the
+      // server will keep rejecting. A later explicit connect() can still retry.
+      const fatal = this.fatalError;
+      this.fatalError = null;
+      this.setState('failed', fatal);
+      this.failOutstandingPublishes(fatal);
+      return;
+    }
+    // Surface why we dropped (e.g. our own 4001 auth-error close) so listeners
+    // can tell a transient network blip from a credential problem the reconnect
+    // loop will never fix on its own.
+    const reason = event.reason
+      ? new Error(`websocket closed: ${event.code} ${event.reason}`)
+      : new Error(`websocket closed: ${event.code}`);
+    this.setState('disconnected', reason);
     const willRetry = this.options.autoReconnect !== false && (this.options.queueMessages ?? true);
     if (willRetry) {
       // Keep outstanding publishes (in-flight + buffered) to resend on reconnect.
@@ -722,9 +777,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect().catch(() => {
-        // doConnect itself drove the state machine; schedule another
-        // attempt unless we've been explicitly closed in the meantime.
-        if (this.state !== 'closed' && this.state !== 'closing') {
+        // doConnect itself drove the state machine; schedule another attempt
+        // unless we've been explicitly closed or hit a terminal auth failure.
+        if (this.state !== 'closed' && this.state !== 'closing' && this.state !== 'failed') {
           this.scheduleReconnect();
         }
       });
@@ -750,10 +805,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.socket.send(JSON.stringify(frame));
   }
 
-  private setState(state: ConnectionState): void {
+  private setState(state: ConnectionState, reason?: Error): void {
     if (this.state === state) return;
     this.state = state;
-    this.emitState(state);
+    this.emitState(state, reason);
   }
 
   private emitState(state: ConnectionState, reason?: Error): void {

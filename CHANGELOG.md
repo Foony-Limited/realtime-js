@@ -3,6 +3,36 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.8.1
+
+### Fixed
+
+- **Reconnect no longer crashes the process on a handshake error.** When the
+  server rejected the handshake (e.g. an expired token surfaced as an `err`
+  frame on reconnect), the SDK closed the socket with reserved WebSocket code
+  `1002`. Node's `undici` WebSocket follows the spec strictly and threw
+  `InvalidAccessError: invalid code`. Thrown from inside a `message` listener,
+  it escaped to `process.nextTick` and killed the host process. Handshake
+  teardown now uses an app-specific close code (`4001`) and swallows any
+  `close()` error, so a rejected handshake degrades to a normal
+  failed-connect/reconnect instead of a crash.
+
+### Changed
+
+- **Disconnect reason is now surfaced to connection listeners.** The
+  `disconnected` state event now carries an `Error` describing the close (code
+  and server reason), so a credential problem the reconnect loop can't fix on
+  its own is visible instead of looping silently. A failed `close()` during
+  teardown is also logged via `console.error` rather than swallowed.
+- **Unrecoverable auth errors now go terminal instead of retrying forever.** A
+  handshake rejected with an auth error (`BadAuth` / `AuthExpired`) only keeps
+  retrying when an `authCallback` can mint a fresh credential on the next
+  attempt. With a static `token` or `key`, the same credential would be re-sent
+  and rejected identically, so the connection now enters the terminal `failed`
+  state (carrying the auth error) rather than looping. A later explicit
+  `connect()` can still retry. Non-auth handshake errors keep retrying as
+  before.
+
 ## 0.8.0
 
 ### Added
