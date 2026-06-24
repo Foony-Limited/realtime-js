@@ -148,6 +148,14 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    */
   private readonly seenMessages = new Map<string, true>();
 
+  /**
+   * The most recent server message id delivered on this channel — the resume cursor the
+   * SDK sends on (re)subscribe so the server replays anything missed during a disconnect.
+   * Advanced monotonically (ids are k-sortable), so replaying already-seen messages on a
+   * resume never drags it backward.
+   */
+  private lastMessageId: string | undefined;
+
   constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions) {
     super((_event, args) => args[0]);
     this.connection = connection;
@@ -161,6 +169,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.connection['registerChannel'](this.name, {
       message: (message) => this.deliverMessage(message),
       presence: (event) => this.presence['emitPresence'](event),
+      lastMessageId: () => this.lastMessageId,
+      resumed: (resumed) => this.onResumed(resumed),
     });
     this.connection.on((state, reason) => this.onConnectionState(state, reason));
   }
@@ -180,10 +190,10 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     if (this.channelState === 'attached') return;
     if (this.attachPromise) return this.attachPromise;
     this.transition('attaching');
-    this.attachPromise = this.connection['request']({ t: 'sub', channel: this.name })
-      .then(() => {
+    this.attachPromise = this.connection['request'](this.subscribeFrame())
+      .then((ack) => {
         this.connection['rememberSubscription'](this.name);
-        this.transition('attached', { resumed: false });
+        this.transition('attached', { resumed: ack.resumed ?? false });
       })
       .catch((error: unknown) => {
         this.transition('failed', { reason: asError(error) });
@@ -193,6 +203,13 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
         this.attachPromise = null;
       });
     return this.attachPromise;
+  }
+
+  /** Build the `sub` frame, carrying the resume cursor when this channel has one. */
+  private subscribeFrame(): { readonly t: 'sub'; readonly channel: string; readonly lastMessageId?: string } {
+    return this.lastMessageId === undefined
+      ? { t: 'sub', channel: this.name }
+      : { t: 'sub', channel: this.name, lastMessageId: this.lastMessageId };
   }
 
   /**
@@ -431,9 +448,24 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       for (let index = 0; index < frame.messages.length; index++) {
         this.deliverSingle(memberFrame(frame, frame.messages[index]!, index));
       }
+      // The whole batch is one server record under frame.messageId; advance the resume
+      // cursor to it, not to the synthetic per-member ids the server doesn't know.
+      this.recordCursor(frame.messageId);
       return;
     }
     this.deliverSingle(frame);
+    this.recordCursor(frame.messageId);
+  }
+
+  /**
+   * Advance the resume cursor to a delivered server record id, monotonically. Message
+   * ids are k-sortable, so a resume that replays already-seen messages never drags the
+   * cursor backward (which would cause needless re-fetching on the next resume).
+   */
+  private recordCursor(messageId: string): void {
+    if (messageId && (this.lastMessageId === undefined || messageId > this.lastMessageId)) {
+      this.lastMessageId = messageId;
+    }
   }
 
   /**
@@ -481,6 +513,18 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     });
   }
 
+  /**
+   * Finalize a reconnect re-subscribe: the connection re-issued the `sub` with our resume
+   * cursor and the server reported whether the gap was replayed. resumed=false is a
+   * discontinuity (messages may have been missed beyond retention), which listeners can
+   * act on — e.g. reload state or read history.
+   */
+  private onResumed(resumed: boolean): void {
+    if (this.channelState === 'attaching' || this.channelState === 'suspended' || this.channelState === 'attached') {
+      this.transition('attached', { resumed });
+    }
+  }
+
   /** Drive the state machine from connection lifecycle changes. */
   private onConnectionState(state: ConnectionState, reason?: Error): void {
     if (state === 'disconnected' && this.channelState === 'attached') {
@@ -488,12 +532,11 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       return;
     }
     if (state === 'connected') {
-      // The connection restores remembered subscriptions on reconnect, so
-      // reflect the resume back to channel state listeners.
+      // The connection re-subscribes remembered channels on reconnect and reports the
+      // true resume outcome via onResumed; move to 'attaching' until that ack arrives
+      // rather than optimistically claiming a resume that may be a discontinuity.
       if (this.channelState === 'suspended') {
-        this.transition('attached', { resumed: true });
-      } else if (this.channelState === 'attached') {
-        this.emit('update', { current: 'attached', previous: 'attached', resumed: true });
+        this.transition('attaching');
       }
       return;
     }

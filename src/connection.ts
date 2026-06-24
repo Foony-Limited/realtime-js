@@ -283,6 +283,10 @@ export type PresenceEventListener = (event: PresenceEventFrame) => void;
 type ChannelDispatchers = {
   readonly message: (message: MessageFrame) => void;
   readonly presence: (event: PresenceEventFrame) => void;
+  /** The channel's resume cursor (its last delivered message id), or undefined. */
+  readonly lastMessageId: () => string | undefined;
+  /** Report the resume outcome once a reconnect re-subscribe has acked. */
+  readonly resumed: (resumed: boolean) => void;
 };
 
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
@@ -787,14 +791,20 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   private restoreSubscriptionsOnReconnect(): void {
-    // The Channel layer is responsible for re-issuing `sub` frames; we
-    // expose desiredSubscriptions so it can iterate without leaking the
-    // set.
+    // Re-issue a `sub` for every remembered channel, carrying its resume cursor so the
+    // server replays whatever was published during the disconnect, then report the
+    // resume outcome (replayed vs discontinuity) back to the channel.
     for (const channel of this.desiredSubscriptions) {
-      this.request({ t: 'sub', channel }).catch(() => {
-        // Failure to restore a subscription bubbles up via state
-        // listeners on the next request; nothing else to do here.
-      });
+      const dispatchers = this.channelDispatchers.get(channel);
+      const lastMessageId = dispatchers?.lastMessageId();
+      const frame: Omit<SubscribeFrame, 'id'> =
+        lastMessageId === undefined ? { t: 'sub', channel } : { t: 'sub', channel, lastMessageId };
+      this.request(frame)
+        .then((ack) => dispatchers?.resumed(ack.resumed ?? false))
+        .catch(() => {
+          // A failed restore surfaces via channel state on the next reconnect; the
+          // channel stays 'attaching' until then.
+        });
     }
   }
 

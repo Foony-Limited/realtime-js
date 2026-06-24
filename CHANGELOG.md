@@ -3,6 +3,21 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.9.0
+
+### Added
+
+- **Connection resume.** On reconnect (and on re-attach) a channel now sends the id
+  of the last message it delivered as a resume cursor, and the edge replays everything
+  published after it before resuming the live tail — so messages published while a
+  client was briefly disconnected are no longer lost. The cursor advances monotonically
+  and the existing `(clientId, messageId)` dedup removes any overlap with the live tail.
+  When the cursor has aged out of the server's retention window, the (re)attach surfaces
+  a **discontinuity** (`resumed: false` in the channel's `attached` state change) instead
+  of silently resuming with a gap; within the window it reports `resumed: true`. On a
+  reconnect a suspended channel now passes briefly through `attaching` until the resume
+  ack arrives, rather than optimistically claiming `resumed: true`.
+
 ## 0.8.1
 
 ### Changed

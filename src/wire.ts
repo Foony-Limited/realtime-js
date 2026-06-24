@@ -179,6 +179,13 @@ export type AckFrame = {
   readonly t: 'ack';
   /** Echoes the id of the client request being acknowledged. */
   readonly id: number;
+  /**
+   * Resume outcome for a `sub` that carried `lastMessageId`: true when the missed
+   * messages were replayed before this ack, false when the cursor had aged out of
+   * retention (a discontinuity — messages may have been missed beyond the window).
+   * Absent for non-resume requests.
+   */
+  readonly resumed?: boolean;
 };
 
 /** Server-originated channel message. */
