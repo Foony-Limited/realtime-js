@@ -102,6 +102,12 @@ export type PublishFrame = {
   /** Batch members; when set, this is a batch publish and `name`/`data` are ignored. */
   readonly messages?: readonly BatchMember[];
   /**
+   * Fire-and-forget: deliver live to current subscribers but exclude from history and
+   * connection-resume (and retain minimally). For transient events on a channel that
+   * otherwise persists.
+   */
+  readonly ephemeral?: boolean;
+  /**
    * Client-assigned message id, stable across resends. The server uses it as the
    * JetStream dedup key (`Nats-Msg-Id`), so a publish resent after a reconnect is
    * collapsed to one message (exactly-once).
@@ -208,6 +214,8 @@ export type MessageFrame = {
   readonly encoding?: string;
   /** Batch members; when set, this frame carries a batch and `name`/`data` are ignored. */
   readonly messages?: readonly BatchMember[];
+  /** Fire-and-forget message: not stored in history and not replayed on resume. */
+  readonly ephemeral?: boolean;
   /**
    * Server-coalesced bundle: several independent publishes the edge packed into
    * one stream record. Each member is a full message with its own server-stamped
@@ -231,6 +239,8 @@ export type BundledMessage = {
   readonly messageId: string;
   readonly clientId?: string;
   readonly encoding?: string;
+  /** Fire-and-forget message: not stored in history and not replayed on resume. */
+  readonly ephemeral?: boolean;
   readonly messages?: readonly BatchMember[];
 };
 

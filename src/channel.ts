@@ -296,7 +296,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    *   message is retained for history (server-clamped to your plan ceiling);
    *   omit it for the short ephemeral default.
    */
-  publish(name: string, data: unknown, options?: { readonly ttlMs?: number }): Promise<void>;
+  publish(name: string, data: unknown, options?: { readonly ttlMs?: number; readonly ephemeral?: boolean }): Promise<void>;
   /**
    * Publish a batch of messages in a single frame under one message id. The
    * batch is the atomic unit: the server stores and dedups it as one durable
@@ -306,20 +306,21 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * @param messages - The messages to publish, each with its own `name`/`data`.
    * @param options - Optional publish controls (e.g. `ttlMs`).
    */
-  publish(messages: ReadonlyArray<{ readonly name: string; readonly data: unknown }>, options?: { readonly ttlMs?: number }): Promise<void>;
+  publish(messages: ReadonlyArray<{ readonly name: string; readonly data: unknown }>, options?: { readonly ttlMs?: number; readonly ephemeral?: boolean }): Promise<void>;
   async publish(
     nameOrMessages: string | ReadonlyArray<{ readonly name: string; readonly data: unknown }>,
     dataOrOptions?: unknown,
-    options?: { readonly ttlMs?: number },
+    options?: { readonly ttlMs?: number; readonly ephemeral?: boolean },
   ): Promise<void> {
     // Publishing does not attach: a publisher that never subscribed should not
     // hold a server-side subscription. Offline publishes are still buffered and
     // resent by the connection's queueMessages, independent of attach state.
     if (typeof nameOrMessages === 'string') {
       const member = await this.toMember(nameOrMessages, dataOrOptions);
-      // Auto-batch single publishes — but not when a per-message ttl override is
-      // set (a batch shares one ttl), so send those immediately.
-      if (options?.ttlMs === undefined) {
+      // Auto-batch single publishes — but not when a per-message ttl override or the
+      // ephemeral flag is set (a batch shares one ttl and one ephemeral disposition),
+      // so send those immediately.
+      if (options?.ttlMs === undefined && options?.ephemeral !== true) {
         return this.enqueue(member);
       }
       await this.connection['publish']({
@@ -329,10 +330,11 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
         data: member.data,
         ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
         ...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
+        ...(options?.ephemeral === true ? { ephemeral: true } : {}),
       });
       return;
     }
-    const opts = dataOrOptions as { readonly ttlMs?: number } | undefined;
+    const opts = dataOrOptions as { readonly ttlMs?: number; readonly ephemeral?: boolean } | undefined;
     const members = await Promise.all(nameOrMessages.map((message) => this.toMember(message.name, message.data)));
     await this.connection['publish']({
       t: 'pub',
@@ -341,6 +343,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       data: null,
       messages: members,
       ...(opts?.ttlMs === undefined ? {} : { ttlMs: opts.ttlMs }),
+      ...(opts?.ephemeral === true ? { ephemeral: true } : {}),
     });
   }
 
@@ -449,12 +452,17 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
         this.deliverSingle(memberFrame(frame, frame.messages[index]!, index));
       }
       // The whole batch is one server record under frame.messageId; advance the resume
-      // cursor to it, not to the synthetic per-member ids the server doesn't know.
-      this.recordCursor(frame.messageId);
+      // cursor to it, not to the synthetic per-member ids. Ephemeral messages are never
+      // resumable, so they must not advance the cursor — the server would not find them.
+      if (frame.ephemeral !== true) {
+        this.recordCursor(frame.messageId);
+      }
       return;
     }
     this.deliverSingle(frame);
-    this.recordCursor(frame.messageId);
+    if (frame.ephemeral !== true) {
+      this.recordCursor(frame.messageId);
+    }
   }
 
   /**
@@ -708,6 +716,7 @@ function memberFrame(base: MessageFrame, member: BatchMember, index: number): Me
     messageId: `${base.messageId}:${index}`,
     ...(base.clientId === undefined ? {} : { clientId: base.clientId }),
     ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+    ...(base.ephemeral === true ? { ephemeral: true } : {}),
   };
 }
 
@@ -722,6 +731,7 @@ function bundledToFrame(channel: string, member: BundledMessage): MessageFrame {
     messageId: member.messageId,
     ...(member.clientId === undefined ? {} : { clientId: member.clientId }),
     ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+    ...(member.ephemeral === true ? { ephemeral: true } : {}),
     ...(member.messages === undefined ? {} : { messages: member.messages }),
   };
 }

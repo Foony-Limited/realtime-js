@@ -17,6 +17,12 @@ All notable changes to `@foony/realtime`. Format loosely follows
   of silently resuming with a gap; within the window it reports `resumed: true`. On a
   reconnect a suspended channel now passes briefly through `attaching` until the resume
   ack arrives, rather than optimistically claiming `resumed: true`.
+- **Per-message ephemeral publishes.** `channel.publish(name, data, { ephemeral: true })`
+  (also valid on a batch publish) marks a message fire-and-forget: it is delivered live to
+  current subscribers — flagged `ephemeral` on the delivered message — but is excluded from
+  history and connection-resume, and never advances the resume cursor. Lets transient events
+  (typing indicators, cursors, reactions) ride a channel that otherwise persists, without
+  polluting its history.
 
 ## 0.8.1
 
