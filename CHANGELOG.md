@@ -24,6 +24,23 @@ All notable changes to `@foony/realtime`. Format loosely follows
   (typing indicators, cursors, reactions) ride a channel that otherwise persists, without
   polluting its history.
 
+### Fixed
+
+- **Intermittent `1006` on connect (handshake race).** The connect path created the
+  WebSocket and then `await`ed `authCallback` (a token fetch) *before* attaching the
+  `open` listener, so a fast upgrade racing a slow token fetch lost the `open` event — the
+  auth frame was never sent and the connection hung until it was dropped. The auth frame
+  is now built before the socket is opened (with a `readyState` guard for a synchronously
+  opening WebSocket), so it is always sent. Also fixes a socket leak when the token fetch threw.
+- **Idle connections dropped with `1006` (no keep-alive).** The SDK never sent pings, so a
+  connection with no subscriptions or traffic was culled by intermediary WebSocket idle
+  timeouts (e.g. Cloudflare). It now sends a ping every server-advertised `keepAliveMs`.
+- **A channel whose attach failed was orphaned.** A subscription was remembered only on
+  attach *success*, so a channel whose attach failed because the connection dropped was
+  never re-subscribed on reconnect (it stayed dead even on a healthy new connection). The
+  intent is now remembered up front and recovered on reconnect; only a terminal capability
+  denial (403xx) stops retrying and surfaces `failed`.
+
 ## 0.8.1
 
 ### Changed

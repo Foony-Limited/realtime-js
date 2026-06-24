@@ -317,6 +317,15 @@ function newClientMessageId(): string {
  * to `process.nextTick` and kills the process. We never want a teardown to crash
  * the caller, so swallow any error here.
  */
+/**
+ * Build an Error for a server `err` frame, tagging it with the numeric code so callers
+ * (e.g. Channel.attach) can tell a terminal capability denial apart from a transient
+ * failure that should recover on reconnect.
+ */
+function serverError(code: number, message: string): Error & { code: number } {
+  return Object.assign(new Error(`server error ${code}: ${message}`), { code });
+}
+
 function safeClose(ws: WebSocket, code: number, reason: string): void {
   try {
     ws.close(code, reason);
@@ -349,6 +358,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private readonly channelDispatchers = new Map<string, ChannelDispatchers>();
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Keep-alive ping timer. Sends a ping every server-advertised `keepAliveMs` so an idle
+   * connection (no subscriptions or traffic) is not culled by an intermediary such as
+   * Cloudflare's WebSocket idle timeout, which surfaces to the app as a 1006 drop.
+   */
+  private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectAttempt = 0;
   /**
    * Set when a handshake fails with an auth error we cannot recover from (a bad
@@ -410,6 +425,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.stopKeepAlive();
     this.setState('closing');
     if (this.socket && this.socket.readyState === READY_STATE_OPEN) {
       this.socket.close(1000, 'client close');
@@ -569,9 +585,14 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
   private async doConnect(): Promise<void> {
     this.setState('connecting');
+    // Build the auth frame BEFORE opening the socket. createAuthFrame may await an async
+    // authCallback (a token fetch); if that await straddled socket creation, the WebSocket
+    // could fire 'open' before the listener below was attached — the event would be lost,
+    // the auth frame never sent, and the connection would hang until it was dropped
+    // (surfacing as a 1006 during the handshake). Fetching first removes that window.
+    const authFrame = await this.createAuthFrame();
     const ws = await this.makeSocket();
     this.socket = ws;
-    const authFrame = await this.createAuthFrame();
 
     return new Promise<void>((resolve, reject) => {
       const onOpen = (): void => {
@@ -600,6 +621,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           ws.removeEventListener('message', onAuthMessage as EventListener);
           ws.addEventListener('message', this.handleMessage);
           this.setState('connected');
+          this.startKeepAlive(connected.keepAliveMs);
           resolve();
           this.restoreSubscriptionsOnReconnect();
           this.flushOutstandingPublishes();
@@ -637,6 +659,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       ws.addEventListener('message', onAuthMessage as EventListener);
       ws.addEventListener('error', onError);
       ws.addEventListener('close', onClose, { once: true });
+      // No await now stands between socket creation and here, so 'open' cannot have fired
+      // yet — but guard anyway in case a WebSocket implementation opens synchronously.
+      if (ws.readyState === READY_STATE_OPEN) {
+        onOpen();
+      }
     });
   }
 
@@ -690,7 +717,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           const pending = this.pending.get(frame.id);
           if (pending) {
             this.pending.delete(frame.id);
-            pending.reject(new Error(`server error ${frame.code}: ${frame.message}`));
+            pending.reject(serverError(frame.code, frame.message));
             return;
           }
           if (this.settlePublish(frame.id, new Error(`server error ${frame.code}: ${frame.message}`))) {
@@ -735,6 +762,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
   private handleClose(event: CloseEvent): void {
     this.socket = null;
+    this.stopKeepAlive();
     // The dead socket's request ids will never be acked; drop the mappings.
     this.publishRequestIds.clear();
     if (this.state === 'closing' || this.state === 'closed') {
@@ -805,6 +833,32 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           // A failed restore surfaces via channel state on the next reconnect; the
           // channel stays 'attaching' until then.
         });
+    }
+  }
+
+  /** Start sending a keep-alive ping every `keepAliveMs` (no-op when non-positive). */
+  private startKeepAlive(keepAliveMs: number): void {
+    this.stopKeepAlive();
+    if (!keepAliveMs || keepAliveMs <= 0) {
+      return;
+    }
+    this.keepAliveTimer = setInterval(() => {
+      if (this.state !== 'connected' || !this.socket || this.socket.readyState !== READY_STATE_OPEN) {
+        return;
+      }
+      try {
+        this.sendRaw({ t: 'ping' });
+      } catch {
+        // Socket is mid-teardown; the close handler will drive the reconnect.
+      }
+    }, keepAliveMs);
+  }
+
+  /** Stop the keep-alive ping timer. */
+  private stopKeepAlive(): void {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
     }
   }
 

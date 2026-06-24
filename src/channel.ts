@@ -190,13 +190,24 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     if (this.channelState === 'attached') return;
     if (this.attachPromise) return this.attachPromise;
     this.transition('attaching');
+    // Remember the intent before the request resolves: if the connection drops mid-attach,
+    // this channel must still be re-subscribed once the connection is restored, not left
+    // orphaned. A terminal capability denial forgets it again below so it isn't retried.
+    this.connection['rememberSubscription'](this.name);
     this.attachPromise = this.connection['request'](this.subscribeFrame())
       .then((ack) => {
-        this.connection['rememberSubscription'](this.name);
         this.transition('attached', { resumed: ack.resumed ?? false });
       })
       .catch((error: unknown) => {
-        this.transition('failed', { reason: asError(error) });
+        if (isCapabilityError(error)) {
+          // Permission won't change on retry — stop trying and surface it.
+          this.connection['forgetSubscription'](this.name);
+          this.transition('failed', { reason: asError(error) });
+        } else {
+          // Transient (e.g. the connection dropped mid-attach): stay remembered and
+          // suspended so the reconnect re-subscribe recovers the channel.
+          this.transition('suspended', { reason: asError(error) });
+        }
         throw error;
       })
       .finally(() => {
@@ -706,6 +717,16 @@ function asError(error: unknown): Error {
 }
 
 /** Build a per-member message frame from a batch frame; member id is `<batchId>:<index>`. */
+/**
+ * True for a server error that won't change on retry — the forbidden / capability /
+ * channel-denied family (403xx). A failed attach with such an error is terminal; any
+ * other failure (e.g. a dropped connection) is transient and recovers on reconnect.
+ */
+function isCapabilityError(error: unknown): boolean {
+  const code = (error as { code?: number } | null)?.code;
+  return typeof code === 'number' && code >= 40300 && code < 40400;
+}
+
 function memberFrame(base: MessageFrame, member: BatchMember, index: number): MessageFrame {
   return {
     t: 'msg',

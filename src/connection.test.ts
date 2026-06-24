@@ -21,8 +21,15 @@ type Harness = {
   readonly authFrames: AuthFrame[];
   /** Every publish frame the edge received (across reconnects), in order. */
   readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
-  /** Mutable test controls. Set `dropNextPublish` to drop the next publish before acking. */
-  readonly control: { dropNextPublish: boolean };
+  /** Every sub frame the edge received, tagged with the connection index it arrived on. */
+  readonly subFrames: { channel: string; conn: number }[];
+  /** Receipt times of every keep-alive ping the edge received. */
+  readonly pings: number[];
+  /**
+   * Mutable test controls: drop the next publish/sub before acking (to simulate a socket
+   * dying mid-request), and the keepAliveMs the edge advertises in its connected frame.
+   */
+  readonly control: { dropNextPublish: boolean; dropNextSub: boolean; keepAliveMs: number };
 };
 
 async function startFakeEdge(): Promise<Harness> {
@@ -32,7 +39,9 @@ async function startFakeEdge(): Promise<Harness> {
   const sockets: NodeWebSocket[] = [];
   const authFrames: AuthFrame[] = [];
   const publishFrames: Harness['publishFrames'] = [];
-  const control = { dropNextPublish: false };
+  const subFrames: Harness['subFrames'] = [];
+  const pings: Harness['pings'] = [];
+  const control = { dropNextPublish: false, dropNextSub: false, keepAliveMs: 30_000 };
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
@@ -50,11 +59,25 @@ async function startFakeEdge(): Promise<Harness> {
         const connected: ServerFrame = {
           t: 'connected',
           connectionId: `conn-${nextConnIndex}`,
-          keepAliveMs: 30_000,
+          keepAliveMs: control.keepAliveMs,
           clientId: 'alice',
         };
         socket.send(JSON.stringify(connected));
         return;
+      }
+      if (frame.t === 'ping') {
+        pings.push(Date.now());
+        socket.send(JSON.stringify({ t: 'pong' } satisfies ServerFrame));
+        return;
+      }
+      if (frame.t === 'sub') {
+        subFrames.push({ channel: frame.channel, conn: nextConnIndex });
+        if (control.dropNextSub) {
+          control.dropNextSub = false;
+          // Die in the gap between receiving the sub and acking it, so the attach fails.
+          socket.close(1001, 'drop before sub ack');
+          return;
+        }
       }
       if (frame.t === 'pub') {
         publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs, data: frame.data, encoding: frame.encoding, channel: frame.channel, messages: frame.messages });
@@ -114,7 +137,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
     });
   });
-  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, control };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, pings, control };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -695,6 +718,67 @@ describe('Connection end-to-end (fake edge)', () => {
 
     await realtime.close();
   });
+
+  it('A: sends the auth frame even when authCallback resolves after the socket opens', async () => {
+    // The local upgrade completes in ~1ms; a 60ms authCallback guarantees the WS 'open'
+    // fires while the token is still being fetched — the race that loses the auth frame.
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: async () => {
+        await delay(60);
+        return 'GOOD';
+      },
+    });
+    await Promise.race([
+      realtime.connect(),
+      delay(1_500).then(() => {
+        throw new Error('connect timed out: auth frame was never sent (handshake race)');
+      }),
+    ]);
+    expect(harness.authFrames.map((frame) => frame.token)).toContain('GOOD');
+    expect(realtime.getConnectionId()).toBe('conn-1');
+    await realtime.close();
+  });
+
+  it('B: sends keep-alive pings on the keepAliveMs cadence while idle', async () => {
+    harness.control.keepAliveMs = 40; // tiny cadence so the test stays fast
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+    // No subscriptions and no publishes: a fully idle connection must still be kept
+    // alive, or an intermediary (e.g. Cloudflare) drops it with a 1006.
+    await waitFor(() => harness.pings.length >= 2, 'idle keep-alive pings');
+    await realtime.close();
+  });
+
+  it('C: recovers a channel whose first attach failed once the connection is restored', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    // The first attach hits a connection that dies before acking the sub. The channel
+    // must not be orphaned: once reconnected, it has to be re-subscribed.
+    harness.control.dropNextSub = true;
+    const channel = realtime.channels.get('chat:room');
+    channel.subscribe(() => {});
+
+    await waitFor(
+      () => harness.subFrames.some((sub) => sub.channel === 'chat:room' && sub.conn >= 2),
+      're-subscribe on the restored connection',
+    );
+    await realtime.close();
+  });
 });
 
 /** Poll until `predicate` is true or 2s elapses. */
@@ -705,6 +789,11 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`timed out waiting for ${label}`);
+}
+
+/** Resolve after `ms` milliseconds. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function createCapturingWebSocket(urls: string[]): typeof WebSocket {
