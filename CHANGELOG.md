@@ -5,6 +5,15 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ## 0.8.1
 
+### Changed
+
+- **`publish()` no longer attaches the channel.** Previously every publish
+  implicitly subscribed the publisher to the channel so it would also receive
+  live messages. A publish-only client (e.g. a server bridge) thus accumulated
+  one server-side subscription per channel it published to, and could exhaust a
+  connection's active-channel quota. Offline publishes are still buffered and
+  resent by `queueMessages`, and are unaffected by this change.
+
 ### Fixed
 
 - **Reconnect no longer crashes the process on a handshake error.** When the

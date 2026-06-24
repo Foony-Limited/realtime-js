@@ -270,7 +270,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Publish one application-level message to the channel.
+   * Publish one application-level message to the channel. Publishing does not
+   * subscribe you to the channel; call `subscribe()` if you also want to receive.
    *
    * @param name - The event name.
    * @param data - The data to publish.
@@ -294,10 +295,9 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     dataOrOptions?: unknown,
     options?: { readonly ttlMs?: number },
   ): Promise<void> {
-    // Attach so the publisher also receives this channel's live messages, but don't
-    // block the publish on it: when the connection is down, queueMessages buffers the
-    // publish and the subscription is restored on reconnect.
-    void this.attach().catch(() => {});
+    // Publishing does not attach: a publisher that never subscribed should not
+    // hold a server-side subscription. Offline publishes are still buffered and
+    // resent by the connection's queueMessages, independent of attach state.
     if (typeof nameOrMessages === 'string') {
       const member = await this.toMember(nameOrMessages, dataOrOptions);
       // Auto-batch single publishes — but not when a per-message ttl override is
