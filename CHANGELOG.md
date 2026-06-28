@@ -8,18 +8,16 @@ All notable changes to `@foony/realtime`. Format loosely follows
 ### Added
 
 - **Per-channel serial cursor + gap detection.** Durable messages now carry a contiguous
-  per-channel `seq` (serial). The channel tracks the highest gap-free serial and uses it as
-  the resume cursor on (re)subscribe, preferred over the message-id cursor. Because the serial
-  is contiguous per channel and identical across cells, resume is exact and migration-safe — it
-  cannot skip a message the way an id scan can when two cells ordered the same publishes
-  differently. A fresh subscriber adopts the first serial it sees as its baseline (it starts
-  from "now", not serial 1).
-- **Automatic gap backfill.** If a message arrives with a serial beyond the next expected one
-  (a message was dropped to a briefly-slow consumer), the channel re-subscribes from its
-  contiguous cursor; the server's ordered replay closes the hole and the existing
-  `(clientId, messageId)` dedup removes the overlap. If the cursor has aged out of retention the
-  re-subscribe reports a discontinuity (`resumed: false`) and the channel re-baselines rather
-  than looping.
+  per-channel `seq` (serial). This is used for ensuring delivery of all messages for a
+  channel, and is preferred over the (now-deprecated) message-id cursor. This enables us
+  to safely provide migrations for apps on our backend from one geographic location to
+  another. It also allows us to have cheaper, more efficient channel subscribers.
+- **Automatic gap backfill (surgical).** If a message arrives with a serial beyond the next
+  expected one (a message was dropped to a briefly-slow consumer), the channel issues a small
+  `fetch` for just the messages after its contiguous cursor and applies them. The existing
+  `(clientId, messageId)` dedup removes any overlap with the live tail. If the cursor has
+  aged out of retention, the server reports a discontinuity (`resumed: false`) and the channel
+  re-baselines.
 
 ### Changed
 

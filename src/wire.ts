@@ -165,6 +165,23 @@ export type HistoryFrame = {
   readonly id: number;
 };
 
+/**
+ * Surgical forward gap-fill: ask the server for the messages with serial > `fromSerial`
+ * (oldest-first), without touching the live subscription. The SDK sends this when it detects a
+ * serial gap mid-stream, so recovering a dropped message is a small read, not a re-subscribe.
+ * Server replies with `fetchRes`.
+ */
+export type FetchFrame = {
+  /** Frame discriminator: surgical gap-fill request. */
+  readonly t: 'fetch';
+  /** Channel to backfill. */
+  readonly channel: string;
+  /** Return messages with serial strictly greater than this. */
+  readonly fromSerial: number;
+  /** Client request id echoed back on the matching `fetchRes` / `err` frame. */
+  readonly id: number;
+};
+
 /** Application-level liveness probe. Server replies with `pong`. */
 export type PingFrame = {
   /** Frame discriminator: liveness probe; server replies with `pong`. */
@@ -315,6 +332,24 @@ export type HistoryResponseFrame = {
   readonly more?: boolean;
 };
 
+/** Response to `fetch`. The missed messages oldest-first plus whether the gap was fillable. */
+export type FetchResponseFrame = {
+  /** Frame discriminator: surgical gap-fill result. */
+  readonly t: 'fetchRes';
+  /** Echoes the id of the `fetch` request this responds to. */
+  readonly id: number;
+  /** Channel the gap-fill was for. */
+  readonly channel: string;
+  /** Missed messages with serial > the requested cursor, oldest-first. */
+  readonly messages: readonly MessageFrame[];
+  /**
+   * True when the cursor was still within the retained window (the gap is filled by `messages`),
+   * false when it had aged out — a discontinuity the SDK surfaces and re-baselines from instead of
+   * re-applying.
+   */
+  readonly resumed: boolean;
+};
+
 /** Any frame the client may send. */
 export type ClientFrame =
   | AuthFrame
@@ -323,6 +358,7 @@ export type ClientFrame =
   | PublishFrame
   | PresenceFrame
   | HistoryFrame
+  | FetchFrame
   | PingFrame;
 
 /** Any frame the server may send. */
@@ -333,7 +369,8 @@ export type ServerFrame =
   | PresenceEventFrame
   | ErrorFrame
   | PongFrame
-  | HistoryResponseFrame;
+  | HistoryResponseFrame
+  | FetchResponseFrame;
 
 /**
  * Error codes the server uses on `err` frames. Mirrors the Go

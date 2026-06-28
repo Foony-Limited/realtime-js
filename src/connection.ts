@@ -12,6 +12,8 @@ import type {
   ClientFrame,
   ConnectedFrame,
   ErrorFrame,
+  FetchFrame,
+  FetchResponseFrame,
   HistoryFrame,
   HistoryResponseFrame,
   MessageFrame,
@@ -261,6 +263,12 @@ type PendingHistoryRequest = {
   readonly reject: (error: Error) => void;
 };
 
+/** Internal record kept for every in-flight fetch (gap-fill) request (resolved by `fetchRes`). */
+type PendingFetchRequest = {
+  readonly resolve: (frame: FetchResponseFrame) => void;
+  readonly reject: (error: Error) => void;
+};
+
 /** A publish tracked until the server acks it. */
 type OutstandingPublish = {
   /** The publish frame to send. Includes a stable id for exactly-once deduplication. */
@@ -357,6 +365,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly pendingHistory = new Map<number, PendingHistoryRequest>();
+  private readonly pendingFetch = new Map<number, PendingFetchRequest>();
   private readonly channelDispatchers = new Map<string, ChannelDispatchers>();
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -441,6 +450,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       pending.reject(new Error('connection closed'));
     }
     this.pendingHistory.clear();
+    for (const pending of this.pendingFetch.values()) {
+      pending.reject(new Error('connection closed'));
+    }
+    this.pendingFetch.clear();
     this.failOutstandingPublishes(new Error('connection closed'));
   }
 
@@ -478,6 +491,26 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         this.sendRaw(out);
       } catch (err) {
         this.pendingHistory.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
+  }
+
+  /**
+   * Surgical gap-fill: ask the server for the messages after `fromSerial` on a channel without
+   * disturbing its live subscription. Used by Channel to heal a detected serial gap. Resolves with
+   * the `fetchRes` frame (or rejects on `err`).
+   */
+  private async requestFetch(frame: Omit<FetchFrame, 'id'>): Promise<FetchResponseFrame> {
+    await this.connect();
+    const id = this.nextRequestId++;
+    const out = { ...frame, id } as ClientFrame;
+    return new Promise<FetchResponseFrame>((resolve, reject) => {
+      this.pendingFetch.set(id, { resolve, reject });
+      try {
+        this.sendRaw(out);
+      } catch (err) {
+        this.pendingFetch.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -731,6 +764,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
             pendingHistory.reject(new Error(`server error ${frame.code}: ${frame.message}`));
             return;
           }
+          const pendingFetch = this.pendingFetch.get(frame.id);
+          if (pendingFetch) {
+            this.pendingFetch.delete(frame.id);
+            pendingFetch.reject(new Error(`server error ${frame.code}: ${frame.message}`));
+            return;
+          }
         }
         // Unscoped errors (id 0 or missing) are surfaced through the
         // current connection event so consumers can observe transport errors.
@@ -749,6 +788,14 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         const pending = this.pendingHistory.get(frame.id);
         if (pending) {
           this.pendingHistory.delete(frame.id);
+          pending.resolve(frame);
+        }
+        return;
+      }
+      case 'fetchRes': {
+        const pending = this.pendingFetch.get(frame.id);
+        if (pending) {
+          this.pendingFetch.delete(frame.id);
           pending.resolve(frame);
         }
         return;

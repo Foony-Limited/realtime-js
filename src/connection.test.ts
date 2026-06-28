@@ -23,13 +23,21 @@ type Harness = {
   readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
   /** Every sub frame the edge received, tagged with the connection index it arrived on. */
   readonly subFrames: { channel: string; conn: number; lastSerial?: number; lastMessageId?: string }[];
+  /** Every fetch (gap-fill) frame the edge received. */
+  readonly fetchFrames: { channel: string; fromSerial: number }[];
   /** Receipt times of every keep-alive ping the edge received. */
   readonly pings: number[];
   /**
    * Mutable test controls: drop the next publish/sub before acking (to simulate a socket
    * dying mid-request), and the keepAliveMs the edge advertises in its connected frame.
    */
-  readonly control: { dropNextPublish: boolean; dropNextSub: boolean; keepAliveMs: number };
+  readonly control: {
+    dropNextPublish: boolean;
+    dropNextSub: boolean;
+    keepAliveMs: number;
+    /** When set, the reply the edge returns for a `fetch` (gap-fill) request. */
+    fetchReply: ((channel: string, fromSerial: number) => { messages: unknown[]; resumed: boolean }) | null;
+  };
 };
 
 async function startFakeEdge(): Promise<Harness> {
@@ -40,8 +48,9 @@ async function startFakeEdge(): Promise<Harness> {
   const authFrames: AuthFrame[] = [];
   const publishFrames: Harness['publishFrames'] = [];
   const subFrames: Harness['subFrames'] = [];
+  const fetchFrames: Harness['fetchFrames'] = [];
   const pings: Harness['pings'] = [];
-  const control = { dropNextPublish: false, dropNextSub: false, keepAliveMs: 30_000 };
+  const control: Harness['control'] = { dropNextPublish: false, dropNextSub: false, keepAliveMs: 30_000, fetchReply: null };
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
@@ -108,6 +117,12 @@ async function startFakeEdge(): Promise<Harness> {
         socket.send(JSON.stringify(histRes));
         return;
       }
+      if (frame.t === 'fetch') {
+        fetchFrames.push({ channel: frame.channel, fromSerial: frame.fromSerial });
+        const reply = control.fetchReply ? control.fetchReply(frame.channel, frame.fromSerial) : { messages: [], resumed: true };
+        socket.send(JSON.stringify({ t: 'fetchRes', id: frame.id, channel: frame.channel, messages: reply.messages, resumed: reply.resumed }));
+        return;
+      }
       if (frame.t === 'sub' || frame.t === 'unsub' || frame.t === 'pub' || frame.t === 'pres') {
         const ack: ServerFrame = { t: 'ack', id: frame.id };
         socket.send(JSON.stringify(ack));
@@ -142,7 +157,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
     });
   });
-  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, pings, control };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, fetchFrames, pings, control };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -605,7 +620,7 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
-  it('detects a serial gap and re-subscribes from the contiguous cursor to backfill', async () => {
+  it('detects a serial gap and heals it with a surgical fetch (no re-subscribe)', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,
       token: 'GOOD',
@@ -613,6 +628,15 @@ describe('Connection end-to-end (fake edge)', () => {
       webSocket: NodeWebSocket as unknown as typeof WebSocket,
     });
     await realtime.connect();
+
+    // The edge returns the missing serial 4 when the SDK fetches from cursor 3.
+    harness.control.fetchReply = (channel, fromSerial) => {
+      expect(fromSerial).toBe(3);
+      return {
+        messages: [{ t: 'msg', channel, name: 'm', data: { n: 4 }, messageId: 's-4', seq: 4, timestamp: 4, clientId: 'alice' }],
+        resumed: true,
+      };
+    };
 
     const channel = realtime.channels.get('chat:seq');
     const received: number[] = [];
@@ -630,15 +654,17 @@ describe('Connection end-to-end (fake edge)', () => {
     await waitFor(() => received.length === 3, 'in-order delivery');
 
     const subsBefore = harness.subFrames.filter((sub) => sub.channel === 'chat:seq').length;
-    // Serial 5 arrives but 4 was lost: the SDK must re-subscribe carrying the contiguous cursor (3).
+    // Serial 5 arrives but 4 was lost: the SDK must issue a surgical fetch from cursor 3, not re-sub.
     edge.send(
       JSON.stringify({ t: 'msg', channel: 'chat:seq', name: 'm', data: { n: 5 }, messageId: 's-5', seq: 5, timestamp: 5, clientId: 'alice' }),
     );
-    await waitFor(
-      () => harness.subFrames.some((sub) => sub.channel === 'chat:seq' && sub.lastSerial === 3),
-      'gap-fill re-subscribe with cursor 3',
-    );
-    expect(harness.subFrames.filter((sub) => sub.channel === 'chat:seq').length).toBeGreaterThan(subsBefore);
+    await waitFor(() => received.includes(4), 'missing serial 4 backfilled via fetch');
+    // The gap-fill used a fetch from cursor 3, and did NOT tear down + re-subscribe the channel.
+    expect(harness.fetchFrames).toContainEqual({ channel: 'chat:seq', fromSerial: 3 });
+    expect(harness.subFrames.filter((sub) => sub.channel === 'chat:seq').length).toBe(subsBefore);
+    // 5 (delivered live) and 4 (backfilled) are both present; dedup keeps each once.
+    expect(received.filter((n) => n === 4)).toHaveLength(1);
+    expect(received).toContain(5);
     await realtime.close();
   });
 

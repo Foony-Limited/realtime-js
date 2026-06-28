@@ -530,21 +530,34 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Heal a detected gap by re-issuing the subscribe with the contiguous-serial cursor: the server
-   * replays serial > cursor in order, which closes the hole; dedup drops the overlap with messages
-   * already delivered live, and the ordered replay walks the cursor forward past the gap. Debounced
-   * to one in-flight backfill. If the cursor has aged out of retention the server reports a
-   * discontinuity (resumed=false), which onResumed surfaces and re-baselines from.
+   * Heal a detected gap with a surgical fetch from the contiguous-serial cursor — NOT a
+   * re-subscribe. The server returns just the messages after the cursor, leaving the live
+   * subscription, presence watcher, and retained replay untouched (a re-subscribe would tear all
+   * three down for one dropped message). The returned messages are applied in order, so the cursor
+   * walks forward past the gap; dedup drops any overlap with messages already delivered live.
+   * Debounced to one in-flight fetch. If the cursor has aged out of retention the server reports a
+   * discontinuity (resumed=false), which we surface and re-baseline from rather than re-applying.
    */
   private triggerBackfill(): void {
-    if (this.backfilling || this.channelState !== 'attached') {
+    if (this.backfilling || this.channelState !== 'attached' || this.contiguousSerial <= 0) {
       return;
     }
     this.backfilling = true;
-    this.connection['request'](this.subscribeFrame())
-      .then((ack) => this.onResumed(ack.resumed ?? false))
+    const fromSerial = this.contiguousSerial;
+    this.connection['requestFetch']({ t: 'fetch', channel: this.name, fromSerial })
+      .then((response) => {
+        if (!response.resumed) {
+          // The gap aged out of retention: the returned messages start above the hole, so applying
+          // them would leave the cursor stuck. Re-baseline and surface the discontinuity instead.
+          this.onResumed(false);
+          return;
+        }
+        for (const message of response.messages) {
+          this.deliverMessage(message);
+        }
+      })
       .catch(() => {
-        // A failed backfill request leaves the gap; the next gapped message retries it.
+        // A failed fetch leaves the gap; the next gapped message retries it.
       })
       .finally(() => {
         this.backfilling = false;
