@@ -156,6 +156,18 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    */
   private lastMessageId: string | undefined;
 
+  /**
+   * The highest serial up to which this channel has received every message with no gap — the
+   * resume cursor sent on (re)subscribe (preferred over lastMessageId because it is contiguous
+   * per channel and identical across cells, so resume is exact and migration-safe). 0 means no
+   * baseline yet: the next sequenced message is adopted as the baseline (a fresh subscriber
+   * starts from "now", not from serial 1).
+   */
+  private contiguousSerial = 0;
+
+  /** True while a gap-fill re-subscribe is in flight, so a burst of gapped messages triggers one. */
+  private backfilling = false;
+
   constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions) {
     super((_event, args) => args[0]);
     this.connection = connection;
@@ -170,6 +182,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       message: (message) => this.deliverMessage(message),
       presence: (event) => this.presence['emitPresence'](event),
       lastMessageId: () => this.lastMessageId,
+      lastSerial: () => (this.contiguousSerial > 0 ? this.contiguousSerial : undefined),
       resumed: (resumed) => this.onResumed(resumed),
     });
     this.connection.on((state, reason) => this.onConnectionState(state, reason));
@@ -216,8 +229,20 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     return this.attachPromise;
   }
 
-  /** Build the `sub` frame, carrying the resume cursor when this channel has one. */
-  private subscribeFrame(): { readonly t: 'sub'; readonly channel: string; readonly lastMessageId?: string } {
+  /**
+   * Build the `sub` frame, carrying the resume cursor when this channel has one. Prefer the
+   * serial cursor (exact + migration-safe); fall back to the message-id cursor for a channel that
+   * has only seen unsequenced messages.
+   */
+  private subscribeFrame(): {
+    readonly t: 'sub';
+    readonly channel: string;
+    readonly lastSerial?: number;
+    readonly lastMessageId?: string;
+  } {
+    if (this.contiguousSerial > 0) {
+      return { t: 'sub', channel: this.name, lastSerial: this.contiguousSerial };
+    }
     return this.lastMessageId === undefined
       ? { t: 'sub', channel: this.name }
       : { t: 'sub', channel: this.name, lastMessageId: this.lastMessageId };
@@ -467,13 +492,63 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       // resumable, so they must not advance the cursor — the server would not find them.
       if (frame.ephemeral !== true) {
         this.recordCursor(frame.messageId);
+        this.recordSerial(frame.seq);
       }
       return;
     }
     this.deliverSingle(frame);
     if (frame.ephemeral !== true) {
       this.recordCursor(frame.messageId);
+      this.recordSerial(frame.seq);
     }
+  }
+
+  /**
+   * Track the contiguous per-channel serial and detect gaps. The fence on the server means stored
+   * order equals serial order and the live tail delivers in that order, so the only way a serial
+   * arrives out of sequence is real loss (a dropped message to a briefly-slow consumer). When that
+   * happens we trigger a gap-fill re-subscribe, whose ordered replay backfills the hole.
+   *
+   *  - no baseline yet (cursor 0): adopt this serial as the baseline (fresh subscriber starts now).
+   *  - next in sequence: advance the cursor.
+   *  - already covered (<= cursor): a replay/duplicate; ignore (dedup handles the payload).
+   *  - ahead of sequence (> cursor + 1): a gap; backfill from the cursor, leave it un-advanced so
+   *    the replay can close the hole before the cursor moves past it.
+   */
+  private recordSerial(seq: number | undefined): void {
+    if (seq === undefined || seq === 0) {
+      return;
+    }
+    if (this.contiguousSerial === 0 || seq === this.contiguousSerial + 1) {
+      this.contiguousSerial = seq;
+      return;
+    }
+    if (seq <= this.contiguousSerial) {
+      return;
+    }
+    this.triggerBackfill();
+  }
+
+  /**
+   * Heal a detected gap by re-issuing the subscribe with the contiguous-serial cursor: the server
+   * replays serial > cursor in order, which closes the hole; dedup drops the overlap with messages
+   * already delivered live, and the ordered replay walks the cursor forward past the gap. Debounced
+   * to one in-flight backfill. If the cursor has aged out of retention the server reports a
+   * discontinuity (resumed=false), which onResumed surfaces and re-baselines from.
+   */
+  private triggerBackfill(): void {
+    if (this.backfilling || this.channelState !== 'attached') {
+      return;
+    }
+    this.backfilling = true;
+    this.connection['request'](this.subscribeFrame())
+      .then((ack) => this.onResumed(ack.resumed ?? false))
+      .catch(() => {
+        // A failed backfill request leaves the gap; the next gapped message retries it.
+      })
+      .finally(() => {
+        this.backfilling = false;
+      });
   }
 
   /**
@@ -539,6 +614,13 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * act on — e.g. reload state or read history.
    */
   private onResumed(resumed: boolean): void {
+    // A discontinuity means the cursor aged out of retention, so the gap can't be filled. Drop the
+    // baseline and adopt the next serial we see, otherwise every later message would look gapped
+    // and we'd backfill-loop. The 'attached' {resumed:false} update tells listeners to recover
+    // (reload state / read history) themselves.
+    if (!resumed) {
+      this.contiguousSerial = 0;
+    }
     if (this.channelState === 'attaching' || this.channelState === 'suspended' || this.channelState === 'attached') {
       this.transition('attached', { resumed });
     }
@@ -752,6 +834,7 @@ function bundledToFrame(channel: string, member: BundledMessage): MessageFrame {
     messageId: member.messageId,
     ...(member.clientId === undefined ? {} : { clientId: member.clientId }),
     ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+    ...(member.seq === undefined ? {} : { seq: member.seq }),
     ...(member.ephemeral === true ? { ephemeral: true } : {}),
     ...(member.messages === undefined ? {} : { messages: member.messages }),
   };

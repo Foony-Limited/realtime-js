@@ -70,7 +70,13 @@ export type SubscribeFrame = {
   readonly channel: string;
   /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
-  /** Optional resume cursor; when set, replay messages with id > this. */
+  /**
+   * Preferred resume cursor: when > 0, replay messages with serial > this before going live.
+   * The serial is contiguous per channel and identical across cells, so this resume is exact and
+   * migration-safe (it cannot skip a message the way an id scan can across two reordered cells).
+   */
+  readonly lastSerial?: number;
+  /** Legacy resume cursor (pre-serial); used only when `lastSerial` is unset. Replay id > this. */
   readonly lastMessageId?: string;
 };
 
@@ -192,6 +198,11 @@ export type AckFrame = {
    * Absent for non-resume requests.
    */
   readonly resumed?: boolean;
+  /**
+   * For a publish ack: the contiguous per-channel serial the server assigned (0/absent for
+   * ephemeral/retained/unsequenced publishes), so the publisher can advance its own cursor.
+   */
+  readonly seq?: number;
 };
 
 /** Server-originated channel message. */
@@ -212,6 +223,12 @@ export type MessageFrame = {
   readonly clientId?: string;
   /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
   readonly encoding?: string;
+  /**
+   * Contiguous per-channel serial (0/absent for ephemeral/retained/unsequenced messages). The
+   * SDK uses it to detect gaps (serial != last+1) and as the migration-safe resume cursor. For a
+   * bundle the outer serial is absent and each member carries its own.
+   */
+  readonly seq?: number;
   /** Batch members; when set, this frame carries a batch and `name`/`data` are ignored. */
   readonly messages?: readonly BatchMember[];
   /** Fire-and-forget message: not stored in history and not replayed on resume. */
@@ -239,6 +256,8 @@ export type BundledMessage = {
   readonly messageId: string;
   readonly clientId?: string;
   readonly encoding?: string;
+  /** This member's contiguous per-channel serial (see {@link MessageFrame.seq}). */
+  readonly seq?: number;
   /** Fire-and-forget message: not stored in history and not replayed on resume. */
   readonly ephemeral?: boolean;
   readonly messages?: readonly BatchMember[];

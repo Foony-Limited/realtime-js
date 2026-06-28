@@ -22,7 +22,7 @@ type Harness = {
   /** Every publish frame the edge received (across reconnects), in order. */
   readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
   /** Every sub frame the edge received, tagged with the connection index it arrived on. */
-  readonly subFrames: { channel: string; conn: number }[];
+  readonly subFrames: { channel: string; conn: number; lastSerial?: number; lastMessageId?: string }[];
   /** Receipt times of every keep-alive ping the edge received. */
   readonly pings: number[];
   /**
@@ -71,7 +71,12 @@ async function startFakeEdge(): Promise<Harness> {
         return;
       }
       if (frame.t === 'sub') {
-        subFrames.push({ channel: frame.channel, conn: nextConnIndex });
+        subFrames.push({
+          channel: frame.channel,
+          conn: nextConnIndex,
+          ...(frame.lastSerial === undefined ? {} : { lastSerial: frame.lastSerial }),
+          ...(frame.lastMessageId === undefined ? {} : { lastMessageId: frame.lastMessageId }),
+        });
         if (control.dropNextSub) {
           control.dropNextSub = false;
           // Die in the gap between receiving the sub and acking it, so the attach fails.
@@ -597,6 +602,43 @@ describe('Connection end-to-end (fake edge)', () => {
     edge.send(JSON.stringify({ t: 'msg', channel: 'chat:bundle', name: 'c', data: {}, messageId: 'b1', clientId: 'carol', timestamp: 3 }));
     await waitFor(() => received.length === 3, 'cross-client not deduped');
     expect(received[2]?.clientId).toBe('carol');
+    await realtime.close();
+  });
+
+  it('detects a serial gap and re-subscribes from the contiguous cursor to backfill', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:seq');
+    const received: number[] = [];
+    channel.subscribe((message) => received.push((message.data as { n: number }).n));
+    await channel.attach();
+    await waitFor(() => harness.sockets.length > 0, 'edge socket');
+    const edge = harness.sockets[0]!;
+
+    // Serials 1,2,3 arrive in order: baseline adopts 1, cursor advances to 3.
+    for (let serial = 1; serial <= 3; serial++) {
+      edge.send(
+        JSON.stringify({ t: 'msg', channel: 'chat:seq', name: 'm', data: { n: serial }, messageId: `s-${serial}`, seq: serial, timestamp: serial, clientId: 'alice' }),
+      );
+    }
+    await waitFor(() => received.length === 3, 'in-order delivery');
+
+    const subsBefore = harness.subFrames.filter((sub) => sub.channel === 'chat:seq').length;
+    // Serial 5 arrives but 4 was lost: the SDK must re-subscribe carrying the contiguous cursor (3).
+    edge.send(
+      JSON.stringify({ t: 'msg', channel: 'chat:seq', name: 'm', data: { n: 5 }, messageId: 's-5', seq: 5, timestamp: 5, clientId: 'alice' }),
+    );
+    await waitFor(
+      () => harness.subFrames.some((sub) => sub.channel === 'chat:seq' && sub.lastSerial === 3),
+      'gap-fill re-subscribe with cursor 3',
+    );
+    expect(harness.subFrames.filter((sub) => sub.channel === 'chat:seq').length).toBeGreaterThan(subsBefore);
     await realtime.close();
   });
 

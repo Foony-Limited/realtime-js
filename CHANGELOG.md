@@ -3,6 +3,32 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.10.0
+
+### Added
+
+- **Per-channel serial cursor + gap detection.** Durable messages now carry a contiguous
+  per-channel `seq` (serial). The channel tracks the highest gap-free serial and uses it as
+  the resume cursor on (re)subscribe, preferred over the message-id cursor. Because the serial
+  is contiguous per channel and identical across cells, resume is exact and migration-safe — it
+  cannot skip a message the way an id scan can when two cells ordered the same publishes
+  differently. A fresh subscriber adopts the first serial it sees as its baseline (it starts
+  from "now", not serial 1).
+- **Automatic gap backfill.** If a message arrives with a serial beyond the next expected one
+  (a message was dropped to a briefly-slow consumer), the channel re-subscribes from its
+  contiguous cursor; the server's ordered replay closes the hole and the existing
+  `(clientId, messageId)` dedup removes the overlap. If the cursor has aged out of retention the
+  re-subscribe reports a discontinuity (`resumed: false`) and the channel re-baselines rather
+  than looping.
+
+### Changed
+
+- A publish `ack` may now carry the assigned `seq` so a publisher can track its own cursor.
+- Resume on reconnect now sends the serial cursor when available, falling back to the message-id
+  cursor for channels that have only seen unsequenced (ephemeral/retained) messages. Fully
+  backward compatible: against a server that predates serials, no `seq` is ever seen, so the
+  message-id resume path is used unchanged.
+
 ## 0.9.0
 
 ### Added
