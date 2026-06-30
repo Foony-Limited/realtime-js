@@ -19,6 +19,8 @@ import type {
   MessageFrame,
   PresenceEventFrame,
   PresenceFrame,
+  PresenceSubscribeFrame,
+  PresenceUnsubscribeFrame,
   PublishFrame,
   ServerFrame,
   SubscribeFrame,
@@ -153,6 +155,19 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
       listener(...args);
     }
   }
+
+  /** True while any listener (catch-all or per-event) is still registered. */
+  protected hasAnyListeners(): boolean {
+    if (this.listeners.size > 0) {
+      return true;
+    }
+    for (const listenersForEvent of this.listenersByEvent.values()) {
+      if (listenersForEvent.size > 0) {
+        return true;
+      }
+    }
+    return false;
+  }
 }
 
 /**
@@ -164,7 +179,9 @@ export type AckableFrame =
   | Omit<SubscribeFrame, 'id'>
   | Omit<UnsubscribeFrame, 'id'>
   | Omit<PublishFrame, 'id'>
-  | Omit<PresenceFrame, 'id'>;
+  | Omit<PresenceFrame, 'id'>
+  | Omit<PresenceSubscribeFrame, 'id'>
+  | Omit<PresenceUnsubscribeFrame, 'id'>;
 
 /** Options that control how Connection reaches the edge. */
 export type ConnectionOptions = {
@@ -297,6 +314,8 @@ type ChannelDispatchers = {
   readonly lastSerial: () => number | undefined;
   /** Report the resume outcome once a reconnect re-subscribe has acked. */
   readonly resumed: (resumed: boolean) => void;
+  /** Re-announce this channel's presence membership after a reconnect (re-enter what was entered). */
+  readonly reenterPresence: () => void;
 };
 
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
@@ -376,6 +395,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    */
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectAttempt = 0;
+  /** True once the first handshake has completed, so we can tell a reconnect from the first connect. */
+  private hasConnectedBefore = false;
   /**
    * Set when a handshake fails with an auth error we cannot recover from (a bad
    * or expired credential with no `authCallback` to re-mint). The pending socket
@@ -385,6 +406,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private fatalError: Error | null = null;
   /** Channels the SDK has asked to be subscribed to; re-sent on reconnect. */
   private readonly desiredSubscriptions = new Set<string>();
+  /** Channels the SDK has asked for presence events on; re-sent on reconnect. */
+  private readonly desiredPresence = new Set<string>();
   /** Publishes awaiting ack, keyed by client messageId; (re)sent on (re)connect. */
   private readonly outstandingPublishes = new Map<string, OutstandingPublish>();
   /** Maps a send attempt's request id back to its publish messageId, to route ack/err. */
@@ -616,6 +639,16 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.desiredSubscriptions.delete(channel);
   }
 
+  /** Add `channel` to the set of presence subscriptions to restore on reconnect. */
+  private rememberPresence(channel: string): void {
+    this.desiredPresence.add(channel);
+  }
+
+  /** Stop restoring this presence subscription on future reconnects. */
+  private forgetPresence(channel: string): void {
+    this.desiredPresence.delete(channel);
+  }
+
   // ---- internals ----
 
   private async doConnect(): Promise<void> {
@@ -658,7 +691,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           this.setState('connected');
           this.startKeepAlive(connected.keepAliveMs);
           resolve();
-          this.restoreSubscriptionsOnReconnect();
+          const isReconnect = this.hasConnectedBefore;
+          this.hasConnectedBefore = true;
+          this.restoreSubscriptionsOnReconnect(isReconnect);
           this.flushOutstandingPublishes();
         } else if (parsed.t === 'err') {
           const errFrame = parsed as ErrorFrame;
@@ -714,18 +749,22 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   private async createAuthFrame(): Promise<AuthFrame> {
+    // On a reconnect, ask the server to reuse our previous connection id so presence
+    // membership survives the gap with no leave/enter churn. Null on the first connect.
+    const resume = this.connectionId ? { resumeConnectionId: this.connectionId } : {};
     if (this.options.key) {
       return {
         t: 'auth',
         key: this.options.key,
         ...(this.options.clientId ? { clientId: this.options.clientId } : {}),
+        ...resume,
       };
     }
-    if (this.options.token) return { t: 'auth', token: this.options.token };
+    if (this.options.token) return { t: 'auth', token: this.options.token, ...resume };
     if (!this.options.authCallback) {
       throw new Error('Connection: missing auth method');
     }
-    return { t: 'auth', token: await this.options.authCallback() };
+    return { t: 'auth', token: await this.options.authCallback(), ...resume };
   }
 
   /** Steady-state message handler; installed after a successful auth. */
@@ -867,7 +906,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }, delay);
   }
 
-  private restoreSubscriptionsOnReconnect(): void {
+  private restoreSubscriptionsOnReconnect(isReconnect: boolean): void {
     // Re-issue a `sub` for every remembered channel, carrying its resume cursor so the
     // server replays whatever was published during the disconnect, then report the
     // resume outcome (replayed vs discontinuity) back to the channel.
@@ -891,6 +930,21 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           // A failed restore surfaces via channel state on the next reconnect; the
           // channel stays 'attaching' until then.
         });
+    }
+    // Presence is restored only on an actual reconnect. On the first connect the app's own
+    // presence.on()/enter() calls already sent their frames, so re-sending here would just
+    // duplicate them (a second enter, a second snapshot).
+    if (!isReconnect) {
+      return;
+    }
+    // Re-open presence watchers for channels the app is watching presence on.
+    for (const channel of this.desiredPresence) {
+      this.request({ t: 'presSub', channel }).catch(() => {});
+    }
+    // Re-announce presence membership: each channel re-enters whatever it had entered,
+    // matching Ably's automatic re-entry after a reconnect.
+    for (const dispatchers of this.channelDispatchers.values()) {
+      dispatchers.reenterPresence();
     }
   }
 

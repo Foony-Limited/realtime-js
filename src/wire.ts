@@ -60,6 +60,12 @@ export type AuthFrame = {
   readonly key?: string;
   /** Stable identifier for this client, surfaced to others in presence. */
   readonly clientId?: string;
+  /**
+   * The connection id from a previous `connected` frame, sent on a reconnect so the server
+   * reuses it. This keeps this connection's presence membership stable across a brief drop
+   * (the member key does not change), so a quick reconnect causes no leave/enter churn.
+   */
+  readonly resumeConnectionId?: string;
 };
 
 /** Start delivering messages + presence for `channel`. */
@@ -147,6 +153,31 @@ export type PresenceFrame = {
   readonly data?: unknown;
   /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
   readonly encoding?: string;
+  /** Client request id echoed back on the matching `ack` / `err` frame. */
+  readonly id: number;
+};
+
+/**
+ * Start receiving presence events for `channel` (an initial snapshot of current
+ * members, then live enter/update/leave). Independent of a message `sub`: a
+ * channel used only for messages never sends this, so the server opens no
+ * presence watcher for it.
+ */
+export type PresenceSubscribeFrame = {
+  /** Frame discriminator: presence-subscribe request. */
+  readonly t: 'presSub';
+  /** Channel to start receiving presence events for. */
+  readonly channel: string;
+  /** Client request id echoed back on the matching `ack` / `err` frame. */
+  readonly id: number;
+};
+
+/** Stop receiving presence events for `channel`. Does not remove this connection's own membership. */
+export type PresenceUnsubscribeFrame = {
+  /** Frame discriminator: presence-unsubscribe request. */
+  readonly t: 'presUnsub';
+  /** Channel to stop receiving presence events for. */
+  readonly channel: string;
   /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
 };
@@ -357,6 +388,8 @@ export type ClientFrame =
   | UnsubscribeFrame
   | PublishFrame
   | PresenceFrame
+  | PresenceSubscribeFrame
+  | PresenceUnsubscribeFrame
   | HistoryFrame
   | FetchFrame
   | PingFrame;

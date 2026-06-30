@@ -23,6 +23,10 @@ type Harness = {
   readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
   /** Every sub frame the edge received, tagged with the connection index it arrived on. */
   readonly subFrames: { channel: string; conn: number; lastSerial?: number; lastMessageId?: string }[];
+  /** Every presence subscribe/unsubscribe frame the edge received, tagged with connection index. */
+  readonly presSubFrames: { channel: string; conn: number; type: 'presSub' | 'presUnsub' }[];
+  /** Every presence mutation (enter/update/leave) the edge received, tagged with connection index. */
+  readonly presFrames: { channel: string; conn: number; action: string }[];
   /** Every fetch (gap-fill) frame the edge received. */
   readonly fetchFrames: { channel: string; fromSerial: number }[];
   /** Receipt times of every keep-alive ping the edge received. */
@@ -48,6 +52,8 @@ async function startFakeEdge(): Promise<Harness> {
   const authFrames: AuthFrame[] = [];
   const publishFrames: Harness['publishFrames'] = [];
   const subFrames: Harness['subFrames'] = [];
+  const presSubFrames: Harness['presSubFrames'] = [];
+  const presFrames: Harness['presFrames'] = [];
   const fetchFrames: Harness['fetchFrames'] = [];
   const pings: Harness['pings'] = [];
   const control: Harness['control'] = { dropNextPublish: false, dropNextSub: false, keepAliveMs: 30_000, fetchReply: null };
@@ -123,7 +129,10 @@ async function startFakeEdge(): Promise<Harness> {
         socket.send(JSON.stringify({ t: 'fetchRes', id: frame.id, channel: frame.channel, messages: reply.messages, resumed: reply.resumed }));
         return;
       }
-      if (frame.t === 'sub' || frame.t === 'unsub' || frame.t === 'pub' || frame.t === 'pres') {
+      if (frame.t === 'presSub' || frame.t === 'presUnsub') {
+        presSubFrames.push({ channel: frame.channel, conn: nextConnIndex, type: frame.t });
+      }
+      if (frame.t === 'sub' || frame.t === 'unsub' || frame.t === 'pub' || frame.t === 'pres' || frame.t === 'presSub' || frame.t === 'presUnsub') {
         const ack: ServerFrame = { t: 'ack', id: frame.id };
         socket.send(JSON.stringify(ack));
         if (frame.t === 'pub') {
@@ -142,6 +151,7 @@ async function startFakeEdge(): Promise<Harness> {
           socket.send(JSON.stringify(msg));
         }
         if (frame.t === 'pres') {
+          presFrames.push({ channel: frame.channel, conn: nextConnIndex, action: frame.action });
           const evt: ServerFrame = {
             t: 'presEvt',
             channel: frame.channel,
@@ -157,7 +167,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
     });
   });
-  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, fetchFrames, pings, control };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, presSubFrames, presFrames, fetchFrames, pings, control };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -844,6 +854,105 @@ describe('Connection end-to-end (fake edge)', () => {
     await waitFor(
       () => harness.subFrames.some((sub) => sub.channel === 'chat:room' && sub.conn >= 2),
       're-subscribe on the restored connection',
+    );
+    await realtime.close();
+  });
+
+  it('does not request presence when a channel is only used for messages', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:1');
+    channel.subscribe(() => {});
+    await waitFor(() => harness.subFrames.some((sub) => sub.channel === 'chat:1'), 'message subscribe');
+    await delay(20);
+    // Subscribing to messages must not open a presence watcher.
+    expect(harness.presSubFrames).toHaveLength(0);
+    await realtime.close();
+  });
+
+  it('requests presence on the first listener and drops it after the last leaves', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:1');
+    const off1 = channel.presence.subscribe(() => {});
+    const off2 = channel.presence.on('enter', () => {});
+    await waitFor(
+      () => harness.presSubFrames.some((p) => p.type === 'presSub' && p.channel === 'chat:1'),
+      'presSub on first listener',
+    );
+    // One watcher regardless of how many listeners.
+    expect(harness.presSubFrames.filter((p) => p.type === 'presSub').length).toBe(1);
+
+    off1();
+    await delay(20);
+    // A listener still remains, so the watcher stays open.
+    expect(harness.presSubFrames.some((p) => p.type === 'presUnsub')).toBe(false);
+
+    off2();
+    await waitFor(
+      () => harness.presSubFrames.some((p) => p.type === 'presUnsub' && p.channel === 'chat:1'),
+      'presUnsub after last listener',
+    );
+    await realtime.close();
+  });
+
+  it('sends resumeConnectionId on reconnect so presence membership stays stable', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+    await waitFor(() => harness.authFrames.length === 1, 'first auth');
+    // First connect carries no resume id; capture the assigned connection id.
+    expect(harness.authFrames[0]?.resumeConnectionId).toBeUndefined();
+    const firstConnId = realtime.connection.getConnectionId();
+    expect(firstConnId).toBeTruthy();
+
+    harness.sockets[0]?.terminate();
+
+    // The reconnect's auth frame asks the server to reuse the prior connection id.
+    await waitFor(() => harness.authFrames.length >= 2, 'reconnect auth');
+    expect(harness.authFrames[1]?.resumeConnectionId).toBe(firstConnId);
+    await realtime.close();
+  });
+
+  it('re-enters presence and re-watches automatically after a reconnect', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:room');
+    channel.presence.subscribe(() => {});
+    await channel.presence.enter({ name: 'Alice' });
+    await waitFor(() => harness.presFrames.some((p) => p.action === 'enter' && p.conn === 1), 'initial enter');
+
+    harness.sockets[0]?.terminate();
+
+    // The SDK restores both halves on the new connection: re-enters membership and re-opens the watcher.
+    await waitFor(() => harness.presFrames.some((p) => p.action === 'enter' && p.conn >= 2), 're-enter on reconnect');
+    await waitFor(
+      () => harness.presSubFrames.some((p) => p.type === 'presSub' && p.channel === 'chat:room' && p.conn >= 2),
+      're-watch on reconnect',
     );
     await realtime.close();
   });

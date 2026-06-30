@@ -3,6 +3,33 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.11.0
+
+### Changed
+
+- **Presence is now opt-in.** Subscribing to a channel's messages no longer also starts
+  presence. To receive presence events, register a presence listener
+  (`channel.presence.subscribe(...)` or `channel.presence.on(...)`); only then does the SDK
+  ask the server to deliver presence on that channel, and it stops again once the last
+  presence listener is removed. A channel used only for messages opens no presence machinery,
+  which makes presence close to free for apps that don't use it. This matches Ably, where
+  receiving presence events is a separate, explicit step. **Breaking** if you relied on a
+  message `subscribe` implicitly delivering presence events. Requires an edge that understands
+  the new `presSub` / `presUnsub` frames.
+
+### Added
+
+- **Automatic presence re-entry on reconnect.** If this connection has entered presence
+  (`presence.enter` / `presence.update`), the SDK re-enters it automatically after a
+  reconnect, and re-opens any presence subscriptions, so a dropped connection heals without
+  the app re-entering by hand. This matches Ably's behavior. An explicit `presence.leave()` or
+  `channel.detach()` stops the automatic re-entry.
+- **Stable connection id across reconnects.** On reconnect the SDK now asks the server to
+  reuse its previous connection id (`resumeConnectionId` on the auth frame). Combined with a
+  server-side grace window, a brief drop and quick reconnect no longer makes observers see a
+  presence leave followed by a re-enter — the member simply stays present. Requires an edge
+  that honors the reclaim; older edges just assign a fresh id as before.
+
 ## 0.10.0
 
 ### Added

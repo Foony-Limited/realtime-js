@@ -184,6 +184,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       lastMessageId: () => this.lastMessageId,
       lastSerial: () => (this.contiguousSerial > 0 ? this.contiguousSerial : undefined),
       resumed: (resumed) => this.onResumed(resumed),
+      reenterPresence: () => this.presence['reenterOnReconnect'](),
     });
     this.connection.on((state, reason) => this.onConnectionState(state, reason));
   }
@@ -258,6 +259,9 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.flush();
     if (this.channelState === 'initialized' || this.channelState === 'detached' || this.channelState === 'detaching') return;
     this.transition('detaching');
+    // Detaching the channel ends presence too: the server's unsub closes the presence
+    // watcher, so stop re-opening it and re-entering on future reconnects.
+    this.presence['onDetached']();
     try {
       await this.connection['request']({ t: 'unsub', channel: this.name });
     } finally {
@@ -692,6 +696,18 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   private readonly cipher: Cipher | null;
   /** Serializes async decryption so presence events keep their arrival order. */
   private decryptChain: Promise<void> = Promise.resolve();
+  /**
+   * True once we have asked the server for presence events on this channel. Set when the
+   * first presence listener is added and cleared when the last leaves, so a channel used
+   * only for messages never opens a presence watcher.
+   */
+  private watching = false;
+  /**
+   * What this connection has entered into the presence set, or null if not present. Kept so
+   * the SDK can re-enter automatically after a reconnect (matching Ably). `{ data }` rather
+   * than the raw value so "entered with no data" is distinct from "not entered".
+   */
+  private enteredState: { readonly data: unknown } | null = null;
 
   constructor(connection: Connection, channelName: string, channel: Channel, cipher: Cipher | null) {
     super((_event, args) => args[0]);
@@ -702,17 +718,21 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   }
 
   /**
-   * Register a listener for presence events. Implicitly attaches the
-   * underlying channel — presence events arrive on the same WebSocket
-   * subscription as message frames.
+   * Register a listener for presence events. Requests presence events on this channel
+   * from the server (an initial member snapshot, then live transitions) — independent of
+   * a message `subscribe`, so a channel used only for messages never opens a watcher.
+   * The watcher is dropped again when the last presence listener is removed.
    */
   override on(listener: PresenceEventListener): UnsubscribeFn;
   /** Register a listener for presence events with a matching action. */
   override on(event: PresenceEventType, listener: PresenceEventListener): UnsubscribeFn;
   override on(first: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): UnsubscribeFn {
     const unsubscribe = second === undefined ? super.on(first as PresenceEventListener) : super.on(first as PresenceEventType, second);
-    this.channel.attach().catch(() => {});
-    return unsubscribe;
+    this.ensureWatching();
+    return () => {
+      unsubscribe();
+      this.maybeStopWatching();
+    };
   }
 
   /** Resolve the next presence event with the matching action. */
@@ -724,35 +744,86 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   override once(first: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): Promise<PresenceEventResult> | void {
     if (second === undefined && typeof first !== 'function') {
       const result = super.once(first);
-      this.channel.attach().catch(() => {});
+      this.ensureWatching();
       return result;
     }
     if (second === undefined) {
       super.once(first as PresenceEventListener);
-      this.channel.attach().catch(() => {});
+      this.ensureWatching();
       return;
     }
     super.once(first as PresenceEventType, second);
-    this.channel.attach().catch(() => {});
+    this.ensureWatching();
   }
 
   subscribe(listener: PresenceEventListener): UnsubscribeFn {
     return this.on(listener);
   }
 
-  /** Announce this connection as present in the channel. */
+  /**
+   * Announce this connection as present in the channel. The membership is remembered so the
+   * SDK re-enters it automatically after a reconnect, the way Ably does.
+   */
   async enter(data?: unknown): Promise<void> {
+    this.enteredState = { data };
     await this.send('enter', data);
   }
 
   /** Update the data attached to this connection's presence entry. */
   async update(data?: unknown): Promise<void> {
+    this.enteredState = { data };
     await this.send('update', data);
   }
 
-  /** Remove this connection's presence entry. */
+  /** Remove this connection's presence entry. Stops automatic re-entry on reconnect. */
   async leave(): Promise<void> {
+    this.enteredState = null;
     await this.send('leave', undefined);
+  }
+
+  /**
+   * Ask the server to start sending presence events on this channel, once. Idempotent and
+   * remembered so it is re-sent on reconnect. A terminal capability denial gives up.
+   */
+  private ensureWatching(): void {
+    if (this.watching) {
+      return;
+    }
+    this.watching = true;
+    this.connection['rememberPresence'](this.channelName);
+    this.connection['request']({ t: 'presSub', channel: this.channelName }).catch((error: unknown) => {
+      if (isCapabilityError(error) && !this.hasAnyListeners()) {
+        this.watching = false;
+        this.connection['forgetPresence'](this.channelName);
+      }
+    });
+  }
+
+  /** Drop the presence watcher once no presence listeners remain, to keep idle channels free. */
+  private maybeStopWatching(): void {
+    if (!this.watching || this.hasAnyListeners()) {
+      return;
+    }
+    this.watching = false;
+    this.connection['forgetPresence'](this.channelName);
+    this.connection['request']({ t: 'presUnsub', channel: this.channelName }).catch(() => {});
+  }
+
+  /**
+   * Re-announce this connection's presence after a reconnect: re-enter whatever was entered.
+   * Presence watching is restored separately by the connection re-sending `presSub`.
+   */
+  private reenterOnReconnect(): void {
+    if (this.enteredState !== null) {
+      this.send('enter', this.enteredState.data).catch(() => {});
+    }
+  }
+
+  /** Forget presence state when the channel detaches (the server's unsub closed the watcher). */
+  private onDetached(): void {
+    this.watching = false;
+    this.enteredState = null;
+    this.connection['forgetPresence'](this.channelName);
   }
 
   /**
