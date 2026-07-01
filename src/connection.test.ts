@@ -11,57 +11,30 @@ import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { Realtime, generateRandomKey } from './index.js';
-import type { AuthFrame, BatchMember, ClientFrame, PublishFrame, ServerFrame } from './wire.js';
+import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
+import { decodeClientFrame, encodeServerFrame, frameBinaryRecord, splitBinaryRecords } from './binary.js';
 
-// The SDK sends publishes in the compact binary format on the WebSocket binary opcode; control
-// frames stay JSON. The fake edge decodes a binary publish here (a small mirror of Go
-// wire.DecodeBinaryPublish) so the end-to-end tests exercise the real send path. Not shipped —
-// the browser SDK only encodes publishes; the Go edge decodes them.
-function decodeBinaryPublish(message: Uint8Array): PublishFrame {
-  const decoder = new TextDecoder();
-  let offset = 0;
-  const uvarint = (): number => {
-    let result = 0;
-    let shift = 0;
-    for (;;) {
-      const byte = message[offset++]!;
-      result += (byte & 0x7f) * 2 ** shift;
-      if ((byte & 0x80) === 0) return result;
-      shift += 7;
-    }
-  };
-  const lenPrefixed = (): Uint8Array => {
-    const length = uvarint();
-    const slice = message.subarray(offset, offset + length);
-    offset += length;
-    return slice;
-  };
-  const json = (bytes: Uint8Array): unknown => (bytes.length > 0 ? JSON.parse(decoder.decode(bytes)) : undefined);
-  uvarint(); // outer length prefix (frameBinaryRecord)
-  offset++; // record tag (0x01)
-  const flags = message[offset++]!;
-  const id = uvarint();
-  const channel = decoder.decode(lenPrefixed());
-  const name = decoder.decode(lenPrefixed());
-  const data = json(lenPrefixed());
-  const encoding = decoder.decode(lenPrefixed());
-  const messageId = decoder.decode(lenPrefixed());
-  const ttlMs = uvarint();
-  const memberCount = uvarint();
-  const messages: BatchMember[] = [];
-  for (let index = 0; index < memberCount; index++) {
-    const memberName = decoder.decode(lenPrefixed());
-    const memberData = json(lenPrefixed());
-    const memberEncoding = decoder.decode(lenPrefixed());
-    messages.push({ name: memberName, data: memberData, ...(memberEncoding ? { encoding: memberEncoding } : {}) });
+// The SDK speaks the binary opcode protocol on the WebSocket binary opcode. The fake edge uses
+// the SDK's own reverse-direction codec (decode client frames, encode server frames) so the
+// end-to-end tests drive the real wire format. These reverse functions tree-shake out of a
+// browser build (only the edge/tests use them).
+
+/** Decode one client frame from a WebSocket binary message (a single length-prefixed record). */
+function decodeClient(raw: Buffer): ClientFrame {
+  const buffer = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+  const records = splitBinaryRecords(buffer);
+  return decodeClientFrame(records[0]!);
+}
+
+/** Send a server frame to the SDK. Mirrors the real edge: a batch message (Messages set) has no
+ * binary form, so it goes as a JSON text frame (the SDK tells them apart by the WS opcode);
+ * everything else is binary. */
+function sendFrame(socket: NodeWebSocket, frame: ServerFrame): void {
+  if (frame.t === 'msg' && frame.messages && frame.messages.length > 0) {
+    socket.send(JSON.stringify(frame));
+    return;
   }
-  return {
-    t: 'pub', channel, name, data, id, messageId,
-    ...(encoding ? { encoding } : {}),
-    ...(ttlMs ? { ttlMs } : {}),
-    ...(flags & 1 ? { ephemeral: true } : {}),
-    ...(messages.length ? { messages } : {}),
-  };
+  socket.send(frameBinaryRecord(encodeServerFrame(frame)));
 }
 
 type Harness = {
@@ -111,17 +84,15 @@ async function startFakeEdge(): Promise<Harness> {
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
-    socket.on('message', (raw, isBinary) => {
-      // Publishes arrive binary (WebSocket binary opcode); control frames arrive as JSON text.
-      const frame = isBinary
-        ? (decodeBinaryPublish(new Uint8Array(raw as Buffer)) as ClientFrame)
-        : (JSON.parse(raw.toString()) as ClientFrame);
+    socket.on('message', (raw) => {
+      // Every client frame arrives binary (the SDK is a binary connection).
+      const frame = decodeClient(raw as Buffer);
       if (frame.t === 'auth') {
         const auth = frame as AuthFrame;
         authFrames.push(auth);
         if (auth.token === 'BAD') {
           const err: ServerFrame = { t: 'err', code: 40101, message: 'bad token' };
-          socket.send(JSON.stringify(err));
+          sendFrame(socket, err);
           socket.close(1002, 'bad auth');
           return;
         }
@@ -131,12 +102,12 @@ async function startFakeEdge(): Promise<Harness> {
           keepAliveMs: control.keepAliveMs,
           clientId: 'alice',
         };
-        socket.send(JSON.stringify(connected));
+        sendFrame(socket, connected);
         return;
       }
       if (frame.t === 'ping') {
         pings.push(Date.now());
-        socket.send(JSON.stringify({ t: 'pong' } satisfies ServerFrame));
+        sendFrame(socket, { t: 'pong' } satisfies ServerFrame);
         return;
       }
       if (frame.t === 'sub') {
@@ -174,13 +145,13 @@ async function startFakeEdge(): Promise<Harness> {
           ],
           more: true,
         };
-        socket.send(JSON.stringify(histRes));
+        sendFrame(socket, histRes);
         return;
       }
       if (frame.t === 'fetch') {
         fetchFrames.push({ channel: frame.channel, fromSerial: frame.fromSerial });
         const reply = control.fetchReply ? control.fetchReply(frame.channel, frame.fromSerial) : { messages: [], resumed: true };
-        socket.send(JSON.stringify({ t: 'fetchRes', id: frame.id, channel: frame.channel, messages: reply.messages, resumed: reply.resumed }));
+        sendFrame(socket, { t: 'fetchRes', id: frame.id, channel: frame.channel, messages: reply.messages, resumed: reply.resumed });
         return;
       }
       if (frame.t === 'presSub' || frame.t === 'presUnsub') {
@@ -188,7 +159,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
       if (frame.t === 'sub' || frame.t === 'unsub' || frame.t === 'pub' || frame.t === 'pres' || frame.t === 'presSub' || frame.t === 'presUnsub') {
         const ack: ServerFrame = { t: 'ack', id: frame.id };
-        socket.send(JSON.stringify(ack));
+        sendFrame(socket, ack);
         if (frame.t === 'pub') {
           const msg: ServerFrame = {
             t: 'msg',
@@ -202,7 +173,7 @@ async function startFakeEdge(): Promise<Harness> {
             ...(frame.encoding === undefined ? {} : { encoding: frame.encoding }),
             ...(frame.messages === undefined ? {} : { messages: frame.messages }),
           };
-          socket.send(JSON.stringify(msg));
+          sendFrame(socket, msg);
         }
         if (frame.t === 'pres') {
           presFrames.push({ channel: frame.channel, conn: nextConnIndex, action: frame.action });
@@ -216,7 +187,7 @@ async function startFakeEdge(): Promise<Harness> {
             ...((frame as { data?: unknown }).data === undefined ? {} : { data: (frame as { data?: unknown }).data }),
             ...((frame as { encoding?: string }).encoding === undefined ? {} : { encoding: (frame as { encoding?: string }).encoding }),
           };
-          socket.send(JSON.stringify(evt));
+          sendFrame(socket, evt);
         }
       }
     });
@@ -655,15 +626,19 @@ describe('Connection end-to-end (fake edge)', () => {
     const edge = harness.sockets[0]!;
 
     // A server bundle of two members from different clients, delivered as one frame.
-    const bundle = JSON.stringify({
+    const bundle: ServerFrame = {
       t: 'msg',
       channel: 'chat:bundle',
+      name: '',
+      data: undefined,
+      timestamp: 0,
+      messageId: '',
       bundle: [
         { name: 'a', data: { n: 1 }, messageId: 'b1', clientId: 'alice', timestamp: 1 },
         { name: 'b', data: { n: 2 }, messageId: 'b2', clientId: 'bob', timestamp: 2 },
       ],
-    });
-    edge.send(bundle);
+    };
+    sendFrame(edge, bundle);
     await waitFor(() => received.length === 2, 'bundle unwrap');
     expect(received.map((message) => message.name)).toEqual(['a', 'b']);
     expect(received.map((message) => message.id)).toEqual(['b1', 'b2']);
@@ -671,14 +646,14 @@ describe('Connection end-to-end (fake edge)', () => {
     // Re-deliver the same bundle (a publisher retry coalesced into a fresh record)
     // plus a standalone repeat — every (clientId, messageId) is already seen, so
     // nothing new is delivered.
-    edge.send(bundle);
-    edge.send(JSON.stringify({ t: 'msg', channel: 'chat:bundle', name: 'a', data: { n: 1 }, messageId: 'b1', clientId: 'alice', timestamp: 1 }));
+    sendFrame(edge, bundle);
+    sendFrame(edge, { t: 'msg', channel: 'chat:bundle', name: 'a', data: { n: 1 }, messageId: 'b1', clientId: 'alice', timestamp: 1 });
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(received).toHaveLength(2);
 
     // The same messageId from a DIFFERENT client is NOT a duplicate — dedup keys on
     // the server-stamped clientId, so one client cannot suppress another's message.
-    edge.send(JSON.stringify({ t: 'msg', channel: 'chat:bundle', name: 'c', data: {}, messageId: 'b1', clientId: 'carol', timestamp: 3 }));
+    sendFrame(edge, { t: 'msg', channel: 'chat:bundle', name: 'c', data: {}, messageId: 'b1', clientId: 'carol', timestamp: 3 });
     await waitFor(() => received.length === 3, 'cross-client not deduped');
     expect(received[2]?.clientId).toBe('carol');
     await realtime.close();
@@ -711,17 +686,13 @@ describe('Connection end-to-end (fake edge)', () => {
 
     // Serials 1,2,3 arrive in order: baseline adopts 1, cursor advances to 3.
     for (let serial = 1; serial <= 3; serial++) {
-      edge.send(
-        JSON.stringify({ t: 'msg', channel: 'chat:seq', name: 'm', data: { n: serial }, messageId: `s-${serial}`, seq: serial, timestamp: serial, clientId: 'alice' }),
-      );
+      sendFrame(edge, { t: 'msg', channel: 'chat:seq', name: 'm', data: { n: serial }, messageId: `s-${serial}`, seq: serial, timestamp: serial, clientId: 'alice' });
     }
     await waitFor(() => received.length === 3, 'in-order delivery');
 
     const subsBefore = harness.subFrames.filter((sub) => sub.channel === 'chat:seq').length;
     // Serial 5 arrives but 4 was lost: the SDK must issue a surgical fetch from cursor 3, not re-sub.
-    edge.send(
-      JSON.stringify({ t: 'msg', channel: 'chat:seq', name: 'm', data: { n: 5 }, messageId: 's-5', seq: 5, timestamp: 5, clientId: 'alice' }),
-    );
+    sendFrame(edge, { t: 'msg', channel: 'chat:seq', name: 'm', data: { n: 5 }, messageId: 's-5', seq: 5, timestamp: 5, clientId: 'alice' });
     await waitFor(() => received.includes(4), 'missing serial 4 backfilled via fetch');
     // The gap-fill used a fetch from cursor 3, and did NOT tear down + re-subscribe the channel.
     expect(harness.fetchFrames).toContainEqual({ channel: 'chat:seq', fromSerial: 3 });
@@ -1032,6 +1003,7 @@ function createCapturingWebSocket(urls: string[]): typeof WebSocket {
 
   class CapturingWebSocket {
     readyState = 1;
+    binaryType = 'arraybuffer';
     private readonly listenersByType = new Map<string, Set<FakeListener>>();
 
     constructor(url: string | URL) {
@@ -1058,8 +1030,14 @@ function createCapturingWebSocket(urls: string[]): typeof WebSocket {
       this.listenersByType.get(type)?.delete(listener as FakeListener);
     }
 
-    send(raw: string): void {
-      const frame = JSON.parse(raw) as ClientFrame;
+    send(raw: unknown): void {
+      // The SDK sends binary opcode frames (one length-prefixed record per message).
+      const bytes = raw instanceof Uint8Array ? raw : ArrayBuffer.isView(raw) ? new Uint8Array((raw as ArrayBufferView).buffer) : null;
+      if (!bytes) {
+        return;
+      }
+      const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+      const frame = decodeClientFrame(splitBinaryRecords(buffer)[0]!);
       if (frame.t !== 'auth') {
         return;
       }
@@ -1070,7 +1048,7 @@ function createCapturingWebSocket(urls: string[]): typeof WebSocket {
         clientId: 'alice',
       };
       setTimeout(() => {
-        this.dispatch('message', { data: JSON.stringify(connected) } as MessageEvent);
+        this.dispatch('message', { data: frameBinaryRecord(encodeServerFrame(connected)) } as unknown as MessageEvent);
       }, 0);
     }
 

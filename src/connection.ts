@@ -27,7 +27,7 @@ import type {
   UnsubscribeFrame,
 } from './wire.js';
 import { ErrorCode } from './wire.js';
-import { decodeBinaryMessages, encodeBinaryPublish, frameBinaryRecord } from './binary.js';
+import { decodeServerFrames, encodeClientFrame, frameBinaryRecord } from './binary.js';
 
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
@@ -578,7 +578,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     outstanding.requestId = id;
     this.publishRequestIds.set(id, outstanding.frame.messageId);
     try {
-      this.sendBinary(frameBinaryRecord(encodeBinaryPublish({ ...outstanding.frame, id })));
+      this.sendRaw({ ...outstanding.frame, id });
     } catch {
       // Socket not actually open; leave it outstanding to (re)send on the next connect.
       this.publishRequestIds.delete(id);
@@ -668,18 +668,21 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     return new Promise<void>((resolve, reject) => {
       const onOpen = (): void => {
         try {
-          ws.send(JSON.stringify(authFrame));
+          // A binary auth frame makes the whole connection binary (the edge decides by the
+          // WebSocket opcode of this frame).
+          ws.send(frameBinaryRecord(encodeClientFrame(authFrame)));
         } catch (err) {
           reject(err instanceof Error ? err : new Error(String(err)));
         }
       };
 
       const onAuthMessage = (event: MessageEvent): void => {
-        let parsed: ServerFrame;
-        try {
-          parsed = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString()) as ServerFrame;
-        } catch (err) {
-          reject(new Error(`failed to parse auth response: ${(err as Error).message}`));
+        const binary = toArrayBuffer(event.data);
+        const parsed = binary
+          ? decodeServerFrames(binary)[0]
+          : (parseJsonFrame(event.data) as ServerFrame | undefined);
+        if (!parsed) {
+          reject(new Error('failed to parse auth response'));
           safeClose(ws, CLOSE_CODE_HANDSHAKE_FAILED, 'bad auth response');
           return;
         }
@@ -779,31 +782,22 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     return { t: 'auth', token: await this.options.authCallback(), ...opts, ...resume };
   }
 
-  /** Steady-state message handler; installed after a successful auth. */
+  /** Steady-state message handler; installed after a successful auth. On a binary connection
+   * every server frame arrives binary (opcode records); the JSON path stays only as a safety
+   * net (an older edge that coalesced JSON frames with '\n'). */
   private readonly handleMessage = (event: MessageEvent): void => {
-    // A binary message carries delivered frames in the compact binary codec (we opted in via
-    // the auth frame's `binaryDelivery` flag). Decode each length-prefixed record and dispatch.
     const binary = toArrayBuffer(event.data);
     if (binary) {
-      for (const frame of decodeBinaryMessages(binary)) {
+      for (const frame of decodeServerFrames(binary)) {
         this.handleFrame(frame);
       }
       return;
     }
     const raw = typeof event.data === 'string' ? event.data : event.data.toString();
-    // The server may pack several frames into one message, separated by '\n' (we opted in
-    // via the auth frame's `coalesce` flag). A newline never appears inside JSON — it is
-    // escaped in strings — so splitting on it cleanly recovers the frames; a message the
-    // server did not coalesce is a single segment.
     for (const segment of raw.split('\n')) {
       if (segment.length === 0) continue;
-      let frame: ServerFrame;
-      try {
-        frame = JSON.parse(segment) as ServerFrame;
-      } catch {
-        continue;
-      }
-      this.handleFrame(frame);
+      const frame = parseJsonFrame(segment);
+      if (frame) this.handleFrame(frame);
     }
   };
 
@@ -1008,14 +1002,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
   }
 
+  /** Send a client frame in the binary opcode protocol (one length-prefixed record). */
   private sendRaw(frame: ClientFrame): void {
-    if (!this.socket || this.socket.readyState !== READY_STATE_OPEN) {
-      throw new Error(`Connection.sendRaw: socket not open (state=${this.state})`);
-    }
-    this.socket.send(JSON.stringify(frame));
+    this.sendBinary(frameBinaryRecord(encodeClientFrame(frame)));
   }
 
-  /** Send an already-encoded binary payload (a length-prefixed publish record) on the socket. */
+  /** Send an already-encoded binary payload on the socket. */
   private sendBinary(bytes: Uint8Array<ArrayBuffer>): void {
     if (!this.socket || this.socket.readyState !== READY_STATE_OPEN) {
       throw new Error(`Connection.sendBinary: socket not open (state=${this.state})`);
@@ -1048,6 +1040,16 @@ async function loadNodeWebSocket(): Promise<typeof WebSocket | undefined> {
     const specifier = 'ws';
     const mod = (await import(/* @vite-ignore */ specifier)) as { WebSocket?: typeof WebSocket; default?: typeof WebSocket };
     return mod.WebSocket ?? mod.default;
+  } catch {
+    return undefined;
+  }
+}
+
+/** parseJsonFrame parses a JSON server frame, returning undefined on malformed input. Retained
+ * only as a safety net for a JSON-coalescing edge; a binary connection never uses it. */
+function parseJsonFrame(data: unknown): ServerFrame | undefined {
+  try {
+    return JSON.parse(typeof data === 'string' ? data : String(data)) as ServerFrame;
   } catch {
     return undefined;
   }
