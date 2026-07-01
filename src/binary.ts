@@ -303,7 +303,6 @@ function encodeSubscribe(frame: SubscribeFrame): Uint8Array {
   pushUvarint(out, frame.id);
   pushUvarint(out, frame.lastSerial ?? 0);
   pushString(out, frame.channel);
-  pushString(out, frame.lastMessageId ?? '');
   return Uint8Array.from(out);
 }
 
@@ -563,8 +562,7 @@ export function decodeClientFrame(record: Uint8Array): ClientFrame {
       const id = reader.uvarint();
       const lastSerial = reader.uvarint();
       const channel = reader.str();
-      const lastMessageId = reader.str();
-      return { t: 'sub', id, channel, ...(lastSerial ? { lastSerial } : {}), ...(lastMessageId ? { lastMessageId } : {}) };
+      return { t: 'sub', id, channel, ...(lastSerial ? { lastSerial } : {}) };
     }
     case Op.Unsub:
       return { t: 'unsub', id: reader.uvarint(), channel: reader.str() };

@@ -149,19 +149,12 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   private readonly seenMessages = new Map<string, true>();
 
   /**
-   * The most recent server message id delivered on this channel — the resume cursor the
-   * SDK sends on (re)subscribe so the server replays anything missed during a disconnect.
-   * Advanced monotonically (ids are k-sortable), so replaying already-seen messages on a
-   * resume never drags it backward.
-   */
-  private lastMessageId: string | undefined;
-
-  /**
    * The highest serial up to which this channel has received every message with no gap — the
-   * resume cursor sent on (re)subscribe (preferred over lastMessageId because it is contiguous
-   * per channel and identical across cells, so resume is exact and migration-safe). 0 means no
-   * baseline yet: the next sequenced message is adopted as the baseline (a fresh subscriber
-   * starts from "now", not from serial 1).
+   * resume cursor sent on (re)subscribe so the server replays anything missed during a disconnect.
+   * Contiguous per channel and identical across cells, so resume is exact and migration-safe. 0
+   * means no baseline yet: the next sequenced message is adopted as the baseline (a fresh
+   * subscriber starts from "now", not from serial 1). A channel that has only seen unsequenced
+   * messages keeps 0 and resubscribes fresh.
    */
   private contiguousSerial = 0;
 
@@ -181,7 +174,6 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.connection['registerChannel'](this.name, {
       message: (message) => this.deliverMessage(message),
       presence: (event) => this.presence['emitPresence'](event),
-      lastMessageId: () => this.lastMessageId,
       lastSerial: () => (this.contiguousSerial > 0 ? this.contiguousSerial : undefined),
       resumed: (resumed) => this.onResumed(resumed),
       reenterPresence: () => this.presence['reenterOnReconnect'](),
@@ -231,22 +223,17 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Build the `sub` frame, carrying the resume cursor when this channel has one. Prefer the
-   * serial cursor (exact + migration-safe); fall back to the message-id cursor for a channel that
-   * has only seen unsequenced messages.
+   * Build the `sub` frame, carrying the serial resume cursor when this channel has one. A channel
+   * that has only seen unsequenced messages has no cursor and resubscribes fresh.
    */
   private subscribeFrame(): {
     readonly t: 'sub';
     readonly channel: string;
     readonly lastSerial?: number;
-    readonly lastMessageId?: string;
   } {
-    if (this.contiguousSerial > 0) {
-      return { t: 'sub', channel: this.name, lastSerial: this.contiguousSerial };
-    }
-    return this.lastMessageId === undefined
-      ? { t: 'sub', channel: this.name }
-      : { t: 'sub', channel: this.name, lastMessageId: this.lastMessageId };
+    return this.contiguousSerial > 0
+      ? { t: 'sub', channel: this.name, lastSerial: this.contiguousSerial }
+      : { t: 'sub', channel: this.name };
   }
 
   /**
@@ -491,18 +478,15 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       for (let index = 0; index < frame.messages.length; index++) {
         this.deliverSingle(memberFrame(frame, frame.messages[index]!, index));
       }
-      // The whole batch is one server record under frame.messageId; advance the resume
-      // cursor to it, not to the synthetic per-member ids. Ephemeral messages are never
+      // The whole batch is one server record with one serial. Ephemeral messages are never
       // resumable, so they must not advance the cursor — the server would not find them.
       if (frame.ephemeral !== true) {
-        this.recordCursor(frame.messageId);
         this.recordSerial(frame.seq);
       }
       return;
     }
     this.deliverSingle(frame);
     if (frame.ephemeral !== true) {
-      this.recordCursor(frame.messageId);
       this.recordSerial(frame.seq);
     }
   }
@@ -566,17 +550,6 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       .finally(() => {
         this.backfilling = false;
       });
-  }
-
-  /**
-   * Advance the resume cursor to a delivered server record id, monotonically. Message
-   * ids are k-sortable, so a resume that replays already-seen messages never drags the
-   * cursor backward (which would cause needless re-fetching on the next resume).
-   */
-  private recordCursor(messageId: string): void {
-    if (messageId && (this.lastMessageId === undefined || messageId > this.lastMessageId)) {
-      this.lastMessageId = messageId;
-    }
   }
 
   /**

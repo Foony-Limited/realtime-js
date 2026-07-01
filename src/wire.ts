@@ -90,13 +90,11 @@ export type SubscribeFrame = {
   /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
   /**
-   * Preferred resume cursor: when > 0, replay messages with serial > this before going live.
-   * The serial is contiguous per channel and identical across cells, so this resume is exact and
-   * migration-safe (it cannot skip a message the way an id scan can across two reordered cells).
+   * Resume cursor: when > 0, replay messages with serial > this before going live. The serial is
+   * contiguous per channel and identical across cells, so this resume is exact and migration-safe.
+   * A channel that has only seen unsequenced messages carries no cursor and resubscribes fresh.
    */
   readonly lastSerial?: number;
-  /** Legacy resume cursor (pre-serial); used only when `lastSerial` is unset. Replay id > this. */
-  readonly lastMessageId?: string;
 };
 
 /** Stop delivering messages + presence for `channel`. */
@@ -253,10 +251,10 @@ export type AckFrame = {
   /** Echoes the id of the client request being acknowledged. */
   readonly id: number;
   /**
-   * Resume outcome for a `sub` that carried `lastMessageId`: true when the missed
-   * messages were replayed before this ack, false when the cursor had aged out of
-   * retention (a discontinuity — messages may have been missed beyond the window).
-   * Absent for non-resume requests.
+   * Resume outcome for a `sub` that carried `lastSerial`: true when the missed messages
+   * were replayed before this ack, false when the cursor had aged out of retention (a
+   * discontinuity, messages may have been missed beyond the window). Absent for non-resume
+   * requests.
    */
   readonly resumed?: boolean;
   /**

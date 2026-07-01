@@ -42,7 +42,7 @@ type Harness = {
   /** Every publish frame the edge received (across reconnects), in order. */
   readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
   /** Every sub frame the edge received, tagged with the connection index it arrived on. */
-  readonly subFrames: { channel: string; conn: number; lastSerial?: number; lastMessageId?: string }[];
+  readonly subFrames: { channel: string; conn: number; lastSerial?: number }[];
   /** Every presence subscribe/unsubscribe frame the edge received, tagged with connection index. */
   readonly presSubFrames: { channel: string; conn: number; type: 'presSub' | 'presUnsub' }[];
   /** Every presence mutation (enter/update/leave) the edge received, tagged with connection index. */
@@ -111,7 +111,6 @@ async function startFakeEdge(): Promise<Harness> {
           channel: frame.channel,
           conn: nextConnIndex,
           ...(frame.lastSerial === undefined ? {} : { lastSerial: frame.lastSerial }),
-          ...(frame.lastMessageId === undefined ? {} : { lastMessageId: frame.lastMessageId }),
         });
         if (control.dropNextSub) {
           control.dropNextSub = false;

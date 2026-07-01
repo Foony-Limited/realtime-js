@@ -309,9 +309,7 @@ export type PresenceEventListener = (event: PresenceEventFrame) => void;
 type ChannelDispatchers = {
   readonly message: (message: MessageFrame) => void;
   readonly presence: (event: PresenceEventFrame) => void;
-  /** The channel's legacy resume cursor (last delivered message id), or undefined. */
-  readonly lastMessageId: () => string | undefined;
-  /** The channel's preferred resume cursor (contiguous serial), or undefined. Migration-safe. */
+  /** The channel's resume cursor (contiguous serial), or undefined. Migration-safe. */
   readonly lastSerial: () => number | undefined;
   /** Report the resume outcome once a reconnect re-subscribe has acked. */
   readonly resumed: (resumed: boolean) => void;
@@ -939,18 +937,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // resume outcome (replayed vs discontinuity) back to the channel.
     for (const channel of this.desiredSubscriptions) {
       const dispatchers = this.channelDispatchers.get(channel);
-      // Prefer the serial cursor (exact + migration-safe); fall back to the message-id cursor for
-      // a channel that has only seen unsequenced messages.
+      // Resume from the serial cursor (exact + migration-safe). A channel that has only seen
+      // unsequenced messages has none and resubscribes fresh.
       const lastSerial = dispatchers?.lastSerial();
-      const lastMessageId = dispatchers?.lastMessageId();
-      let frame: Omit<SubscribeFrame, 'id'>;
-      if (lastSerial !== undefined) {
-        frame = { t: 'sub', channel, lastSerial };
-      } else if (lastMessageId !== undefined) {
-        frame = { t: 'sub', channel, lastMessageId };
-      } else {
-        frame = { t: 'sub', channel };
-      }
+      const frame: Omit<SubscribeFrame, 'id'> =
+        lastSerial !== undefined ? { t: 'sub', channel, lastSerial } : { t: 'sub', channel };
       this.request(frame)
         .then((ack) => dispatchers?.resumed(ack.resumed ?? false))
         .catch(() => {

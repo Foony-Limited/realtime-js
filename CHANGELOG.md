@@ -10,6 +10,12 @@ All notable changes to `@foony/realtime`. Format loosely follows
 - Message delivery is now fully binary. Replaced the few remaining cases (e.g. message batching)
   that still used JSON.
 
+### Removed
+
+- Dropped the old message-id resume cursor. Reconnect resume uses the `seq` cursor only, which
+  every durable message carries. A channel that has seen only unsequenced messages resubscribes
+  fresh. No change for `ephemeral: true` messages, which were never resumable.
+
 ## 0.12.0
 
 ### Added
