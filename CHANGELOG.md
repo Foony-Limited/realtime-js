@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to `@foony/realtime`. Format loosely follows
-[Keep a Changelog](https://keepachangelog.com); versions are semver.
+[Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
 ## 0.12.1
 
@@ -14,266 +14,172 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ### Added
 
-- **Frame coalescing.** The client can now decode a WebSocket message carrying several frames,
-  and it splits incoming messages accordingly. Under load the server packs many acks and
-  deliveries into one message and one socket write, a large edge-CPU saving at high message
-  rates (load testing shows up to a 3x improvement in max throughput).
-- **Binary opcode protocol.** The whole wire protocol is now binary: every frame is a 1-byte
-  opcode followed by its fields (length-prefixed), replacing the JSON `t` discriminator. The SDK
-  sends its auth frame on the WebSocket binary opcode, which makes the whole connection binary.
-  This is far cheaper for the edge than `JSON.stringify`/`JSON.parse` at high message rates
-  (publishes, deliveries, acks, history responses, pings). The edge still accepts JSON from
-  older clients, so this is backward compatible. However, as we're still pre-alpha, we'll be
-  removing this backwards-compatibility during the 0.13.0 release in the coming days. Once
-  foony.io launches its alpha, old SDKs will target a minimum 2-year lifespan.
-- **Binary batches.** A batch (i.e. an array publish, or the auto-batching that every
-  `channel.publish()` goes through) now has its own binary record, both on the wire and in
-  storage. A batch is one durable message that carries one or more messages (payloads), so
-  the record stores the shared header once and then just each payload's name/data/encoding. The
-  SDK expands this back into individual messages. Since single publishes auto-batch, this covers
-  essentially all delivered traffic, so delivery no longer falls back to JSON.
+- **Frame coalescing.** The SDK now supports unpacking several frames in one WebSocket message,
+  increasing throughput under load by ~3x or more in some cases.
+- **Binary wire protocol.** Messages now travel in a compact binary format instead of JSON, which
+  is up to 3x faster at high message rates. The edge still accepts older JSON clients for now, but
+  that fallback will be removed in 0.13.0.
+- **Binary batches.** Batched publishes (`channel.publish([...])` and auto-batching) now use the
+  new binary format.
 
 ### Fixed
 
-- **`ErrorCode` and `FrameType` now match the server.** The SDK's wire tables had drifted
-  from the canonical Go definitions. `ErrorCode` was missing `Capability` (40301),
-  `ChannelDenied` (40302), `RateLimited` (42900), and `Bootstrap` (50001) — most importantly
-  `RateLimited`, so an app could not cleanly tell throttling apart from other errors on an
-  `err` frame. The `FrameType` discriminator union was missing `presSub`, `presUnsub`,
-  `fetch`, and `fetchRes` (the frame shapes themselves were already present). Purely additive,
-  so existing code keeps working.
+- **`ErrorCode` and `FrameType` now match the server.** Added the missing error codes `Capability`,
+  `ChannelDenied`, `RateLimited`, and `Bootstrap` (so you can now detect throttling), and the
+  `presSub`, `presUnsub`, `fetch`, and `fetchRes` frame types.
 
 ## 0.11.0
 
 ### Changed
 
-- **Presence is now opt-in.** Subscribing to a channel's messages no longer also starts
-  presence. To receive presence events, register a presence listener
-  (`channel.presence.subscribe(...)` or `channel.presence.on(...)`); only then does the SDK
-  ask the server to deliver presence on that channel, and it stops again once the last
-  presence listener is removed. A channel used only for messages opens no presence machinery,
-  which makes presence close to free for apps that don't use it. This matches Ably, where
-  receiving presence events is a separate, explicit step. **Breaking** if you relied on a
-  message `subscribe` implicitly delivering presence events. Requires an edge that understands
-  the new `presSub` / `presUnsub` frames.
+- **Presence is now opt-in.** Subscribing to a channel's messages no longer starts presence.
+  Register a presence listener (`channel.presence.subscribe(...)` or `channel.presence.on(...)`) to
+  receive presence events, and the SDK stops them once the last listener is removed. **Breaking** if
+  you relied on message `subscribe` also delivering presence events.
 
 ### Added
 
-- **Automatic presence re-entry on reconnect.** If this connection has entered presence
-  (`presence.enter` / `presence.update`), the SDK re-enters it automatically after a
-  reconnect, and re-opens any presence subscriptions, so a dropped connection heals without
-  the app re-entering by hand. This matches Ably's behavior. An explicit `presence.leave()` or
-  `channel.detach()` stops the automatic re-entry.
-- **Stable connection id across reconnects.** On reconnect the SDK now asks the server to
-  reuse its previous connection id (`resumeConnectionId` on the auth frame). Combined with a
-  server-side grace window, a brief drop and quick reconnect no longer makes observers see a
-  presence leave followed by a re-enter — the member simply stays present. Requires an edge
-  that honors the reclaim; older edges just assign a fresh id as before.
+- **Automatic presence re-entry on reconnect.** After a reconnect the SDK re-enters presence and
+  re-opens presence subscriptions for you. An explicit `presence.leave()` or `channel.detach()`
+  stops that.
+- **Stable connection id across reconnects.** A brief drop and quick reconnect no longer shows
+  observers a presence leave followed by a re-enter.
 
 ## 0.10.0
 
 ### Added
 
-- **Per-channel serial cursor + gap detection.** Durable messages now carry a contiguous
-  per-channel `seq` (serial). This is used for ensuring delivery of all messages for a
-  channel, and is preferred over the (now-deprecated) message-id cursor. This enables us
-  to safely provide migrations for apps on our backend from one geographic location to
-  another. It also allows us to have cheaper, more efficient channel subscribers.
-- **Automatic gap backfill (surgical).** If a message arrives with a serial beyond the next
-  expected one (a message was dropped to a briefly-slow consumer), the channel issues a small
-  `fetch` for just the messages after its contiguous cursor and applies them. The existing
-  `(clientId, messageId)` dedup removes any overlap with the live tail. If the cursor has
-  aged out of retention, the server reports a discontinuity (`resumed: false`) and the channel
-  re-baselines.
+- **Per-channel message serial (`seq`).** Delivered messages now carry a contiguous per-channel
+  `seq`, used to detect gaps and to resume reliably.
+- **Automatic gap backfill.** If a message is missed (a gap in `seq`), the channel fetches just the
+  missing messages and fills them in. If the gap is too old to recover, it reports a discontinuity
+  (`resumed: false`).
 
 ### Changed
 
-- A publish `ack` may now carry the assigned `seq` so a publisher can track its own cursor.
-- Resume on reconnect now sends the serial cursor when available, falling back to the message-id
-  cursor for channels that have only seen unsequenced (ephemeral/retained) messages. Fully
-  backward compatible: against a server that predates serials, no `seq` is ever seen, so the
-  message-id resume path is used unchanged.
+- A publish `ack` may now include the assigned `seq`, so a publisher can track its own cursor.
+- Reconnect resume now uses the `seq` cursor when available, falling back to the message-id cursor.
+  Backward compatible with servers that predate `seq`.
 
 ## 0.9.0
 
 ### Added
 
-- **Connection resume.** On reconnect (and on re-attach) a channel now sends the id
-  of the last message it delivered as a resume cursor, and the edge replays everything
-  published after it before resuming the live tail — so messages published while a
-  client was briefly disconnected are no longer lost. The cursor advances monotonically
-  and the existing `(clientId, messageId)` dedup removes any overlap with the live tail.
-  When the cursor has aged out of the server's retention window, the (re)attach surfaces
-  a **discontinuity** (`resumed: false` in the channel's `attached` state change) instead
-  of silently resuming with a gap; within the window it reports `resumed: true`. On a
-  reconnect a suspended channel now passes briefly through `attaching` until the resume
-  ack arrives, rather than optimistically claiming `resumed: true`.
-- **Per-message ephemeral publishes.** `channel.publish(name, data, { ephemeral: true })`
-  (also valid on a batch publish) marks a message fire-and-forget: it is delivered live to
-  current subscribers — flagged `ephemeral` on the delivered message — but is excluded from
-  history and connection-resume, and never advances the resume cursor. Lets transient events
-  (typing indicators, cursors, reactions) ride a channel that otherwise persists, without
-  polluting its history.
+- **Connection resume.** On reconnect, the channel replays messages published while you were briefly
+  disconnected, so they are no longer lost. If the disconnect was too long to recover, the
+  `attached` state reports a discontinuity (`resumed: false`) instead of silently skipping messages.
+- **Ephemeral publishes.** `channel.publish(name, data, { ephemeral: true })` (also on batch
+  publishes) delivers a message live to current subscribers but keeps it out of history and resume.
+  Good for transient events like typing indicators, cursors, and reactions. Ephemeral publishes have
+  significantly higher throughput and reduced latency, but are an at-most-once delivery guarantee.
 
 ### Fixed
 
-- **Intermittent `1006` on connect (handshake race).** The connect path created the
-  WebSocket and then `await`ed `authCallback` (a token fetch) *before* attaching the
-  `open` listener, so a fast upgrade racing a slow token fetch lost the `open` event — the
-  auth frame was never sent and the connection hung until it was dropped. The auth frame
-  is now built before the socket is opened (with a `readyState` guard for a synchronously
-  opening WebSocket), so it is always sent. Also fixes a socket leak when the token fetch threw.
-- **Idle connections dropped with `1006` (no keep-alive).** The SDK never sent pings, so a
-  connection with no subscriptions or traffic was culled by intermediary WebSocket idle
-  timeouts (e.g. Cloudflare). It now sends a ping every server-advertised `keepAliveMs`.
-- **A channel whose attach failed was orphaned.** A subscription was remembered only on
-  attach *success*, so a channel whose attach failed because the connection dropped was
-  never re-subscribed on reconnect (it stayed dead even on a healthy new connection). The
-  intent is now remembered up front and recovered on reconnect; only a terminal capability
-  denial (403xx) stops retrying and surfaces `failed`.
+- **Intermittent `1006` on connect.** A race between opening the socket and fetching the auth token
+  could drop the connection at startup. Fixed, along with a socket leak when the token fetch throws.
+- **Idle connections dropped with `1006`.** The SDK now sends a keep-alive ping every `keepAliveMs`,
+  so idle connections are no longer culled by proxy idle timeouts (e.g. Cloudflare).
+- **A channel whose attach failed is now retried.** A channel that failed to attach because the
+  connection dropped stayed dead even after reconnecting. It now re-subscribes on reconnect, and
+  stops only on a capability denial (403xx).
 
 ## 0.8.1
 
 ### Changed
 
-- **`publish()` no longer attaches the channel.** Previously every publish
-  implicitly subscribed the publisher to the channel so it would also receive
-  live messages. A publish-only client (e.g. a server bridge) thus accumulated
-  one server-side subscription per channel it published to, and could exhaust a
-  connection's active-channel quota. Offline publishes are still buffered and
-  resent by `queueMessages`, and are unaffected by this change.
+- **`publish()` no longer attaches the channel.** A publish-only client (e.g. a server bridge) no
+  longer accumulates a subscription per channel it publishes to, which could exhaust the
+  connection's channel quota. Offline publishes are still buffered by `queueMessages`.
+- **Disconnect reason is surfaced to connection listeners.** The `disconnected` event now carries an
+  `Error` with the close code and server reason, so a credential problem is visible instead of
+  failing silently.
+- **Unrecoverable auth errors now go terminal instead of retrying forever.** A handshake rejected
+  with `BadAuth` or `AuthExpired` keeps retrying only when an `authCallback` can mint a fresh
+  credential. With a static `token` or `key` the connection goes to `failed`, carrying the auth
+  error. A later `connect()` can still retry.
 
 ### Fixed
 
-- **Reconnect no longer crashes the process on a handshake error.** When the
-  server rejected the handshake (e.g. an expired token surfaced as an `err`
-  frame on reconnect), the SDK closed the socket with reserved WebSocket code
-  `1002`. Node's `undici` WebSocket follows the spec strictly and threw
-  `InvalidAccessError: invalid code`. Thrown from inside a `message` listener,
-  it escaped to `process.nextTick` and killed the host process. Handshake
-  teardown now uses an app-specific close code (`4001`) and swallows any
-  `close()` error, so a rejected handshake degrades to a normal
-  failed-connect/reconnect instead of a crash.
-
-### Changed
-
-- **Disconnect reason is now surfaced to connection listeners.** The
-  `disconnected` state event now carries an `Error` describing the close (code
-  and server reason), so a credential problem the reconnect loop can't fix on
-  its own is visible instead of looping silently. A failed `close()` during
-  teardown is also logged via `console.error` rather than swallowed.
-- **Unrecoverable auth errors now go terminal instead of retrying forever.** A
-  handshake rejected with an auth error (`BadAuth` / `AuthExpired`) only keeps
-  retrying when an `authCallback` can mint a fresh credential on the next
-  attempt. With a static `token` or `key`, the same credential would be re-sent
-  and rejected identically, so the connection now enters the terminal `failed`
-  state (carrying the auth error) rather than looping. A later explicit
-  `connect()` can still retry. Non-auth handshake errors keep retrying as
-  before.
+- **Reconnect no longer crashes the process on a handshake error.** A rejected handshake (e.g. an
+  expired token) could throw from a WebSocket close and kill the host process under Node's `undici`.
+  It now degrades to a normal failed-connect and reconnect.
 
 ## 0.8.0
 
 ### Added
 
-- **`auth.createJwt` — local JWT minting.** A trusted backend holding a
-  Realtime API key can now mint a short-lived, capability-scoped token for a
-  less-trusted client without a network round-trip: `realtime.auth.createJwt({
-  capability, clientId, ttlMs })` (or the standalone `createJwt(params, { key })`)
-  signs an HS256 token locally with the key secret. The token's `kid` header is
-  the public key name so the edge can look up the secret to verify it; the payload
-  carries only `sub`/`cap`/`iat`/`exp` — no secret material. The browser returns
-  the token from its `authCallback` and the edge verifies it on the handshake.
-  Exports: `Auth`, `createJwt`, and the `Capability` / `CreateJwtParams` /
+- **Local JWT minting (`auth.createJwt`).** A backend holding a Realtime API key can mint a
+  short-lived, capability-scoped token for a client without a network round-trip:
+  `realtime.auth.createJwt({ capability, clientId, ttlMs })`. The browser returns it from
+  `authCallback`. Exports `Auth`, `createJwt`, and the `Capability`, `CreateJwtParams`, and
   `CreateJwtOptions` types.
 
 ## 0.7.0
 
 ### Added
 
-- **Transparent server-coalesced bundles + delivered-message dedup.** The edge
-  may now pack independent publishes on a channel (across clients) into one stream
-  record — an "envelope of envelopes" — to raise server-side throughput. The SDK
-  unwraps these bundles automatically, so subscribers still receive individual
-  messages, and it now **deduplicates delivered messages by `(clientId,
-  messageId)`**: a publisher retry never surfaces a message to a subscriber twice.
-  This preserves exactly-once *delivery* as a system-wide property even though the
-  publish path is at-least-once. Dedup is keyed on the server-stamped `clientId`,
-  so one client cannot suppress another's message by reusing an id. No API change.
+- **Exactly-once delivery.** Subscribers no longer see a duplicate when a publish is retried. The
+  SDK deduplicates delivered messages by `(clientId, messageId)`.
 
 ## 0.6.0
 
 ### Changed
 
-- **Auto-batching is always on, throttled by `intervalMs`.** Single `publish`
-  calls are batched automatically on every channel, which greatly raises the max
-  throughput per channel. A publish is sent right away unless a batch went out in
-  the last `intervalMs` (default `10`). When one did, the publish waits until the
-  window is up, so only fast bursts get grouped into one batch. Publishes spaced
-  further apart than `intervalMs` are never batched together. `BatchOptions`
-  (`intervalMs` and `maxMessages`) lets you adjust this. Array publishes and
+- **Auto-batching is always on, throttled by `intervalMs`.** Single `publish` calls are batched
+  automatically per channel, raising max throughput. A publish sends right away unless a batch went
+  out within the last `intervalMs` (default `10`), so only fast bursts are grouped. `BatchOptions`
+  (`intervalMs`, `maxMessages`) can be used to configure this behavior. Array publishes and
   `batchPublish` are never buffered.
 
 ## 0.5.0
 
 ### Changed
 
-- **Default endpoint moved to `realtime.foony.io`.** The Realtime SaaS now lives on
-  `foony.io`, so `DEFAULT_REALTIME_ENDPOINT` (used when `endpoint` is
-  omitted) has been changed to `realtime.foony.io`.
+- **Default endpoint is now `realtime.foony.io`.** `DEFAULT_REALTIME_ENDPOINT` (used when `endpoint`
+  is omitted) changed to `realtime.foony.io`.
 
 ## 0.4.0
 
 ### Added
 
-- **Message batching.** `channel.publish(messages[])` and 
-  `realtime.batchPublish({ channels, messages })` bundle multiple messages into one
-  frame that the edge stores and dedups as a single message, reducing costs and
-  increasing maximum throughput. Subscribers still process the members individually
-  (same reduced cost, and no DevEx overhead).
-- **Opt-in auto-batching.** `{ batch: { enabled, intervalMs, maxMessages } }` on
-  the `Realtime` client sets a default that can be overridden via
-  `channels.get(name, { batch })`). Single `publish` calls are buffered and
-  flushed as one batch (`intervalMs: 0` coalesces same-tick bursts). Disabled by
-  default. `channel.flush()` forces a flush.
-- New exports: `BatchSpec`, `BatchMessage`, `BatchPublishResult`, `BatchMember`,
-  `BatchOptions`.
+- **Message batching.** `channel.publish(messages[])` and `realtime.batchPublish({ channels,
+  messages })` send several messages in one frame that the edge stores and dedups as a single
+  message, lowering cost and raising throughput. Subscribers still receive the members individually.
+- **Opt-in auto-batching.** `{ batch: { enabled, intervalMs, maxMessages } }` on the client sets a
+  default, overridable via `channels.get(name, { batch })`. Single `publish` calls are buffered and
+  flushed as one batch. Off by default. `channel.flush()` forces a flush.
+- New exports: `BatchSpec`, `BatchMessage`, `BatchPublishResult`, `BatchMember`, `BatchOptions`.
 
 ### Changed
 
-- `PublishFrame`/`MessageFrame` gained an optional `messages` array (batch
-  members), and presence/encoding stay per-member for encrypted batches.
+- Added an optional `messages` array (batch members) to `PublishFrame` and `MessageFrame`. Presence
+  and encoding stay per-member for encrypted batches.
 
 ## 0.3.0
 
 ### Added
 
-- **End-to-end channel encryption.** `channels.get(name, { cipher: { key } })`
-  encrypts the `data` of both messages and presence client-side with AES-GCM
-  (256-bit default), so the realtime edge only ever sees ciphertext. The key is
-  shared between clients out of band and never sent to the server. Encrypted
-  payloads are tagged with a transport `encoding` (e.g.
-  `cipher+aes-256-gcm/base64`, HTTP `Content-Encoding`-style) that the edge
-  forwards opaquely; the IV is prepended to the ciphertext. New exports:
-  `generateRandomKey`, `Cipher`, and the `CipherParams`, `CipherAlgorithm`,
-  `EncryptResult`, and `ChannelOptions` types. Only `data` is encrypted; the
-  event `name` and `clientId` stay in clear.
+- **End-to-end channel encryption.** `channels.get(name, { cipher: { key } })` encrypts message and
+  presence `data` client-side with AES-GCM (256-bit default), so the edge only ever sees ciphertext.
+  The key is shared between clients out of band and never sent to the server. Only `data` is
+  encrypted, not the event `name` or `clientId`. Exports `generateRandomKey`, `Cipher`, and the
+  `CipherParams`, `CipherAlgorithm`, `EncryptResult`, and `ChannelOptions` types.
 
 ### Changed
 
-- `PublishFrame`/`MessageFrame` and the presence frames gained an optional
-  `encoding` field (backward-compatible; absent means plain JSON).
+- Added an optional `encoding` field to `PublishFrame`, `MessageFrame`, and the presence frames.
+  Backward compatible, absent means plain JSON.
 
 ## 0.2.0
 
 ### Added
 
-- **Per-message publish TTL.** `channel.publish(name, data, { ttlMs })` requests
-  how long a message is retained for history; the edge clamps it to the app's
-  plan ceiling. `PublishFrame.ttlMs` added.
+- **Per-message publish TTL.** `channel.publish(name, data, { ttlMs })` sets how long a message is
+  kept for history, clamped to the app's plan ceiling. Adds `PublishFrame.ttlMs`.
 
 ## 0.1.0
 
 ### Added
 
-- **Message history.** `channel.history({ limit, start })` returns recent
-  messages, oldest-first, with backward pagination. `HistoryFrame` exported.
+- **Message history.** `channel.history({ limit, start })` returns recent messages, oldest-first,
+  with backward pagination. Exports `HistoryFrame`.
