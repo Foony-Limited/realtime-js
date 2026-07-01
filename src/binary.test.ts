@@ -105,4 +105,24 @@ describe('binary message decoding', () => {
     expect(frame.messages![0]).toEqual({ name: 'a', data: { i: 1 } });
     expect(frame.messages![1]).toEqual({ name: 'b', data: 'two', encoding: 'enc' });
   });
+
+  // Golden bytes for a bundle (opcode 0x0d) whose second member is itself a batch (flags 0x02):
+  // a plain member then a batch member with its own shared header + payloads.
+  const goldenBundleBatch =
+    '420d02000006726f6f6d3a310161077b2269223a317d0469642d31026331000502' +
+    '6406726f6f6d3a3103626174026332060201780131000179052274776f2203656e63';
+
+  it('decodes a Go-encoded bundle whose member is a batch', () => {
+    const frames = decodeServerFrames(hexToArrayBuffer(goldenBundleBatch));
+    expect(frames).toHaveLength(1);
+    const frame = frames[0] as MessageFrame;
+    expect(frame.bundle).toHaveLength(2);
+    expect(frame.bundle![0]).toMatchObject({ name: 'a', data: { i: 1 }, messageId: 'id-1', clientId: 'c1', seq: 5 });
+    const batchMember = frame.bundle![1]!;
+    expect(batchMember).toMatchObject({ messageId: 'bat', clientId: 'c2', seq: 6 });
+    expect(batchMember.messages).toEqual([
+      { name: 'x', data: 1 },
+      { name: 'y', data: 'two', encoding: 'enc' },
+    ]);
+  });
 });

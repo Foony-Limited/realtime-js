@@ -37,6 +37,8 @@ const Op = {
 } as const;
 
 const FLAG_EPHEMERAL = 1 << 0;
+/** In a bundle member's flags byte: the member is itself a batch (batch layout follows). */
+const FLAG_BATCH = 1 << 1;
 const FLAG_RESPONSE_SET = 1 << 0;
 
 /** The byte after the auth opcode: a binary connection always coalesces and receives binary
@@ -134,7 +136,12 @@ class Reader {
 // ---- message members (shared by msg delivery and history/fetch responses) ----
 
 function pushMember(out: number[], message: MessageFrame | BundledMessage, channel: string): void {
-  out.push(message.ephemeral ? FLAG_EPHEMERAL : 0);
+  const isBatch = (message.messages?.length ?? 0) > 0;
+  out.push((message.ephemeral ? FLAG_EPHEMERAL : 0) | (isBatch ? FLAG_BATCH : 0));
+  if (isBatch) {
+    pushBatchFields(out, message, channel);
+    return;
+  }
   pushUvarint(out, message.timestamp);
   pushString(out, channel);
   pushString(out, message.name);
@@ -143,6 +150,23 @@ function pushMember(out: number[], message: MessageFrame | BundledMessage, chann
   pushString(out, message.clientId ?? '');
   pushString(out, message.encoding ?? '');
   pushUvarint(out, message.seq ?? 0);
+}
+
+/** Write a batch's fields after its flags byte — the shared header then each payload's
+ * name/data/encoding. Shared by the OpBatch record and a batch member inside a bundle. */
+function pushBatchFields(out: number[], message: MessageFrame | BundledMessage, channel: string): void {
+  pushUvarint(out, message.timestamp);
+  pushString(out, channel);
+  pushString(out, message.messageId);
+  pushString(out, message.clientId ?? '');
+  pushUvarint(out, message.seq ?? 0);
+  const members = message.messages ?? [];
+  pushUvarint(out, members.length);
+  for (const member of members) {
+    pushString(out, member.name);
+    pushJson(out, member.data);
+    pushString(out, member.encoding ?? '');
+  }
 }
 
 type Member = {
@@ -155,10 +179,14 @@ type Member = {
   encoding: string;
   seq: number;
   ephemeral: boolean;
+  messages?: BatchMember[];
 };
 
 function readMember(reader: Reader): Member {
   const flags = reader.byte();
+  if (flags & FLAG_BATCH) {
+    return readBatchFields(reader, flags);
+  }
   const timestamp = reader.uvarint();
   const channel = reader.str();
   const name = reader.str();
@@ -170,7 +198,35 @@ function readMember(reader: Reader): Member {
   return { channel, name, data, timestamp, messageId, clientId, encoding, seq, ephemeral: (flags & FLAG_EPHEMERAL) !== 0 };
 }
 
+/** Read a batch's fields (after its flags byte) into a Member with `messages` set. */
+function readBatchFields(reader: Reader, flags: number): Member {
+  const timestamp = reader.uvarint();
+  const channel = reader.str();
+  const messageId = reader.str();
+  const clientId = reader.str();
+  const seq = reader.uvarint();
+  const count = reader.uvarint();
+  const messages: BatchMember[] = [];
+  for (let index = 0; index < count; index++) {
+    const name = reader.str();
+    const data = reader.json();
+    const encoding = reader.str();
+    messages.push({ name, data, ...(encoding ? { encoding } : {}) });
+  }
+  return { channel, name: '', data: undefined, timestamp, messageId, clientId, encoding: '', seq, ephemeral: (flags & FLAG_EPHEMERAL) !== 0, messages };
+}
+
 function memberToMessageFrame(member: Member): MessageFrame {
+  if (member.messages) {
+    return {
+      t: 'msg', channel: member.channel, name: '', data: undefined, timestamp: member.timestamp,
+      messageId: member.messageId,
+      ...(member.clientId ? { clientId: member.clientId } : {}),
+      ...(member.seq ? { seq: member.seq } : {}),
+      ...(member.ephemeral ? { ephemeral: true } : {}),
+      messages: member.messages,
+    };
+  }
   return {
     t: 'msg', channel: member.channel, name: member.name, data: member.data, timestamp: member.timestamp,
     messageId: member.messageId,
@@ -188,6 +244,7 @@ function memberToBundled(member: Member): BundledMessage {
     ...(member.encoding ? { encoding: member.encoding } : {}),
     ...(member.seq ? { seq: member.seq } : {}),
     ...(member.ephemeral ? { ephemeral: true } : {}),
+    ...(member.messages ? { messages: member.messages } : {}),
   };
 }
 
@@ -391,30 +448,11 @@ function decodeMessage(reader: Reader): MessageFrame {
   return { t: 'msg', channel, name: '', data: undefined, timestamp: 0, messageId: '', bundle };
 }
 
-/** decodeBatch reads an OpBatch record: a shared header then its members, into a msg frame whose
+/** decodeBatch reads an OpBatch record (a shared header then its members) into a msg frame whose
  * `messages` the channel expands into individual messages. */
 function decodeBatch(reader: Reader): MessageFrame {
   const flags = reader.byte();
-  const timestamp = reader.uvarint();
-  const channel = reader.str();
-  const messageId = reader.str();
-  const clientId = reader.str();
-  const seq = reader.uvarint();
-  const count = reader.uvarint();
-  const messages: BatchMember[] = [];
-  for (let index = 0; index < count; index++) {
-    const name = reader.str();
-    const data = reader.json();
-    const encoding = reader.str();
-    messages.push({ name, data, ...(encoding ? { encoding } : {}) });
-  }
-  return {
-    t: 'msg', channel, name: '', data: undefined, timestamp, messageId,
-    ...(clientId ? { clientId } : {}),
-    ...(seq ? { seq } : {}),
-    ...(flags & FLAG_EPHEMERAL ? { ephemeral: true } : {}),
-    messages,
-  };
+  return memberToMessageFrame(readBatchFields(reader, flags));
 }
 
 function decodeResponse(reader: Reader): { id: number; channel: string; messages: MessageFrame[]; flag: boolean } {
@@ -492,19 +530,8 @@ function encodeMessage(frame: MessageFrame): Uint8Array {
 /** encodeBatch encodes a batch msg frame (`messages` set) as an OpBatch record: shared header
  * then its members. Mirrors Go wire.EncodeBinaryBatch. */
 function encodeBatch(frame: MessageFrame): Uint8Array {
-  const members = frame.messages ?? [];
   const out: number[] = [Op.Batch, frame.ephemeral ? FLAG_EPHEMERAL : 0];
-  pushUvarint(out, frame.timestamp);
-  pushString(out, frame.channel);
-  pushString(out, frame.messageId);
-  pushString(out, frame.clientId ?? '');
-  pushUvarint(out, frame.seq ?? 0);
-  pushUvarint(out, members.length);
-  for (const member of members) {
-    pushString(out, member.name);
-    pushJson(out, member.data);
-    pushString(out, member.encoding ?? '');
-  }
+  pushBatchFields(out, frame, frame.channel);
   return Uint8Array.from(out);
 }
 
