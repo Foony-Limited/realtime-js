@@ -26,14 +26,10 @@ function decodeClient(raw: Buffer): ClientFrame {
   return decodeClientFrame(records[0]!);
 }
 
-/** Send a server frame to the SDK. Mirrors the real edge: a batch message (Messages set) has no
- * binary form, so it goes as a JSON text frame (the SDK tells them apart by the WS opcode);
- * everything else is binary. */
+/** Send a server frame to the SDK in the binary opcode protocol, as the real edge does on a
+ * binary connection — including a batch message (Messages set), which rides its own OpBatch
+ * record. */
 function sendFrame(socket: NodeWebSocket, frame: ServerFrame): void {
-  if (frame.t === 'msg' && frame.messages && frame.messages.length > 0) {
-    socket.send(JSON.stringify(frame));
-    return;
-  }
   socket.send(frameBinaryRecord(encodeServerFrame(frame)));
 }
 

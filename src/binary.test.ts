@@ -84,4 +84,25 @@ describe('binary message decoding', () => {
     const frames = decodeServerFrames(hexToArrayBuffer(goldenMsg + 'ff'));
     expect(frames).toHaveLength(1);
   });
+
+  // Golden bytes for a batch record (opcode 0x13), from Go wire.EncodeBinaryBatch: one shared
+  // header (channel/messageId/clientId/timestamp/seq/ephemeral) then two members.
+  const goldenBatch =
+    '361301f0d6a183f23306726f6f6d3a310362617408636c69656e742d37b960020161' +
+    '077b2269223a317d000162052274776f2203656e63';
+
+  it('decodes a Go-encoded batch into a msg frame with messages', () => {
+    const frames = decodeServerFrames(hexToArrayBuffer(goldenBatch));
+    expect(frames).toHaveLength(1);
+    const frame = frames[0] as MessageFrame;
+    expect(frame.channel).toBe('room:1');
+    expect(frame.messageId).toBe('bat');
+    expect(frame.clientId).toBe('client-7');
+    expect(frame.timestamp).toBe(1782955142000);
+    expect(frame.seq).toBe(12345);
+    expect(frame.ephemeral).toBe(true);
+    expect(frame.messages).toHaveLength(2);
+    expect(frame.messages![0]).toEqual({ name: 'a', data: { i: 1 } });
+    expect(frame.messages![1]).toEqual({ name: 'b', data: 'two', encoding: 'enc' });
+  });
 });

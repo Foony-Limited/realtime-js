@@ -19,9 +19,15 @@ All notable changes to `@foony/realtime`. Format loosely follows
   the edge then sends every frame back in the same form, and the SDK decodes it. This is far
   cheaper for the edge than `JSON.stringify`/`JSON.parse` at high message rates (publishes, deliveries,
   acks, history responses, pings). The edge still accepts JSON from older clients, so this is
-  backward compatible. One current exception: a batch publish (`channel.publish([...])`, and the
-  SDK's auto-batching) has no binary form yet and rides a JSON frame, which the client tells apart
-  by the WebSocket opcode.
+  backward compatible.
+- **Binary batches.** A batch — an array publish, or the auto-batching that every
+  `channel.publish()` goes through — now has its own binary record too, both on the wire and in
+  storage. A batch is one durable message (one id, one serial) carrying several named payloads, so
+  the record stores the shared header once and then just each payload's name/data/encoding; the
+  SDK expands it back into individual messages. Since single publishes auto-batch, this covers
+  essentially all delivered traffic, so delivery no longer falls back to JSON. The one remaining
+  JSON case is a server-coalesced bundle that happens to carry a batch member (nested), which is
+  interop-only and goes away after the server's storage migration.
 
 ### Fixed
 

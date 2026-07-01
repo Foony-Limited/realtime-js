@@ -33,7 +33,7 @@ import type {
 /** Frame opcodes — one per frame type, matching Go wire.Op. */
 const Op = {
   Auth: 1, Sub: 2, Unsub: 3, Pub: 4, Pres: 5, PresSub: 6, PresUnsub: 7, Hist: 8, Fetch: 9, Ping: 10,
-  Connected: 11, Ack: 12, Msg: 13, PresEvt: 14, Err: 15, Pong: 16, HistRes: 17, FetchRes: 18,
+  Connected: 11, Ack: 12, Msg: 13, PresEvt: 14, Err: 15, Pong: 16, HistRes: 17, FetchRes: 18, Batch: 19,
 } as const;
 
 const FLAG_EPHEMERAL = 1 << 0;
@@ -340,6 +340,8 @@ function decodeServerFrame(record: Uint8Array): ServerFrame | null {
       }
       case Op.Msg:
         return decodeMessage(reader);
+      case Op.Batch:
+        return decodeBatch(reader);
       case Op.PresEvt: {
         const action = presenceActionFrom(reader.byte());
         const timestamp = reader.uvarint();
@@ -382,6 +384,32 @@ function decodeMessage(reader: Reader): MessageFrame {
     bundle.push(memberToBundled(member));
   }
   return { t: 'msg', channel, name: '', data: undefined, timestamp: 0, messageId: '', bundle };
+}
+
+/** decodeBatch reads an OpBatch record: a shared header then its members, into a msg frame whose
+ * `messages` the channel expands into individual messages. */
+function decodeBatch(reader: Reader): MessageFrame {
+  const flags = reader.byte();
+  const timestamp = reader.uvarint();
+  const channel = reader.str();
+  const messageId = reader.str();
+  const clientId = reader.str();
+  const seq = reader.uvarint();
+  const count = reader.uvarint();
+  const messages: BatchMember[] = [];
+  for (let index = 0; index < count; index++) {
+    const name = reader.str();
+    const data = reader.json();
+    const encoding = reader.str();
+    messages.push({ name, data, ...(encoding ? { encoding } : {}) });
+  }
+  return {
+    t: 'msg', channel, name: '', data: undefined, timestamp, messageId,
+    ...(clientId ? { clientId } : {}),
+    ...(seq ? { seq } : {}),
+    ...(flags & FLAG_EPHEMERAL ? { ephemeral: true } : {}),
+    messages,
+  };
 }
 
 function decodeResponse(reader: Reader): { id: number; channel: string; messages: MessageFrame[]; flag: boolean } {
@@ -442,6 +470,9 @@ export function encodeServerFrame(frame: ServerFrame): Uint8Array {
 }
 
 function encodeMessage(frame: MessageFrame): Uint8Array {
+  if (frame.messages && frame.messages.length > 0) {
+    return encodeBatch(frame);
+  }
   const out: number[] = [Op.Msg];
   if (frame.bundle && frame.bundle.length > 0) {
     pushUvarint(out, frame.bundle.length);
@@ -449,6 +480,25 @@ function encodeMessage(frame: MessageFrame): Uint8Array {
   } else {
     pushUvarint(out, 1);
     pushMember(out, frame, frame.channel);
+  }
+  return Uint8Array.from(out);
+}
+
+/** encodeBatch encodes a batch msg frame (`messages` set) as an OpBatch record: shared header
+ * then its members. Mirrors Go wire.EncodeBinaryBatch. */
+function encodeBatch(frame: MessageFrame): Uint8Array {
+  const members = frame.messages ?? [];
+  const out: number[] = [Op.Batch, frame.ephemeral ? FLAG_EPHEMERAL : 0];
+  pushUvarint(out, frame.timestamp);
+  pushString(out, frame.channel);
+  pushString(out, frame.messageId);
+  pushString(out, frame.clientId ?? '');
+  pushUvarint(out, frame.seq ?? 0);
+  pushUvarint(out, members.length);
+  for (const member of members) {
+    pushString(out, member.name);
+    pushJson(out, member.data);
+    pushString(out, member.encoding ?? '');
   }
   return Uint8Array.from(out);
 }
