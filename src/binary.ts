@@ -5,19 +5,20 @@
  * which is much cheaper for the edge to produce under heavy fan-out. This decodes them back
  * into {@link MessageFrame} values identical to the JSON path.
  *
- * The layout mirrors Go `wire.EncodeBinaryMessage` / `wire.AppendBinaryRecord`
- * (services/realtime-saas/internal/wire): a WebSocket binary message is a sequence of records,
- * each a uvarint length followed by that many bytes; each record is
- *   tag(0x02) flags uvarint(timestamp)
- *   lp(channel) lp(name) lp(data) lp(messageId) lp(clientId) lp(encoding) uvarint(seq)
+ * The layout mirrors Go `wire.EncodeBinaryMessage(s)` (services/realtime-saas/internal/wire): a
+ * WebSocket binary message is a sequence of length-prefixed records; each record is
+ *   tag(0x02) uvarint(count) member×count
+ *   member := flags uvarint(timestamp) lp(channel) lp(name) lp(data)
+ *             lp(messageId) lp(clientId) lp(encoding) uvarint(seq)
  * where `lp` is a uvarint length followed by the bytes, `data` is raw JSON, and `seq` is the
- * trailing field (the server appends it after building the body).
+ * member's trailing field. There is no separate bundle shape: a normal message is a record of
+ * count 1, a server-coalesced bundle a record of count > 1 (surfaced as a `bundle` frame the SDK
+ * unwraps and dedups, exactly like the JSON path).
  */
 
 import type { BundledMessage, MessageFrame } from './wire.js';
 
-const BIN_MESSAGE_TAG = 0x02;
-const BIN_BUNDLE_TAG = 0x03;
+const BIN_RECORD_TAG = 0x02;
 const BIN_MSG_FLAG_EPHEMERAL = 1 << 0;
 
 const textDecoder = new TextDecoder();
@@ -79,27 +80,40 @@ export function decodeBinaryMessages(buffer: ArrayBuffer): MessageFrame[] {
     } catch {
       break;
     }
-    const frame = record.length > 0 && record[0] === BIN_BUNDLE_TAG ? decodeBundle(record) : decodeRecord(record);
+    const frame = decodeRecord(record);
     if (frame) frames.push(frame);
   }
   return frames;
 }
 
+/** One decoded member of a record (before it becomes a single frame or a bundle entry). */
+type Member = {
+  channel: string;
+  name: string;
+  data: unknown;
+  timestamp: number;
+  messageId: string;
+  clientId: string;
+  encoding: string;
+  seq: number;
+  ephemeral: boolean;
+};
+
 /**
- * decodeBundle decodes a bundle record — a tag, a count, then that many length-prefixed member
- * message records — into one MessageFrame carrying `bundle`, mirroring the JSON bundle frame the
- * SDK already unwraps and dedups. Returns null if malformed.
+ * decodeRecord decodes one record: a tag, a member count, then that many members. Count 1 becomes
+ * a normal message frame; count > 1 becomes a bundle frame (members surfaced as `bundle`, mirroring
+ * the JSON bundle the SDK unwraps and dedups). Returns null if malformed.
  */
-function decodeBundle(record: Uint8Array): MessageFrame | null {
+function decodeRecord(record: Uint8Array): MessageFrame | null {
   try {
     const reader = new Reader(record);
-    if (reader.byte() !== BIN_BUNDLE_TAG) return null;
+    if (reader.byte() !== BIN_RECORD_TAG) return null;
     const count = reader.uvarint();
+    if (count === 1) return memberToFrame(readMember(reader));
     const bundle: BundledMessage[] = [];
     let channel = '';
     for (let i = 0; i < count; i++) {
-      const member = decodeRecord(reader.lenPrefixed());
-      if (!member) return null;
+      const member = readMember(reader);
       channel = member.channel;
       bundle.push({
         name: member.name,
@@ -120,36 +134,42 @@ function decodeBundle(record: Uint8Array): MessageFrame | null {
   }
 }
 
-/** decodeRecord decodes one binary message record, or null if it is malformed. */
-function decodeRecord(record: Uint8Array): MessageFrame | null {
-  try {
-    const reader = new Reader(record);
-    if (reader.byte() !== BIN_MESSAGE_TAG) return null;
-    const flags = reader.byte();
-    const timestamp = reader.uvarint();
-    const channel = textDecoder.decode(reader.lenPrefixed());
-    const name = textDecoder.decode(reader.lenPrefixed());
-    const dataBytes = reader.lenPrefixed();
-    const messageId = textDecoder.decode(reader.lenPrefixed());
-    const clientId = textDecoder.decode(reader.lenPrefixed());
-    const encoding = textDecoder.decode(reader.lenPrefixed());
-    // Serial is the trailing field: a durable message's serial is appended by the server
-    // after the body is built, so the decoder reads it last.
-    const seq = reader.uvarint();
-    const frame: MessageFrame = {
-      t: 'msg',
-      channel,
-      name,
-      data: dataBytes.length > 0 ? JSON.parse(textDecoder.decode(dataBytes)) : undefined,
-      timestamp,
-      messageId,
-      ...(clientId ? { clientId } : {}),
-      ...(encoding ? { encoding } : {}),
-      ...(seq ? { seq } : {}),
-      ...(flags & BIN_MSG_FLAG_EPHEMERAL ? { ephemeral: true } : {}),
-    };
-    return frame;
-  } catch {
-    return null;
-  }
+/** readMember reads one member's fields; serial is its trailing field. */
+function readMember(reader: Reader): Member {
+  const flags = reader.byte();
+  const timestamp = reader.uvarint();
+  const channel = textDecoder.decode(reader.lenPrefixed());
+  const name = textDecoder.decode(reader.lenPrefixed());
+  const dataBytes = reader.lenPrefixed();
+  const messageId = textDecoder.decode(reader.lenPrefixed());
+  const clientId = textDecoder.decode(reader.lenPrefixed());
+  const encoding = textDecoder.decode(reader.lenPrefixed());
+  const seq = reader.uvarint();
+  return {
+    channel,
+    name,
+    data: dataBytes.length > 0 ? JSON.parse(textDecoder.decode(dataBytes)) : undefined,
+    timestamp,
+    messageId,
+    clientId,
+    encoding,
+    seq,
+    ephemeral: (flags & BIN_MSG_FLAG_EPHEMERAL) !== 0,
+  };
+}
+
+/** memberToFrame builds a single message frame from a decoded member. */
+function memberToFrame(member: Member): MessageFrame {
+  return {
+    t: 'msg',
+    channel: member.channel,
+    name: member.name,
+    data: member.data,
+    timestamp: member.timestamp,
+    messageId: member.messageId,
+    ...(member.clientId ? { clientId: member.clientId } : {}),
+    ...(member.encoding ? { encoding: member.encoding } : {}),
+    ...(member.seq ? { seq: member.seq } : {}),
+    ...(member.ephemeral ? { ephemeral: true } : {}),
+  };
 }
