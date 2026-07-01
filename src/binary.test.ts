@@ -16,9 +16,9 @@ describe('binary message decoding', () => {
   // for a known message. Pins the SDK decoder to the actual server wire format so the two
   // cannot drift silently across languages.
   const golden =
-    '530201b960f0d6a183f23306726f6f6d3a310463686174157b226869223a22746865' +
+    '530201f0d6a183f23306726f6f6d3a310463686174157b226869223a22746865' +
     '7265222c226e223a34327d1c313738323935353134323030303030303030302d3161' +
-    '32623363346408636c69656e742d3700';
+    '32623363346408636c69656e742d3700b960';
 
   it('decodes a Go-encoded binary message frame', () => {
     const frames = decodeBinaryMessages(hexToArrayBuffer(golden));

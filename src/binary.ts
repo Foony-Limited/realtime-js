@@ -8,9 +8,10 @@
  * The layout mirrors Go `wire.EncodeBinaryMessage` / `wire.AppendBinaryRecord`
  * (services/realtime-saas/internal/wire): a WebSocket binary message is a sequence of records,
  * each a uvarint length followed by that many bytes; each record is
- *   tag(0x02) flags uvarint(seq) uvarint(timestamp)
- *   lp(channel) lp(name) lp(data) lp(messageId) lp(clientId) lp(encoding)
- * where `lp` is a uvarint length followed by the bytes, and `data` is raw JSON.
+ *   tag(0x02) flags uvarint(timestamp)
+ *   lp(channel) lp(name) lp(data) lp(messageId) lp(clientId) lp(encoding) uvarint(seq)
+ * where `lp` is a uvarint length followed by the bytes, `data` is raw JSON, and `seq` is the
+ * trailing field (the server appends it after building the body).
  */
 
 import type { MessageFrame } from './wire.js';
@@ -89,7 +90,6 @@ function decodeRecord(record: Uint8Array): MessageFrame | null {
     const reader = new Reader(record);
     if (reader.byte() !== BIN_MESSAGE_TAG) return null;
     const flags = reader.byte();
-    const seq = reader.uvarint();
     const timestamp = reader.uvarint();
     const channel = textDecoder.decode(reader.lenPrefixed());
     const name = textDecoder.decode(reader.lenPrefixed());
@@ -97,6 +97,9 @@ function decodeRecord(record: Uint8Array): MessageFrame | null {
     const messageId = textDecoder.decode(reader.lenPrefixed());
     const clientId = textDecoder.decode(reader.lenPrefixed());
     const encoding = textDecoder.decode(reader.lenPrefixed());
+    // Serial is the trailing field: a durable message's serial is appended by the server
+    // after the body is built, so the decoder reads it last.
+    const seq = reader.uvarint();
     const frame: MessageFrame = {
       t: 'msg',
       channel,
