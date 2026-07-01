@@ -2,7 +2,10 @@
  * Wire protocol types for the Foony Realtime WebSocket service.
  *
  * Mirrors `services/realtime-saas/internal/wire/wire.go` exactly — any
- * change here MUST be mirrored on the Go side and vice versa.
+ * change here MUST be mirrored on the Go side and vice versa. The Go file is
+ * the canonical source. The two tables that have drifted before, so watch
+ * them: the `FrameType` discriminator list (Go `Frame*` consts) and the
+ * `ErrorCode` table (Go `Code*` consts) — both must stay one-for-one.
  *
  * Conventions:
  *  - Every frame has a single-character `t` discriminator.
@@ -13,22 +16,32 @@
  *    except for `t`, which we keep short because every frame carries it.
  */
 
-/** Discriminator values for the `t` field. */
+/**
+ * Discriminator values for the `t` field. Must list every `Frame*` const in
+ * the Go `FrameType` tables (`internal/wire/wire.go`) — see the sync note in
+ * this file's header.
+ */
 export type FrameType =
+  // Client -> Server
   | 'auth'
   | 'sub'
   | 'unsub'
   | 'pub'
   | 'pres'
+  | 'presSub'
+  | 'presUnsub'
   | 'hist'
+  | 'fetch'
   | 'ping'
+  // Server -> Client
   | 'connected'
   | 'ack'
   | 'msg'
   | 'presEvt'
   | 'err'
   | 'pong'
-  | 'histRes';
+  | 'histRes'
+  | 'fetchRes';
 
 /** Recognized presence transition values. */
 export type PresenceAction = 'enter' | 'leave' | 'update';
@@ -406,8 +419,9 @@ export type ServerFrame =
   | FetchResponseFrame;
 
 /**
- * Error codes the server uses on `err` frames. Mirrors the Go
- * `internal/wire` constants — keep in sync.
+ * Error codes the server uses on `err` frames. Mirrors the `Code*` constant
+ * table in the Go `internal/wire/wire.go` (the canonical source) one-for-one —
+ * see the sync note in this file's header. Keep the order and values identical.
  */
 export const ErrorCode = {
   /** Malformed or unparseable frame. */
@@ -418,10 +432,18 @@ export const ErrorCode = {
   AuthExpired: 40102,
   /** Authenticated but not permitted for this channel or action. */
   Forbidden: 40300,
+  /** The token's capability does not grant the requested action. */
+  Capability: 40301,
+  /** The token's capability does not grant access to this specific channel. */
+  ChannelDenied: 40302,
   /** Referenced resource (e.g. channel) does not exist. */
   NotFound: 40400,
+  /** Too many requests; the publish or connection rate limit was exceeded. */
+  RateLimited: 42900,
   /** Unexpected server-side error. */
   Server: 50000,
+  /** The edge could not bootstrap its NATS streams/buckets; retry later. */
+  Bootstrap: 50001,
 } as const;
 
 /** Union of the {@link ErrorCode} member names (e.g. `'Forbidden'`), for typing error handlers. */

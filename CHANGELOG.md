@@ -3,6 +3,18 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.12.0
+
+### Fixed
+
+- **`ErrorCode` and `FrameType` now match the server.** The SDK's wire tables had drifted
+  from the canonical Go definitions. `ErrorCode` was missing `Capability` (40301),
+  `ChannelDenied` (40302), `RateLimited` (42900), and `Bootstrap` (50001) — most importantly
+  `RateLimited`, so an app could not cleanly tell throttling apart from other errors on an
+  `err` frame. The `FrameType` discriminator union was missing `presSub`, `presUnsub`,
+  `fetch`, and `fetchRes` (the frame shapes themselves were already present). Purely additive,
+  so existing code keeps working.
+
 ## 0.11.0
 
 ### Changed
