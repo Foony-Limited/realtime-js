@@ -79,6 +79,13 @@ export type AuthFrame = {
    * (the member key does not change), so a quick reconnect causes no leave/enter churn.
    */
   readonly resumeConnectionId?: string;
+  /**
+   * Tells the server this client can decode a WebSocket message that carries several frames
+   * joined by '\n', so under load the server may pack many acks/deliveries into one message
+   * and one socket write. The SDK always sets it and splits incoming messages accordingly;
+   * omitting it (older SDKs) makes the server send one frame per message, unchanged.
+   */
+  readonly coalesce?: boolean;
 };
 
 /** Start delivering messages + presence for `channel`. */

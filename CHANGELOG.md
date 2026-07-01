@@ -5,6 +5,15 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ## 0.12.0
 
+### Added
+
+- **Frame coalescing.** The client now tells the server (via a `coalesce` flag on the auth
+  handshake) that it can decode a WebSocket message carrying several frames joined by `'\n'`,
+  and it splits incoming messages accordingly. Under load the server packs many acks and
+  deliveries into one message and one socket write, a large edge-CPU saving at high message
+  rates. Purely additive and backward compatible: an older client that does not send the flag
+  keeps receiving one frame per message.
+
 ### Fixed
 
 - **`ErrorCode` and `FrameType` now match the server.** The SDK's wire tables had drifted

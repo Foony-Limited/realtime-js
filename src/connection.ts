@@ -752,29 +752,45 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // On a reconnect, ask the server to reuse our previous connection id so presence
     // membership survives the gap with no leave/enter churn. Null on the first connect.
     const resume = this.connectionId ? { resumeConnectionId: this.connectionId } : {};
+    // Opt into frame coalescing so the server may pack many frames into one message under
+    // load; handleMessage splits them back apart on read.
     if (this.options.key) {
       return {
         t: 'auth',
         key: this.options.key,
+        coalesce: true,
         ...(this.options.clientId ? { clientId: this.options.clientId } : {}),
         ...resume,
       };
     }
-    if (this.options.token) return { t: 'auth', token: this.options.token, ...resume };
+    if (this.options.token) return { t: 'auth', token: this.options.token, coalesce: true, ...resume };
     if (!this.options.authCallback) {
       throw new Error('Connection: missing auth method');
     }
-    return { t: 'auth', token: await this.options.authCallback(), ...resume };
+    return { t: 'auth', token: await this.options.authCallback(), coalesce: true, ...resume };
   }
 
   /** Steady-state message handler; installed after a successful auth. */
   private readonly handleMessage = (event: MessageEvent): void => {
-    let frame: ServerFrame;
-    try {
-      frame = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString()) as ServerFrame;
-    } catch {
-      return;
+    const raw = typeof event.data === 'string' ? event.data : event.data.toString();
+    // The server may pack several frames into one message, separated by '\n' (we opted in
+    // via the auth frame's `coalesce` flag). A newline never appears inside JSON — it is
+    // escaped in strings — so splitting on it cleanly recovers the frames; a message the
+    // server did not coalesce is a single segment.
+    for (const segment of raw.split('\n')) {
+      if (segment.length === 0) continue;
+      let frame: ServerFrame;
+      try {
+        frame = JSON.parse(segment) as ServerFrame;
+      } catch {
+        continue;
+      }
+      this.handleFrame(frame);
     }
+  };
+
+  /** Dispatches one decoded server frame to its waiting caller or channel. */
+  private handleFrame(frame: ServerFrame): void {
     switch (frame.t) {
       case 'ack': {
         const pending = this.pending.get(frame.id);
@@ -846,7 +862,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         // the switch exhaustive.
         return;
     }
-  };
+  }
 
   private handleClose(event: CloseEvent): void {
     this.socket = null;
