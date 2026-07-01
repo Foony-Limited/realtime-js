@@ -14,9 +14,10 @@
  * trailing field (the server appends it after building the body).
  */
 
-import type { MessageFrame } from './wire.js';
+import type { BundledMessage, MessageFrame } from './wire.js';
 
 const BIN_MESSAGE_TAG = 0x02;
+const BIN_BUNDLE_TAG = 0x03;
 const BIN_MSG_FLAG_EPHEMERAL = 1 << 0;
 
 const textDecoder = new TextDecoder();
@@ -78,10 +79,45 @@ export function decodeBinaryMessages(buffer: ArrayBuffer): MessageFrame[] {
     } catch {
       break;
     }
-    const frame = decodeRecord(record);
+    const frame = record.length > 0 && record[0] === BIN_BUNDLE_TAG ? decodeBundle(record) : decodeRecord(record);
     if (frame) frames.push(frame);
   }
   return frames;
+}
+
+/**
+ * decodeBundle decodes a bundle record — a tag, a count, then that many length-prefixed member
+ * message records — into one MessageFrame carrying `bundle`, mirroring the JSON bundle frame the
+ * SDK already unwraps and dedups. Returns null if malformed.
+ */
+function decodeBundle(record: Uint8Array): MessageFrame | null {
+  try {
+    const reader = new Reader(record);
+    if (reader.byte() !== BIN_BUNDLE_TAG) return null;
+    const count = reader.uvarint();
+    const bundle: BundledMessage[] = [];
+    let channel = '';
+    for (let i = 0; i < count; i++) {
+      const member = decodeRecord(reader.lenPrefixed());
+      if (!member) return null;
+      channel = member.channel;
+      bundle.push({
+        name: member.name,
+        data: member.data,
+        timestamp: member.timestamp,
+        messageId: member.messageId,
+        ...(member.clientId ? { clientId: member.clientId } : {}),
+        ...(member.encoding ? { encoding: member.encoding } : {}),
+        ...(member.seq ? { seq: member.seq } : {}),
+        ...(member.ephemeral ? { ephemeral: true } : {}),
+      });
+    }
+    // A bundle frame's own name/data/timestamp/messageId are unused (the members carry them);
+    // fill zero values to match the JSON bundle frame shape the SDK already unwraps.
+    return { t: 'msg', channel, name: '', data: undefined, timestamp: 0, messageId: '', bundle };
+  } catch {
+    return null;
+  }
 }
 
 /** decodeRecord decodes one binary message record, or null if it is malformed. */

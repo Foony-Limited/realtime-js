@@ -19,7 +19,9 @@ All notable changes to `@foony/realtime`. Format loosely follows
   message events. Encoding a delivered message this way is several times cheaper for the edge
   than `JSON.stringify`, which raises fan-out throughput at high message rates. Purely additive
   and backward compatible: an older client that does not send the flag keeps receiving JSON
-  message frames, and bundles and batch messages always stay JSON.
+  message frames. Server-coalesced bundles are delivered in binary too (a bundle record is just
+  the member records concatenated) and unwrapped as before; client batch publishes still arrive
+  as JSON for now.
 
 ### Fixed
 

@@ -44,6 +44,23 @@ describe('binary message decoding', () => {
     expect(frames[1]!.messageId).toBe('1782955142000000000-1a2b3c4d');
   });
 
+  // Golden bytes from Go wire.AppendBinaryRecord(wire.EncodeBinaryBundle(...)) for a 2-member
+  // bundle on "room:1". Pins the bundle decoder to the server format.
+  const goldenBundle =
+    '3e03021e02006406726f6f6d3a310161077b2269223a317d0469642d31026331' +
+    '00051c02016506726f6f6d3a310162052274776f220469642d320263320006';
+
+  it('decodes a Go-encoded binary bundle into a bundle frame', () => {
+    const frames = decodeBinaryMessages(hexToArrayBuffer(goldenBundle));
+    expect(frames).toHaveLength(1);
+    const frame = frames[0]!;
+    expect(frame.channel).toBe('room:1');
+    expect(frame.bundle).toBeDefined();
+    expect(frame.bundle).toHaveLength(2);
+    expect(frame.bundle![0]).toMatchObject({ name: 'a', data: { i: 1 }, messageId: 'id-1', clientId: 'c1', seq: 5 });
+    expect(frame.bundle![1]).toMatchObject({ name: 'b', data: 'two', messageId: 'id-2', clientId: 'c2', seq: 6, ephemeral: true });
+  });
+
   it('returns whole frames decoded before a malformed tail', () => {
     // Valid record followed by a truncated length prefix.
     const frames = decodeBinaryMessages(hexToArrayBuffer(golden + 'ff'));
