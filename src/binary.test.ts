@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { decodeBinaryMessages } from './binary.js';
+import { decodeBinaryMessages, encodeBinaryPublish } from './binary.js';
+import type { PublishFrame } from './wire.js';
 
 /** Turn a hex string into an ArrayBuffer (as a WebSocket binary message arrives). */
 function hexToArrayBuffer(hex: string): ArrayBuffer {
@@ -10,6 +11,30 @@ function hexToArrayBuffer(hex: string): ArrayBuffer {
   }
   return bytes.buffer;
 }
+
+/** Hex-encode bytes for comparison against a Go golden. */
+function toHex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+describe('binary publish encoding', () => {
+  it('encodes a single publish to the Go format', () => {
+    const frame: PublishFrame = { t: 'pub', channel: 'room:1', name: 'chat', data: { hi: 'there' }, ephemeral: true, messageId: 'm-1', id: 7 };
+    // Golden from Go wire.EncodeBinaryPublish.
+    expect(toHex(encodeBinaryPublish(frame))).toBe('01010706726f6f6d3a3104636861740e7b226869223a227468657265227d00036d2d310000');
+  });
+
+  it('encodes a batch publish (Messages) to the Go format', () => {
+    const frame: PublishFrame = {
+      t: 'pub', channel: 'room:1', name: '', data: null, messageId: 'm-2', id: 9,
+      messages: [
+        { name: 'a', data: { i: 1 } },
+        { name: 'b', data: 'two', encoding: 'enc' },
+      ],
+    };
+    expect(toHex(encodeBinaryPublish(frame))).toBe('01000906726f6f6d3a3100046e756c6c00036d2d3200020161077b2269223a317d000162052274776f2203656e63');
+  });
+});
 
 describe('binary message decoding', () => {
   // Golden bytes produced by the Go encoder (wire.AppendBinaryRecord(wire.EncodeBinaryMessage))

@@ -11,7 +11,58 @@ import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { Realtime, generateRandomKey } from './index.js';
-import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
+import type { AuthFrame, BatchMember, ClientFrame, PublishFrame, ServerFrame } from './wire.js';
+
+// The SDK sends publishes in the compact binary format on the WebSocket binary opcode; control
+// frames stay JSON. The fake edge decodes a binary publish here (a small mirror of Go
+// wire.DecodeBinaryPublish) so the end-to-end tests exercise the real send path. Not shipped —
+// the browser SDK only encodes publishes; the Go edge decodes them.
+function decodeBinaryPublish(message: Uint8Array): PublishFrame {
+  const decoder = new TextDecoder();
+  let offset = 0;
+  const uvarint = (): number => {
+    let result = 0;
+    let shift = 0;
+    for (;;) {
+      const byte = message[offset++]!;
+      result += (byte & 0x7f) * 2 ** shift;
+      if ((byte & 0x80) === 0) return result;
+      shift += 7;
+    }
+  };
+  const lenPrefixed = (): Uint8Array => {
+    const length = uvarint();
+    const slice = message.subarray(offset, offset + length);
+    offset += length;
+    return slice;
+  };
+  const json = (bytes: Uint8Array): unknown => (bytes.length > 0 ? JSON.parse(decoder.decode(bytes)) : undefined);
+  uvarint(); // outer length prefix (frameBinaryRecord)
+  offset++; // record tag (0x01)
+  const flags = message[offset++]!;
+  const id = uvarint();
+  const channel = decoder.decode(lenPrefixed());
+  const name = decoder.decode(lenPrefixed());
+  const data = json(lenPrefixed());
+  const encoding = decoder.decode(lenPrefixed());
+  const messageId = decoder.decode(lenPrefixed());
+  const ttlMs = uvarint();
+  const memberCount = uvarint();
+  const messages: BatchMember[] = [];
+  for (let index = 0; index < memberCount; index++) {
+    const memberName = decoder.decode(lenPrefixed());
+    const memberData = json(lenPrefixed());
+    const memberEncoding = decoder.decode(lenPrefixed());
+    messages.push({ name: memberName, data: memberData, ...(memberEncoding ? { encoding: memberEncoding } : {}) });
+  }
+  return {
+    t: 'pub', channel, name, data, id, messageId,
+    ...(encoding ? { encoding } : {}),
+    ...(ttlMs ? { ttlMs } : {}),
+    ...(flags & 1 ? { ephemeral: true } : {}),
+    ...(messages.length ? { messages } : {}),
+  };
+}
 
 type Harness = {
   readonly server: WebSocketServer;
@@ -60,8 +111,11 @@ async function startFakeEdge(): Promise<Harness> {
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
-    socket.on('message', (raw) => {
-      const frame = JSON.parse(raw.toString()) as ClientFrame;
+    socket.on('message', (raw, isBinary) => {
+      // Publishes arrive binary (WebSocket binary opcode); control frames arrive as JSON text.
+      const frame = isBinary
+        ? (decodeBinaryPublish(new Uint8Array(raw as Buffer)) as ClientFrame)
+        : (JSON.parse(raw.toString()) as ClientFrame);
       if (frame.t === 'auth') {
         const auth = frame as AuthFrame;
         authFrames.push(auth);

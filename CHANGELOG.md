@@ -19,9 +19,13 @@ All notable changes to `@foony/realtime`. Format loosely follows
   message events. Encoding a delivered message this way is several times cheaper for the edge
   than `JSON.stringify`, which raises fan-out throughput at high message rates. Purely additive
   and backward compatible: an older client that does not send the flag keeps receiving JSON
-  message frames. Server-coalesced bundles are delivered in binary too (a bundle record is just
-  the member records concatenated) and unwrapped as before; client batch publishes still arrive
-  as JSON for now.
+  message frames. Server-coalesced bundles are delivered in binary too (a bundle is just a record
+  of several members) and unwrapped as before.
+- **Binary publishes.** The SDK now also *sends* publishes in the compact binary format on the
+  WebSocket binary opcode — single publishes and auto-batched/array publishes alike — instead of
+  JSON, so the client→edge path is binary end to end and much cheaper for the edge to decode at
+  high publish rates. Control frames (auth, subscribe, presence, history, …) stay JSON; the
+  server accepts binary and JSON publishes interchangeably.
 
 ### Fixed
 

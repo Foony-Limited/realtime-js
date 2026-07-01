@@ -27,7 +27,7 @@ import type {
   UnsubscribeFrame,
 } from './wire.js';
 import { ErrorCode } from './wire.js';
-import { decodeBinaryMessages } from './binary.js';
+import { decodeBinaryMessages, encodeBinaryPublish, frameBinaryRecord } from './binary.js';
 
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
@@ -570,13 +570,15 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     });
   }
 
-  /** Send an outstanding publish on the current socket under a fresh request id. */
+  /** Send an outstanding publish on the current socket under a fresh request id. Publishes go
+   * out in the compact binary format (WebSocket binary opcode); the server accepts binary and
+   * JSON publishes interchangeably, so control frames stay JSON. */
   private sendPublish(outstanding: OutstandingPublish): void {
     const id = this.nextRequestId++;
     outstanding.requestId = id;
     this.publishRequestIds.set(id, outstanding.frame.messageId);
     try {
-      this.sendRaw({ ...outstanding.frame, id });
+      this.sendBinary(frameBinaryRecord(encodeBinaryPublish({ ...outstanding.frame, id })));
     } catch {
       // Socket not actually open; leave it outstanding to (re)send on the next connect.
       this.publishRequestIds.delete(id);
@@ -1011,6 +1013,14 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       throw new Error(`Connection.sendRaw: socket not open (state=${this.state})`);
     }
     this.socket.send(JSON.stringify(frame));
+  }
+
+  /** Send an already-encoded binary payload (a length-prefixed publish record) on the socket. */
+  private sendBinary(bytes: Uint8Array<ArrayBuffer>): void {
+    if (!this.socket || this.socket.readyState !== READY_STATE_OPEN) {
+      throw new Error(`Connection.sendBinary: socket not open (state=${this.state})`);
+    }
+    this.socket.send(bytes);
   }
 
   private setState(state: ConnectionState, reason?: Error): void {

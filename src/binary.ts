@@ -16,12 +16,77 @@
  * unwraps and dedups, exactly like the JSON path).
  */
 
-import type { BundledMessage, MessageFrame } from './wire.js';
+import type { BundledMessage, MessageFrame, PublishFrame } from './wire.js';
 
 const BIN_RECORD_TAG = 0x02;
+const BIN_PUBLISH_TAG = 0x01;
 const BIN_MSG_FLAG_EPHEMERAL = 1 << 0;
 
 const textDecoder = new TextDecoder();
+const textEncoder = new TextEncoder();
+
+/** Append value as a base-128 varint. Values are non-negative and well within 2^53. */
+function pushUvarint(out: number[], value: number): void {
+  let remaining = value;
+  while (remaining >= 0x80) {
+    out.push((remaining % 0x80) + 0x80);
+    remaining = Math.floor(remaining / 0x80);
+  }
+  out.push(remaining);
+}
+
+/** Append bytes prefixed by their uvarint length. */
+function pushLenPrefixed(out: number[], bytes: Uint8Array): void {
+  pushUvarint(out, bytes.length);
+  for (const byte of bytes) out.push(byte);
+}
+
+/** Encode a payload as its raw JSON bytes (empty when undefined), matching the JSON `data` field. */
+function jsonBytes(data: unknown): Uint8Array {
+  return data === undefined ? new Uint8Array(0) : textEncoder.encode(JSON.stringify(data));
+}
+
+/**
+ * encodeBinaryPublish encodes a publish frame as one binary publish record, mirroring Go
+ * `wire.EncodeBinaryPublish`:
+ *   tag(0x01) flags uvarint(id) lp(channel) lp(name) lp(data) lp(encoding) lp(messageId)
+ *   uvarint(ttlMs) uvarint(memberCount) [lp(name) lp(data) lp(encoding)]×memberCount
+ * A single publish has member count 0 (message in the top-level name/data); a batch has members.
+ */
+export function encodeBinaryPublish(frame: PublishFrame): Uint8Array {
+  const out: number[] = [];
+  out.push(BIN_PUBLISH_TAG);
+  out.push(frame.ephemeral ? BIN_MSG_FLAG_EPHEMERAL : 0);
+  pushUvarint(out, frame.id);
+  pushLenPrefixed(out, textEncoder.encode(frame.channel));
+  pushLenPrefixed(out, textEncoder.encode(frame.name ?? ''));
+  pushLenPrefixed(out, jsonBytes(frame.data));
+  pushLenPrefixed(out, textEncoder.encode(frame.encoding ?? ''));
+  pushLenPrefixed(out, textEncoder.encode(frame.messageId));
+  pushUvarint(out, frame.ttlMs ?? 0);
+  const members = frame.messages ?? [];
+  pushUvarint(out, members.length);
+  for (const member of members) {
+    pushLenPrefixed(out, textEncoder.encode(member.name));
+    pushLenPrefixed(out, jsonBytes(member.data));
+    pushLenPrefixed(out, textEncoder.encode(member.encoding ?? ''));
+  }
+  return Uint8Array.from(out);
+}
+
+/**
+ * frameBinaryRecord prefixes a record with its uvarint length so several records concatenate in
+ * one WebSocket binary message (and the server splits them the same way). The SDK sends one
+ * publish per message, so this wraps a single record.
+ */
+export function frameBinaryRecord(record: Uint8Array): Uint8Array<ArrayBuffer> {
+  const prefix: number[] = [];
+  pushUvarint(prefix, record.length);
+  const framed = new Uint8Array(prefix.length + record.length);
+  framed.set(prefix);
+  framed.set(record, prefix.length);
+  return framed;
+}
 
 /** A forward cursor over a byte buffer, mirroring Go's wire.BinReader. */
 class Reader {
