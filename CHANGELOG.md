@@ -3,6 +3,13 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com); versions are semver.
 
+## 0.12.1
+
+### Changed
+
+- Message delivery is now fully binary. Replaced the few remaining cases (e.g. message batching)
+  that still used JSON.
+
 ## 0.12.0
 
 ### Added
@@ -24,9 +31,7 @@ All notable changes to `@foony/realtime`. Format loosely follows
   storage. A batch is one durable message that carries one or more messages (payloads), so
   the record stores the shared header once and then just each payload's name/data/encoding. The
   SDK expands this back into individual messages. Since single publishes auto-batch, this covers
-  essentially all delivered traffic, so delivery no longer falls back to JSON. Server-coalesced
-  bundles are binary too (a bundle carries any mix of messages and batches), so nothing on the
-  delivery or storage path is JSON anymore.
+  essentially all delivered traffic, so delivery no longer falls back to JSON.
 
 ### Fixed
 
