@@ -86,6 +86,13 @@ export type AuthFrame = {
    * omitting it (older SDKs) makes the server send one frame per message, unchanged.
    */
   readonly coalesce?: boolean;
+  /**
+   * Tells the server this client can decode delivered message frames in the compact binary
+   * form (WebSocket binary opcode). The SDK always sets it and decodes binary messages back
+   * into MessageFrame values; omitting it (older SDKs) makes the server send JSON message
+   * frames, unchanged. Bundles and batch messages always stay JSON.
+   */
+  readonly binaryDelivery?: boolean;
 };
 
 /** Start delivering messages + presence for `channel`. */

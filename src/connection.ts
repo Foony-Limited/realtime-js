@@ -27,6 +27,7 @@ import type {
   UnsubscribeFrame,
 } from './wire.js';
 import { ErrorCode } from './wire.js';
+import { decodeBinaryMessages } from './binary.js';
 
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
@@ -745,33 +746,48 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     if (!ctor) {
       throw new Error('Connection: no WebSocket implementation available. Pass options.webSocket or install the "ws" package.');
     }
-    return new ctor(endpointToUrl(this.options.endpoint));
+    const socket = new ctor(endpointToUrl(this.options.endpoint));
+    // Deliver binary message frames as ArrayBuffer (not Blob) so handleMessage can decode
+    // them synchronously; text frames still arrive as strings.
+    socket.binaryType = 'arraybuffer';
+    return socket;
   }
 
   private async createAuthFrame(): Promise<AuthFrame> {
     // On a reconnect, ask the server to reuse our previous connection id so presence
     // membership survives the gap with no leave/enter churn. Null on the first connect.
     const resume = this.connectionId ? { resumeConnectionId: this.connectionId } : {};
-    // Opt into frame coalescing so the server may pack many frames into one message under
-    // load; handleMessage splits them back apart on read.
+    // Opt into frame coalescing (the server may pack many frames into one message under load;
+    // handleMessage splits them apart) and binary delivery (single messages arrive in the
+    // compact binary codec; handleMessage decodes them). Both are backward compatible.
+    const opts = { coalesce: true as const, binaryDelivery: true as const };
     if (this.options.key) {
       return {
         t: 'auth',
         key: this.options.key,
-        coalesce: true,
+        ...opts,
         ...(this.options.clientId ? { clientId: this.options.clientId } : {}),
         ...resume,
       };
     }
-    if (this.options.token) return { t: 'auth', token: this.options.token, coalesce: true, ...resume };
+    if (this.options.token) return { t: 'auth', token: this.options.token, ...opts, ...resume };
     if (!this.options.authCallback) {
       throw new Error('Connection: missing auth method');
     }
-    return { t: 'auth', token: await this.options.authCallback(), coalesce: true, ...resume };
+    return { t: 'auth', token: await this.options.authCallback(), ...opts, ...resume };
   }
 
   /** Steady-state message handler; installed after a successful auth. */
   private readonly handleMessage = (event: MessageEvent): void => {
+    // A binary message carries delivered frames in the compact binary codec (we opted in via
+    // the auth frame's `binaryDelivery` flag). Decode each length-prefixed record and dispatch.
+    const binary = toArrayBuffer(event.data);
+    if (binary) {
+      for (const frame of decodeBinaryMessages(binary)) {
+        this.handleFrame(frame);
+      }
+      return;
+    }
     const raw = typeof event.data === 'string' ? event.data : event.data.toString();
     // The server may pack several frames into one message, separated by '\n' (we opted in
     // via the auth frame's `coalesce` flag). A newline never appears inside JSON — it is
@@ -1025,6 +1041,20 @@ async function loadNodeWebSocket(): Promise<typeof WebSocket | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * toArrayBuffer returns the ArrayBuffer for a binary WebSocket message, or null for a text
+ * message. Handles both an ArrayBuffer (browser, with binaryType='arraybuffer') and a typed-
+ * array/Buffer view (some Node ws builds), copying the exact bytes of a view.
+ */
+function toArrayBuffer(data: unknown): ArrayBuffer | null {
+  if (data instanceof ArrayBuffer) return data;
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView;
+    return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer;
+  }
+  return null;
 }
 
 function endpointToUrl(endpoint = DEFAULT_REALTIME_ENDPOINT): string {

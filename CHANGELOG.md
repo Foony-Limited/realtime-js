@@ -13,6 +13,13 @@ All notable changes to `@foony/realtime`. Format loosely follows
   deliveries into one message and one socket write, a large edge-CPU saving at high message
   rates. Purely additive and backward compatible: an older client that does not send the flag
   keeps receiving one frame per message.
+- **Binary message delivery.** The client now advertises `binaryDelivery` on the auth
+  handshake, and the server delivers single messages in a compact length-prefixed binary form
+  on the WebSocket binary opcode instead of JSON. The SDK decodes them back into identical
+  message events. Encoding a delivered message this way is several times cheaper for the edge
+  than `JSON.stringify`, which raises fan-out throughput at high message rates. Purely additive
+  and backward compatible: an older client that does not send the flag keeps receiving JSON
+  message frames, and bundles and batch messages always stay JSON.
 
 ### Fixed
 
