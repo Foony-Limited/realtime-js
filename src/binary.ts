@@ -39,6 +39,11 @@ const Op = {
 const FLAG_EPHEMERAL = 1 << 0;
 const FLAG_RESPONSE_SET = 1 << 0;
 
+/** The byte after the auth opcode: a binary connection always coalesces and receives binary
+ * delivery (both implied by speaking binary), so instead of flags it carries a protocol version —
+ * 0 today, reserved for future connection-wide format changes. Matches Go wire.binAuthVersion. */
+const AUTH_PROTOCOL_VERSION = 0;
+
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
 
@@ -228,7 +233,7 @@ export function encodeClientFrame(frame: ClientFrame): Uint8Array {
 }
 
 function encodeAuth(frame: AuthFrame): Uint8Array {
-  const out: number[] = [Op.Auth, (frame.coalesce ? 1 : 0) | (frame.binaryDelivery ? 2 : 0)];
+  const out: number[] = [Op.Auth, AUTH_PROTOCOL_VERSION];
   pushString(out, frame.token ?? '');
   pushString(out, frame.key ?? '');
   pushString(out, frame.clientId ?? '');
@@ -517,7 +522,7 @@ export function decodeClientFrame(record: Uint8Array): ClientFrame {
   const reader = new Reader(record);
   switch (reader.byte()) {
     case Op.Auth: {
-      const flags = reader.byte();
+      reader.byte(); // protocol version (AUTH_PROTOCOL_VERSION); 0 today, reserved
       const token = reader.str();
       const key = reader.str();
       const clientId = reader.str();
@@ -525,7 +530,6 @@ export function decodeClientFrame(record: Uint8Array): ClientFrame {
       return {
         t: 'auth', ...(token ? { token } : {}), ...(key ? { key } : {}), ...(clientId ? { clientId } : {}),
         ...(resumeConnectionId ? { resumeConnectionId } : {}),
-        ...(flags & 1 ? { coalesce: true } : {}), ...(flags & 2 ? { binaryDelivery: true } : {}),
       };
     }
     case Op.Sub: {

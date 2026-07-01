@@ -7,27 +7,24 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ### Added
 
-- **Frame coalescing.** The client now tells the server (via a `coalesce` flag on the auth
-  handshake) that it can decode a WebSocket message carrying several frames joined by `'\n'`,
+- **Frame coalescing.** The client can now decode a WebSocket message carrying several frames,
   and it splits incoming messages accordingly. Under load the server packs many acks and
   deliveries into one message and one socket write, a large edge-CPU saving at high message
-  rates. Purely additive and backward compatible: an older client that does not send the flag
-  keeps receiving one frame per message.
+  rates (load testing shows up to a 3x improvement in max throughput).
 - **Binary opcode protocol.** The whole wire protocol is now binary: every frame is a 1-byte
   opcode followed by its fields (length-prefixed), replacing the JSON `t` discriminator. The SDK
-  sends its auth frame on the WebSocket binary opcode, which makes the whole connection binary —
-  the edge then sends every frame back in the same form, and the SDK decodes it. This is far
-  cheaper for the edge than `JSON.stringify`/`JSON.parse` at high message rates (publishes, deliveries,
-  acks, history responses, pings). The edge still accepts JSON from older clients, so this is
-  backward compatible.
-- **Binary batches.** A batch — an array publish, or the auto-batching that every
-  `channel.publish()` goes through — now has its own binary record too, both on the wire and in
-  storage. A batch is one durable message (one id, one serial) carrying several named payloads, so
-  the record stores the shared header once and then just each payload's name/data/encoding; the
-  SDK expands it back into individual messages. Since single publishes auto-batch, this covers
-  essentially all delivered traffic, so delivery no longer falls back to JSON. The one remaining
-  JSON case is a server-coalesced bundle that happens to carry a batch member (nested), which is
-  interop-only and goes away after the server's storage migration.
+  sends its auth frame on the WebSocket binary opcode, which makes the whole connection binary.
+  This is far cheaper for the edge than `JSON.stringify`/`JSON.parse` at high message rates
+  (publishes, deliveries, acks, history responses, pings). The edge still accepts JSON from
+  older clients, so this is backward compatible. However, as we're still pre-alpha, we'll be
+  removing this backwards-compatibility during the 0.13.0 release in the coming days. Once
+  foony.io launches its alpha, old SDKs will target a minimum 2-year lifespan.
+- **Binary batches.** A batch (i.e. an array publish, or the auto-batching that every
+  `channel.publish()` goes through) now has its own binary record, both on the wire and in
+  storage. A batch is one durable message that carries one or more messages (payloads), so
+  the record stores the shared header once and then just each payload's name/data/encoding. The
+  SDK expands this back into individual messages. Since single publishes auto-batch, this covers
+  essentially all delivered traffic, so delivery no longer falls back to JSON.
 
 ### Fixed
 

@@ -762,24 +762,23 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // On a reconnect, ask the server to reuse our previous connection id so presence
     // membership survives the gap with no leave/enter churn. Null on the first connect.
     const resume = this.connectionId ? { resumeConnectionId: this.connectionId } : {};
-    // Opt into frame coalescing (the server may pack many frames into one message under load;
-    // handleMessage splits them apart) and binary delivery (single messages arrive in the
-    // compact binary codec; handleMessage decodes them). Both are backward compatible.
-    const opts = { coalesce: true as const, binaryDelivery: true as const };
+    // The auth frame goes out on the WebSocket binary opcode, which makes the whole connection
+    // binary: the edge then coalesces frames and delivers binary, both implied by speaking binary,
+    // so there is nothing to negotiate here (handleMessage splits coalesced messages and decodes
+    // binary regardless).
     if (this.options.key) {
       return {
         t: 'auth',
         key: this.options.key,
-        ...opts,
         ...(this.options.clientId ? { clientId: this.options.clientId } : {}),
         ...resume,
       };
     }
-    if (this.options.token) return { t: 'auth', token: this.options.token, ...opts, ...resume };
+    if (this.options.token) return { t: 'auth', token: this.options.token, ...resume };
     if (!this.options.authCallback) {
       throw new Error('Connection: missing auth method');
     }
-    return { t: 'auth', token: await this.options.authCallback(), ...opts, ...resume };
+    return { t: 'auth', token: await this.options.authCallback(), ...resume };
   }
 
   /** Steady-state message handler; installed after a successful auth. On a binary connection
