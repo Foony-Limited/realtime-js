@@ -3,6 +3,29 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.13.0
+
+### Added
+
+- **REST client.** New `Rest` class for request/response access without holding a
+  WebSocket open, aimed at backends, cron jobs, and serverless functions:
+  `new Rest({ key })`, then `rest.channels.get(name).publish(...)`. Publishes are
+  durable and identical to WebSocket publishes for subscribers, history, and
+  billing.
+- `channel.history(params)` on REST channels returns a `PaginatedResult` (newest
+  first by default) with `next()`, `hasNext()`, and `isLast()` for paging through
+  older messages. `channel.presence.get(params)` returns the current members,
+  filterable by `clientId` and `connectionId`.
+- `rest.auth.requestToken({ clientId, ttl, capability })` asks the service to mint
+  a client JWT from your API key and returns `TokenDetails` with the expiry, so
+  you can cache tokens instead of minting per connection.
+- `rest.time()` returns the server clock in milliseconds for clock-skew checks.
+- End-to-end encryption works on REST channels: pass the same `cipher` key to
+  `rest.channels.get(name, { cipher })` and publishes are encrypted before they
+  leave the process, history and presence data decrypted on read.
+- Failed requests reject with `RestError`, carrying the same numeric `code`
+  values as `ErrorCode` plus the HTTP `statusCode`.
+
 ## 0.12.1
 
 ### Changed

@@ -86,6 +86,49 @@ server rejects invalid names with error code `40001` (`BadFrame`).
 - `client.connection.on('connected', fn)` — observe one connection event.
 - `client.connection.off()` — remove all connection listeners.
 - `client.connection.once('connected')` — await the next matching connection event.
+- `Rest` — HTTP client for publish, history, presence, and token minting without
+  a connection (see [REST](#rest)).
+
+## REST
+
+For backends and integrations that publish or read without holding a
+connection open (cron jobs, serverless functions, webhooks), use the `Rest`
+client. It talks to the same service over HTTPS, and its publishes are
+identical to WebSocket publishes for subscribers, history, and billing.
+
+```ts
+import { Rest } from '@foony/realtime';
+
+const rest = new Rest({ key: process.env.REALTIME_API_KEY });
+const channel = rest.channels.get('chat:room:42');
+
+// Publish one message, or an array (stored and delivered as one atomic batch).
+await channel.publish('greeting', { text: 'hello' });
+
+// History, newest first. Page through older messages with next().
+let page = await channel.history({ limit: 100 });
+for (const message of page.items) {
+  console.log(message.name, message.data);
+}
+while (page.hasNext()) {
+  page = (await page.next())!;
+}
+
+// Current presence members.
+const members = await channel.presence.get();
+
+// Mint a client JWT from your API key (for handing to browser clients).
+const details = await rest.auth.requestToken({
+  clientId: 'user-42',
+  capability: { 'chat:*': ['subscribe', 'publish'] },
+});
+```
+
+Auth accepts the same options as the realtime client: `key` (server-side),
+`token`, or `authCallback` (refreshed automatically when the service reports
+it expired). Channels accept the same `cipher` option for end-to-end
+encryption. Errors reject with `RestError`, which carries the numeric protocol
+`code` plus the HTTP `statusCode`.
 
 ## Reconnect
 

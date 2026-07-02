@@ -14,6 +14,24 @@ export {
   type BatchPublishResult,
 } from './realtime.js';
 export {
+  Rest,
+  RestChannel,
+  RestPresence,
+  RestAuth,
+  RestError,
+  PaginatedResult,
+  type RestOptions,
+  type RestChannelOptions,
+  type RestPublishMessage,
+  type PublishResult,
+  type RestMessage,
+  type PresenceMember,
+  type RestHistoryParams,
+  type RestPresenceParams,
+  type TokenParams,
+  type TokenDetails,
+} from './rest.js';
+export {
   Auth,
   createJwt,
   type Capability,
