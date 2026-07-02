@@ -1,5 +1,7 @@
 /**
- * Wire protocol types for the Foony Realtime WebSocket service.
+ * Wire protocol types for the Foony Realtime WebSocket service. These are the in-memory
+ * frame shapes; on the wire every frame travels in the binary opcode format (binary.ts),
+ * with `t` as the local discriminator the codec maps to and from opcodes.
  *
  * Mirrors `services/realtime-saas/internal/wire/wire.go` exactly — any
  * change here MUST be mirrored on the Go side and vice versa. The Go file is
@@ -8,12 +10,9 @@
  * `ErrorCode` table (Go `Code*` consts) — both must stay one-for-one.
  *
  * Conventions:
- *  - Every frame has a single-character `t` discriminator.
  *  - Client-originated frames carry a numeric `id`; the server echoes it
  *    back on the matching `ack` / `err` frame so SDKs can correlate
  *    requests to responses.
- *  - Field names favor readability over brevity (`channel`, not `ch`),
- *    except for `t`, which we keep short because every frame carries it.
  */
 
 /**

@@ -568,9 +568,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     });
   }
 
-  /** Send an outstanding publish on the current socket under a fresh request id. Publishes go
-   * out in the compact binary format (WebSocket binary opcode); the server accepts binary and
-   * JSON publishes interchangeably, so control frames stay JSON. */
+  /** Send an outstanding publish on the current socket under a fresh request id. */
   private sendPublish(outstanding: OutstandingPublish): void {
     const id = this.nextRequestId++;
     outstanding.requestId = id;
@@ -676,9 +674,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
       const onAuthMessage = (event: MessageEvent): void => {
         const binary = toArrayBuffer(event.data);
-        const parsed = binary
-          ? decodeServerFrames(binary)[0]
-          : (parseJsonFrame(event.data) as ServerFrame | undefined);
+        const parsed = binary ? decodeServerFrames(binary)[0] : undefined;
         if (!parsed) {
           reject(new Error('failed to parse auth response'));
           safeClose(ws, CLOSE_CODE_HANDSHAKE_FAILED, 'bad auth response');
@@ -779,22 +775,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     return { t: 'auth', token: await this.options.authCallback(), ...resume };
   }
 
-  /** Steady-state message handler; installed after a successful auth. On a binary connection
-   * every server frame arrives binary (opcode records); the JSON path stays only as a safety
-   * net (an older edge that coalesced JSON frames with '\n'). */
+  /** Steady-state message handler; installed after a successful auth. Every server frame
+   * arrives binary: one WebSocket message carries one or more opcode records. */
   private readonly handleMessage = (event: MessageEvent): void => {
     const binary = toArrayBuffer(event.data);
-    if (binary) {
-      for (const frame of decodeServerFrames(binary)) {
-        this.handleFrame(frame);
-      }
-      return;
-    }
-    const raw = typeof event.data === 'string' ? event.data : event.data.toString();
-    for (const segment of raw.split('\n')) {
-      if (segment.length === 0) continue;
-      const frame = parseJsonFrame(segment);
-      if (frame) this.handleFrame(frame);
+    if (!binary) return;
+    for (const frame of decodeServerFrames(binary)) {
+      this.handleFrame(frame);
     }
   };
 
@@ -1030,16 +1017,6 @@ async function loadNodeWebSocket(): Promise<typeof WebSocket | undefined> {
     const specifier = 'ws';
     const mod = (await import(/* @vite-ignore */ specifier)) as { WebSocket?: typeof WebSocket; default?: typeof WebSocket };
     return mod.WebSocket ?? mod.default;
-  } catch {
-    return undefined;
-  }
-}
-
-/** parseJsonFrame parses a JSON server frame, returning undefined on malformed input. Retained
- * only as a safety net for a JSON-coalescing edge; a binary connection never uses it. */
-function parseJsonFrame(data: unknown): ServerFrame | undefined {
-  try {
-    return JSON.parse(typeof data === 'string' ? data : String(data)) as ServerFrame;
   } catch {
     return undefined;
   }

@@ -26,6 +26,12 @@ All notable changes to `@foony/realtime`. Format loosely follows
 - Failed requests reject with `RestError`, carrying the same numeric `code`
   values as `ErrorCode` plus the HTTP `statusCode`.
 
+### Removed
+
+- Dropped the JSON WebSocket protocol, as announced in 0.12.0. The SDK and the edge
+  now speak only the binary format that 0.12.0 introduced. SDK versions before
+  0.12.0 can no longer connect.
+
 ## 0.12.1
 
 ### Changed
