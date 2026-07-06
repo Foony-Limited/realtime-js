@@ -42,6 +42,10 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ### Fixed
 
+- **`close()` racing an in-flight `connect()` no longer crashes a Node process.**
+  Tearing down a socket that was still connecting emitted an error event with no
+  listener attached, which Node treats as an uncaught exception. Browsers were
+  unaffected.
 - **The `update` channel event fires now.** A discontinuity found while the channel
   stayed attached previously emitted nothing, so listeners never learned messages
   were lost. Check `resumed` on the payload and reload state or read history when

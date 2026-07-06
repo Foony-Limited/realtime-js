@@ -447,6 +447,13 @@ function serverError(code: number, message: string): Error & { code: number } {
  * the caller, so swallow any error here.
  */
 function safeClose(ws: WebSocket, code: number, reason: string): void {
+  // Closing a socket that is still connecting makes Node's `ws` abort the handshake and emit an
+  // asynchronous error event ("WebSocket was closed before the connection was established").
+  // Node crashes on an error event with no listener, and the try/catch below cannot see an async
+  // event, so make sure a listener exists — the close-during-connect path in particular tears the
+  // socket down before any handlers were attached. Browsers never throw on error events, and an
+  // extra no-op listener is harmless where handlers are already attached.
+  ws.addEventListener('error', () => {});
   try {
     ws.close(code, reason);
   } catch (err) {
