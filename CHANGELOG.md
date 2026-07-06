@@ -13,12 +13,62 @@ All notable changes to `@foony/realtime`. Format loosely follows
   publishes that passed `ttlMs` now join auto-batching instead of being sent alone.
   The token-lifetime `ttlMs` on `createJwt` is unchanged.
 
+### Changed
+
+- **`channels.get` validates channel names client-side** against the server's
+  grammar (`A-Z a-z 0-9 : - _`, at most 255 characters, no leading `:`) and
+  throws immediately. Before, a bad name attach-looped against `BadFrame`
+  rejections forever.
+- **`batchPublish` enforces the 1000-message limit on the merged per-channel
+  batch**, not per spec, since specs naming the same channel merge into one
+  batch.
+- **`Cipher` throws when `algorithm` contradicts the key length.** A 16-byte
+  key with `aes-256-gcm` used to silently run AES-128.
+
 ### Fixed
 
 - **The `update` channel event fires now.** A discontinuity found while the channel
   stayed attached previously emitted nothing, so listeners never learned messages
   were lost. Check `resumed` on the payload and reload state or read history when
   it is `false`.
+- **Requests no longer hang when the connection drops.** An attach, detach,
+  history read, presence change, or gap-fill fetch in flight when the socket
+  died stayed pending forever, and a hung gap-fill silently disabled gap
+  healing for the channel's lifetime. They now reject, and the reconnect
+  restores the channel.
+- **`close()` during an in-flight `connect()` no longer resurrects the
+  connection.** The handshake used to complete anyway, leaving a live socket
+  delivering messages while the client reported `closed`.
+- **No duplicate subscribe on the first connect.** Subscribing before
+  `connect()` sent the channel's `sub` twice, and the second ack surfaced a
+  spurious `update` with `resumed: false` (a false discontinuity signal).
+- **A failed `authCallback` before a socket exists retries now.** It used to
+  wedge the state at `connecting` forever even with `autoReconnect` on.
+- **A stale socket's close event can no longer tear down a newer connection.**
+- **Frames coalesced into the same WebSocket message as `connected` are
+  delivered** instead of silently dropped.
+- **Released channels are fully released.** `channels.release` left the old
+  instance listening to connection state forever, retaining it and its dedup
+  cache and keeping its state machine running.
+- **Encrypted channels deliver in arrival order.** A payload-less event (a
+  presence `leave`, a plaintext message) could overtake an encrypted one still
+  being decrypted, so an enter-then-leave pair could be observed as
+  leave-then-enter.
+- **The presence watcher closes when the last listener leaves via `once()` or
+  `off()`.** Before, only the unsubscribe function returned by `on()` released
+  it, so a lone `presence.once(...)` held the watcher open forever.
+- **A detach racing a fresh attach no longer erases the subscription.** The
+  channel looked attached but was missing from the reconnect restore set, so it
+  silently received nothing after the next drop.
+- **`channel.history({ start })` accepts batch-member message ids.** The
+  `<batchId>:<index>` member suffix is stripped to the stored record's id.
+  Before, the server did not know the id and silently restarted paging from the
+  newest page.
+- **REST history and presence no longer fail the whole page when one message is
+  undecryptable.** The unreadable item comes back undecoded with its `encoding`
+  intact, as the field docs always promised.
+- **`Rest.auth.requestToken` rejects a malformed API key** with a clear error
+  instead of building a mangled URL and surfacing a confusing 401.
 
 ## 0.13.0
 

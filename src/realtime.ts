@@ -65,6 +65,9 @@ const MAX_BATCH_CHANNELS = 100;
 /** Maximum number of messages per channel per batch. */
 const MAX_BATCH_MESSAGES = 1000;
 
+/** Maximum channel name length, matching the server's `MaxChannelNameLength`. */
+const MAX_CHANNEL_NAME_LENGTH = 255;
+
 /**
  * The realtime client and the entry point for app code. It owns one WebSocket
  * {@link Connection} (opened lazily on first use) and a map of
@@ -111,6 +114,11 @@ export class Realtime {
      * name returns the existing instance unchanged.
      */
     get: (name: string, options?: ChannelOptions): Channel => {
+      // Enforce the server's grammar client-side so a bad name fails loudly
+      // here instead of attach-looping against `BadFrame` rejections.
+      if (!isValidChannelName(name)) {
+        throw new Error(`channels.get: invalid channel name "${name}" (allowed: A-Z a-z 0-9 : - _, at most 255 characters, not starting with ':')`);
+      }
       let existing = this.channelsByName.get(name);
       if (!existing) {
         existing = new Channel(this.connection, name, options?.cipher, options?.batch ?? this.batchDefault);
@@ -129,6 +137,10 @@ export class Realtime {
       if (!channel) return;
       this.channelsByName.delete(name);
       this.connection['unregisterChannel'](name);
+      // Remove the channel's connection state listener, or every released
+      // instance would be retained (and keep running its state machine) for
+      // the life of the client.
+      channel['dispose']();
       channel.detach().catch(() => {});
     },
   };
@@ -186,9 +198,6 @@ export class Realtime {
     for (const spec of list) {
       const channels = typeof spec.channels === 'string' ? [spec.channels] : spec.channels;
       const messages = isMessageArray(spec.messages) ? spec.messages : [spec.messages];
-      if (messages.length > MAX_BATCH_MESSAGES) {
-        throw new Error(`batchPublish: a spec may carry at most ${MAX_BATCH_MESSAGES} messages`);
-      }
       for (const channel of channels) {
         const existing = channelMessages.get(channel);
         if (existing) {
@@ -200,6 +209,14 @@ export class Realtime {
     }
     if (channelMessages.size > MAX_BATCH_CHANNELS) {
       throw new Error(`batchPublish: at most ${MAX_BATCH_CHANNELS} channels per request`);
+    }
+    // Check the limit on the merged per-channel batches, not per spec: several
+    // specs naming the same channel merge into one batch, and that merged batch
+    // is what must fit.
+    for (const [channel, messages] of channelMessages) {
+      if (messages.length > MAX_BATCH_MESSAGES) {
+        throw new Error(`batchPublish: at most ${MAX_BATCH_MESSAGES} messages per channel per request (channel "${channel}" has ${messages.length})`);
+      }
     }
 
     const results = await Promise.all(
@@ -237,4 +254,16 @@ export class Realtime {
 /** Narrow a single-or-array of messages to the array case. */
 function isMessageArray(value: BatchMessage | readonly BatchMessage[]): value is readonly BatchMessage[] {
   return Array.isArray(value);
+}
+
+/**
+ * True when `name` satisfies the server's channel grammar: 1 to 255 characters
+ * from `A-Z a-z 0-9 : - _`, not starting with ':'. Mirrors
+ * `wire.ValidateChannelName` on the Go side (the canonical source).
+ */
+function isValidChannelName(name: string): boolean {
+  if (name.length === 0 || name.length > MAX_CHANNEL_NAME_LENGTH || name.startsWith(':')) {
+    return false;
+  }
+  return /^[A-Za-z0-9:_-]+$/u.test(name);
 }

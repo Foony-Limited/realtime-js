@@ -43,6 +43,12 @@ describe('Cipher', () => {
     expect(() => new Cipher({ key: new Uint8Array(20) })).toThrow(/16 or 32 bytes/);
   });
 
+  it('rejects an algorithm that contradicts the key length', () => {
+    expect(() => new Cipher({ key: new Uint8Array(16), algorithm: 'aes-256-gcm' })).toThrow(/32-byte key/);
+    expect(() => new Cipher({ key: new Uint8Array(32), algorithm: 'aes-128-gcm' })).toThrow(/16-byte key/);
+    expect(() => new Cipher({ key: new Uint8Array(32), algorithm: 'aes-256-gcm' })).not.toThrow();
+  });
+
   it('isCipherEncoding recognizes cipher encodings only', () => {
     expect(isCipherEncoding('cipher+aes-256-gcm/base64')).toBe(true);
     expect(isCipherEncoding('cipher+aes-128-gcm/base64')).toBe(true);

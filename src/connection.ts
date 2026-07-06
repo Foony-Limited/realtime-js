@@ -375,7 +375,8 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
 
 /** Default cap on the reconnect backoff, in ms. */
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
-/** WebSocket.OPEN — duplicated here so we do not depend on a global. */
+/** WebSocket.CONNECTING and WebSocket.OPEN, duplicated here so we do not depend on a global. */
+const READY_STATE_CONNECTING = 0;
 const READY_STATE_OPEN = 1;
 /**
  * Close code used when we abort a handshake server-side errors. The WebSocket
@@ -464,6 +465,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private fatalError: Error | null = null;
   /** Channels the SDK has asked to be subscribed to. Re-sent on reconnect. */
   private readonly desiredSubscriptions = new Set<string>();
+  /** Per-channel counter bumped on every rememberSubscription, so a stale detach cannot forget a newer attach. */
+  private readonly subscriptionEpochs = new Map<string, number>();
   /** Channels the SDK has asked for presence events on. Re-sent on reconnect. */
   private readonly desiredPresence = new Set<string>();
   /** Publishes awaiting ack, keyed by client messageId. (Re)sent on (re)connect. */
@@ -531,23 +534,31 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
     this.stopKeepAlive();
     this.setState('closing');
-    if (this.socket && this.socket.readyState === READY_STATE_OPEN) {
-      this.socket.close(1000, 'client close');
+    if (this.socket && (this.socket.readyState === READY_STATE_CONNECTING || this.socket.readyState === READY_STATE_OPEN)) {
+      // Also abort a socket that is still connecting, or a close() racing an
+      // in-flight connect() would leave the handshake to complete and resurrect
+      // the connection.
+      safeClose(this.socket, 1000, 'client close');
     }
     this.setState('closed');
+    this.failPendingRequests(new Error('connection closed'));
+    this.failOutstandingPublishes(new Error('connection closed'));
+  }
+
+  /** Reject every in-flight ack, history, and fetch request. They can never be answered. */
+  private failPendingRequests(error: Error): void {
     for (const pending of this.pending.values()) {
-      pending.reject(new Error('connection closed'));
+      pending.reject(error);
     }
     this.pending.clear();
     for (const pending of this.pendingHistory.values()) {
-      pending.reject(new Error('connection closed'));
+      pending.reject(error);
     }
     this.pendingHistory.clear();
     for (const pending of this.pendingFetch.values()) {
-      pending.reject(new Error('connection closed'));
+      pending.reject(error);
     }
     this.pendingFetch.clear();
-    this.failOutstandingPublishes(new Error('connection closed'));
   }
 
   /**
@@ -699,13 +710,30 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.channelDispatchers.delete(channel);
   }
 
-  /** Add `channel` to the set of subscriptions to restore on reconnect. */
+  /**
+   * Add `channel` to the set of subscriptions to restore on reconnect, and bump
+   * its epoch so an older in-flight detach cannot erase this newer intent.
+   */
   private rememberSubscription(channel: string): void {
     this.desiredSubscriptions.add(channel);
+    this.subscriptionEpochs.set(channel, this.subscriptionEpoch(channel) + 1);
   }
 
-  /** Stop restoring this subscription on future reconnects. */
-  private forgetSubscription(channel: string): void {
+  /** The current subscription epoch for `channel`. Bumped by every rememberSubscription. */
+  private subscriptionEpoch(channel: string): number {
+    return this.subscriptionEpochs.get(channel) ?? 0;
+  }
+
+  /**
+   * Stop restoring this subscription on future reconnects. When `epoch` is
+   * given, the forget only applies if no newer attach has re-remembered the
+   * channel since that epoch was read (a detach ack racing a fresh attach must
+   * not erase the new subscription intent).
+   */
+  private forgetSubscription(channel: string, epoch?: number): void {
+    if (epoch !== undefined && epoch !== this.subscriptionEpoch(channel)) {
+      return;
+    }
     this.desiredSubscriptions.delete(channel);
   }
 
@@ -728,8 +756,30 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // could fire 'open' before the listener below was attached — the event would be lost,
     // the auth frame never sent, and the connection would hang until it was dropped
     // (surfacing as a 1006 during the handshake). Fetching first removes that window.
-    const authFrame = await this.createAuthFrame();
-    const ws = await this.makeSocket();
+    let authFrame: AuthFrame;
+    let ws: WebSocket;
+    try {
+      authFrame = await this.createAuthFrame();
+      ws = await this.makeSocket();
+    } catch (error) {
+      // No socket exists yet, so no close event will drive the state machine.
+      // Mirror handleClose here: mark disconnected and schedule the retry, or a
+      // transient token-endpoint failure would wedge the state at `connecting`
+      // with nothing in flight.
+      const reason = error instanceof Error ? error : new Error(String(error));
+      if (this.state === 'connecting') {
+        this.setState('disconnected', reason);
+        if (this.options.autoReconnect !== false) {
+          this.scheduleReconnect();
+        }
+      }
+      throw error;
+    }
+    if (this.state === 'closing' || this.state === 'closed') {
+      // close() ran while the auth frame was being built. Don't resurrect.
+      safeClose(ws, 1000, 'client close');
+      throw new Error('connection closed during connect');
+    }
     this.socket = ws;
 
     return new Promise<void>((resolve, reject) => {
@@ -745,13 +795,21 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
       const onAuthMessage = (event: MessageEvent): void => {
         const binary = toArrayBuffer(event.data);
-        const parsed = binary ? decodeServerFrames(binary)[0] : undefined;
+        const frames = binary ? decodeServerFrames(binary) : [];
+        const parsed = frames[0];
         if (!parsed) {
           reject(new Error('failed to parse auth response'));
           safeClose(ws, CLOSE_CODE_HANDSHAKE_FAILED, 'bad auth response');
           return;
         }
         if (parsed.t === 'connected') {
+          if (this.state === 'closing' || this.state === 'closed') {
+            // close() ran while the handshake was in flight. Don't resurrect the
+            // connection into a zombie the app believes is closed.
+            safeClose(ws, 1000, 'client close');
+            reject(new Error('connection closed during handshake'));
+            return;
+          }
           const connected = parsed as ConnectedFrame;
           this.connectionId = connected.connectionId;
           this.serverClientId = connected.clientId;
@@ -762,6 +820,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           this.setState('connected');
           this.startKeepAlive(connected.keepAliveMs);
           resolve();
+          // The edge may coalesce more frames into the same WebSocket message as
+          // `connected`. Dispatch them now that the steady handler owns the socket.
+          for (const frame of frames.slice(1)) {
+            this.handleFrame(frame);
+          }
           const isReconnect = this.hasConnectedBefore;
           this.hasConnectedBefore = true;
           this.restoreSubscriptionsOnReconnect(isReconnect);
@@ -789,7 +852,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       };
 
       const onClose = (event: CloseEvent): void => {
-        this.handleClose(event);
+        this.handleClose(ws, event);
         // If close fires before we finished the handshake, the
         // surrounding promise hasn't been settled yet — surface it as
         // a connect failure.
@@ -931,13 +994,21 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
   }
 
-  private handleClose(event: CloseEvent): void {
+  private handleClose(ws: WebSocket, event: CloseEvent): void {
+    if (this.socket !== null && this.socket !== ws) {
+      // A stale socket's close event (an earlier, already-replaced attempt)
+      // must not tear down the live connection.
+      return;
+    }
     this.socket = null;
     this.stopKeepAlive();
-    // The dead socket's request ids will never be acked; drop the mappings.
+    // The dead socket's requests can never be answered: drop the publish id
+    // mappings and reject in-flight acks, history, and fetches so attach,
+    // detach, history, presence, and gap-fill callers do not hang forever.
     this.publishRequestIds.clear();
     if (this.state === 'closing' || this.state === 'closed') {
       this.setState('closed');
+      this.failPendingRequests(new Error('connection closed'));
       this.failOutstandingPublishes(new Error('connection closed'));
       return;
     }
@@ -947,6 +1018,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       const fatal = this.fatalError;
       this.fatalError = null;
       this.setState('failed', fatal);
+      this.failPendingRequests(fatal);
       this.failOutstandingPublishes(fatal);
       return;
     }
@@ -956,6 +1028,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     const reason = event.reason
       ? new Error(`websocket closed: ${event.code} ${event.reason}`)
       : new Error(`websocket closed: ${event.code}`);
+    this.failPendingRequests(reason);
     this.setState('disconnected', reason);
     const willRetry = this.options.autoReconnect !== false && (this.options.queueMessages ?? true);
     if (willRetry) {
@@ -990,6 +1063,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   private restoreSubscriptionsOnReconnect(isReconnect: boolean): void {
+    // Only on an actual reconnect. On the first connect the app's own attach()
+    // and presence calls have their frames in flight already (their requests
+    // await connect()), so restoring here would send duplicate subs, and the
+    // duplicate's ack would surface as a spurious `update` on the channel.
+    if (!isReconnect) {
+      return;
+    }
     // Re-issue a `sub` for every remembered channel, carrying its resume cursor so the
     // server replays whatever was published during the disconnect, then report the
     // resume outcome (replayed vs discontinuity) back to the channel.
@@ -1006,12 +1086,6 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           // A failed restore surfaces via channel state on the next reconnect; the
           // channel stays 'attaching' until then.
         });
-    }
-    // Presence is restored only on an actual reconnect. On the first connect the app's own
-    // presence.on()/enter() calls already sent their frames, so re-sending here would just
-    // duplicate them (a second enter, a second snapshot).
-    if (!isReconnect) {
-      return;
     }
     // Re-open presence watchers for channels the app is watching presence on.
     for (const channel of this.desiredPresence) {

@@ -9,7 +9,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { generateRandomKey } from './crypto.js';
+import { Cipher, generateRandomKey } from './crypto.js';
 import { Rest, RestError } from './rest.js';
 
 type RecordedRequest = {
@@ -234,6 +234,13 @@ describe('Rest auth', () => {
     const rest = new Rest({ endpoint, token: 'some-jwt' });
     await expect(rest.auth.requestToken({ clientId: 'u' })).rejects.toThrow(/API key is required/u);
   });
+
+  it('rejects requestToken with a malformed API key instead of mangling the URL', async () => {
+    const { fake, endpoint } = await startFake();
+    const rest = new Rest({ endpoint, key: 'no-colon-in-here' });
+    await expect(rest.auth.requestToken({ clientId: 'u' })).rejects.toThrow(/malformed API key/u);
+    expect(fake.requests).toHaveLength(0);
+  });
 });
 
 describe('Rest time and errors', () => {
@@ -345,5 +352,29 @@ describe('Rest channel encryption', () => {
     const page = await rest.channels.get('c').history();
     expect(page.items[0]!.encoding).toBe('cipher+aes-256-gcm/base64');
     expect(page.items[0]!.data).toBe('AAAA');
+  });
+
+  it('returns an undecryptable history item undecoded instead of failing the page', async () => {
+    const { fake, endpoint } = await startFake();
+    const cipherKey = await generateRandomKey(256);
+    const goodCipher = new Cipher({ key: cipherKey });
+    const otherCipher = new Cipher({ key: await generateRandomKey(256) });
+    const good = await goodCipher.encrypt({ n: 1 });
+    const foreign = await otherCipher.encrypt({ n: 2 });
+    fake.handler = (_request, response) =>
+      json(response, 200, [
+        { id: 'm-1', name: 'a', data: good.data, encoding: good.encoding, timestamp: 1 },
+        { id: 'm-2', name: 'b', data: foreign.data, encoding: foreign.encoding, timestamp: 2 },
+      ]);
+
+    const rest = new Rest({ endpoint, key: 'myapp.key1:s3cret' });
+    const page = await rest.channels.get('c', { cipher: { key: cipherKey } }).history();
+
+    // The readable message decrypts, the foreign-key one comes back undecoded
+    // with its encoding intact, and the page itself does not reject.
+    expect(page.items[0]!.data).toEqual({ n: 1 });
+    expect(page.items[0]!.encoding).toBeUndefined();
+    expect(page.items[1]!.data).toBe(foreign.data);
+    expect(page.items[1]!.encoding).toBe(foreign.encoding);
   });
 });

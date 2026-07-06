@@ -10,7 +10,7 @@ import { AddressInfo } from 'node:net';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { Realtime, generateRandomKey } from './index.js';
+import { Cipher, Realtime, generateRandomKey } from './index.js';
 import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
 import { decodeClientFrame, encodeServerFrame, frameBinaryRecord, splitBinaryRecords } from './binary.js';
 
@@ -33,6 +33,11 @@ function sendFrame(socket: NodeWebSocket, frame: ServerFrame): void {
   socket.send(frameBinaryRecord(encodeServerFrame(frame)));
 }
 
+/** Send several frames coalesced into ONE WebSocket message, the way the edge's writer can. */
+function sendCoalesced(socket: NodeWebSocket, frames: readonly ServerFrame[]): void {
+  socket.send(Buffer.concat(frames.map((frame) => Buffer.from(frameBinaryRecord(encodeServerFrame(frame))))));
+}
+
 type Harness = {
   readonly server: WebSocketServer;
   readonly endpoint: string;
@@ -49,6 +54,8 @@ type Harness = {
   readonly presFrames: { channel: string; conn: number; action: string }[];
   /** Every fetch (gap-fill) frame the edge received. */
   readonly fetchFrames: { channel: string; fromSerial: number }[];
+  /** Every hist frame the edge received. */
+  readonly histFrames: { channel: string; start?: string }[];
   /** Receipt times of every keep-alive ping the edge received. */
   readonly pings: number[];
   /**
@@ -58,9 +65,13 @@ type Harness = {
   readonly control: {
     dropNextPublish: boolean;
     dropNextSub: boolean;
+    dropNextHist: boolean;
+    dropNextFetch: boolean;
     keepAliveMs: number;
     /** When set, the reply the edge returns for a `fetch` (gap-fill) request. */
     fetchReply: ((channel: string, fromSerial: number) => { messages: unknown[]; resumed: boolean }) | null;
+    /** When set, the connected frame is coalesced with these frames into ONE WebSocket message. */
+    coalesceWithConnected: ServerFrame[] | null;
   };
 };
 
@@ -75,8 +86,17 @@ async function startFakeEdge(): Promise<Harness> {
   const presSubFrames: Harness['presSubFrames'] = [];
   const presFrames: Harness['presFrames'] = [];
   const fetchFrames: Harness['fetchFrames'] = [];
+  const histFrames: Harness['histFrames'] = [];
   const pings: Harness['pings'] = [];
-  const control: Harness['control'] = { dropNextPublish: false, dropNextSub: false, keepAliveMs: 30_000, fetchReply: null };
+  const control: Harness['control'] = {
+    dropNextPublish: false,
+    dropNextSub: false,
+    dropNextHist: false,
+    dropNextFetch: false,
+    keepAliveMs: 30_000,
+    fetchReply: null,
+    coalesceWithConnected: null,
+  };
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
@@ -98,7 +118,11 @@ async function startFakeEdge(): Promise<Harness> {
           keepAliveMs: control.keepAliveMs,
           clientId: 'alice',
         };
-        sendFrame(socket, connected);
+        if (control.coalesceWithConnected) {
+          sendCoalesced(socket, [connected, ...control.coalesceWithConnected]);
+        } else {
+          sendFrame(socket, connected);
+        }
         return;
       }
       if (frame.t === 'ping') {
@@ -130,6 +154,13 @@ async function startFakeEdge(): Promise<Harness> {
         }
       }
       if (frame.t === 'hist') {
+        histFrames.push({ channel: frame.channel, ...(frame.start === undefined ? {} : { start: frame.start }) });
+        if (control.dropNextHist) {
+          control.dropNextHist = false;
+          // Die between receiving the hist and answering it, so the request is orphaned.
+          socket.close(1001, 'drop before hist response');
+          return;
+        }
         const histRes: ServerFrame = {
           t: 'histRes',
           id: frame.id,
@@ -145,6 +176,12 @@ async function startFakeEdge(): Promise<Harness> {
       }
       if (frame.t === 'fetch') {
         fetchFrames.push({ channel: frame.channel, fromSerial: frame.fromSerial });
+        if (control.dropNextFetch) {
+          control.dropNextFetch = false;
+          // Die between receiving the fetch and answering it, so the gap-fill is orphaned.
+          socket.close(1001, 'drop before fetch response');
+          return;
+        }
         const reply = control.fetchReply ? control.fetchReply(frame.channel, frame.fromSerial) : { messages: [], resumed: true };
         sendFrame(socket, { t: 'fetchRes', id: frame.id, channel: frame.channel, messages: reply.messages, resumed: reply.resumed });
         return;
@@ -187,7 +224,7 @@ async function startFakeEdge(): Promise<Harness> {
       }
     });
   });
-  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, presSubFrames, presFrames, fetchFrames, pings, control };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, presSubFrames, presFrames, fetchFrames, histFrames, pings, control };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -988,6 +1025,293 @@ describe('Connection end-to-end (fake edge)', () => {
     );
     await realtime.close();
   });
+
+  it('rejects an in-flight history request when the socket drops', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    harness.control.dropNextHist = true;
+    const outcome = await settleOrTimeout(realtime.channels.get('chat:h').history(), 1_500);
+    expect(outcome).toBe('rejected');
+    await realtime.close();
+  });
+
+  it('rejects an in-flight attach when the socket drops, then recovers on reconnect', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:a');
+    harness.control.dropNextSub = true;
+    const outcome = await settleOrTimeout(channel.attach(), 1_500);
+    expect(outcome).toBe('rejected');
+    // The subscription intent stays remembered, so the reconnect restores the channel.
+    await waitFor(() => channel.state === 'attached', 'channel recovered after reconnect');
+    await realtime.close();
+  });
+
+  it('gap-heal survives a fetch that was in flight when the socket dropped', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:g');
+    const received: number[] = [];
+    channel.subscribe((message) => received.push((message.data as { n: number }).n));
+    await channel.attach();
+    const edge = harness.sockets[0]!;
+    for (const serial of [1, 2]) {
+      sendFrame(edge, { t: 'msg', channel: 'chat:g', name: 'm', data: { n: serial }, messageId: `g-${serial}`, seq: serial, timestamp: serial, clientId: 'alice' });
+    }
+    await waitFor(() => received.length === 2, 'cursor established');
+
+    // Drop the socket while the gap-fill fetch is in flight.
+    harness.control.dropNextFetch = true;
+    sendFrame(edge, { t: 'msg', channel: 'chat:g', name: 'm', data: { n: 5 }, messageId: 'g-5', seq: 5, timestamp: 5, clientId: 'alice' });
+    await waitFor(() => harness.fetchFrames.length === 1, 'first fetch attempted');
+
+    // After the reconnect, a later gap must trigger a fresh fetch. A wedged
+    // `backfilling` flag would silently disable gap healing forever.
+    await waitFor(() => channel.state === 'attached' && harness.sockets.length >= 2, 'channel re-attached');
+    const edge2 = harness.sockets.at(-1)!;
+    sendFrame(edge2, { t: 'msg', channel: 'chat:g', name: 'm', data: { n: 7 }, messageId: 'g-7', seq: 7, timestamp: 7, clientId: 'alice' });
+    await waitFor(() => received.includes(7), 'post-reconnect baseline');
+    sendFrame(edge2, { t: 'msg', channel: 'chat:g', name: 'm', data: { n: 9 }, messageId: 'g-9', seq: 9, timestamp: 9, clientId: 'alice' });
+    await waitFor(() => harness.fetchFrames.length >= 2, 'gap-heal works again after the drop');
+    await realtime.close();
+  });
+
+  it('close() during an in-flight connect() leaves the connection closed', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const states: string[] = [];
+    realtime.connection.on((state) => states.push(state));
+
+    const connecting = realtime.connect();
+    await realtime.close();
+
+    await expect(connecting).rejects.toThrow();
+    await delay(300);
+    expect(realtime.getState()).toBe('closed');
+    expect(states).not.toContain('connected');
+  });
+
+  it('first connect sends one sub per channel and no spurious update event', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const channel = realtime.channels.get('chat:one');
+    channel.subscribe(() => {});
+    const updates: unknown[] = [];
+    channel.on('update', (change) => updates.push(change));
+
+    await realtime.connect();
+    await waitFor(() => channel.state === 'attached', 'attached');
+    await delay(150);
+    expect(harness.subFrames.filter((sub) => sub.channel === 'chat:one')).toHaveLength(1);
+    expect(updates).toHaveLength(0);
+    await realtime.close();
+  });
+
+  it('auto-reconnects when the auth callback fails before a socket exists', async () => {
+    let calls = 0;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error('token endpoint down');
+        }
+        return 'GOOD';
+      },
+    });
+
+    await expect(realtime.connect()).rejects.toThrow('token endpoint down');
+    await waitFor(() => realtime.getState() === 'connected', 'recovered after failed token mint');
+    await realtime.close();
+  });
+
+  it('delivers frames coalesced into the same message as connected', async () => {
+    harness.control.coalesceWithConnected = [
+      { t: 'msg', channel: 'chat:co', name: 'm', data: { n: 1 }, messageId: 'co-1', timestamp: 1, clientId: 'alice' },
+    ];
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const received: unknown[] = [];
+    realtime.channels.get('chat:co').subscribe((message) => received.push(message.data));
+
+    await realtime.connect();
+    await waitFor(() => received.length === 1, 'coalesced frame delivered');
+    await realtime.close();
+  });
+
+  it('released channels stop listening to connection state', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const listenerCount = (): number => (realtime.connection as unknown as { listeners: Set<unknown> })['listeners'].size;
+    const before = listenerCount();
+    for (let index = 0; index < 5; index++) {
+      realtime.channels.get(`chat:cycle-${index}`);
+      realtime.channels.release(`chat:cycle-${index}`);
+    }
+    await delay(50);
+    expect(listenerCount()).toBe(before);
+    await realtime.close();
+  });
+
+  it('keeps presence order when plaintext events follow encrypted ones', async () => {
+    const key = await generateRandomKey();
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:e2e', { cipher: { key } });
+    const actions: string[] = [];
+    channel.presence.on((event) => actions.push(event.action));
+    await channel.attach();
+
+    const edge = harness.sockets[0]!;
+    const cipher = new Cipher({ key });
+    const encrypted = await cipher.encrypt({ name: 'alice' });
+    // enter carries encrypted data (async decrypt path), leave has no payload (sync path).
+    sendFrame(edge, { t: 'presEvt', channel: 'chat:e2e', action: 'enter', clientId: 'a', connectionId: 'c1', timestamp: 1, data: encrypted.data, encoding: encrypted.encoding });
+    sendFrame(edge, { t: 'presEvt', channel: 'chat:e2e', action: 'leave', clientId: 'a', connectionId: 'c1', timestamp: 2 });
+
+    await waitFor(() => actions.length === 2, 'both presence events');
+    expect(actions).toEqual(['enter', 'leave']);
+    await realtime.close();
+  });
+
+  it('drops the presence watcher after a once() fires and after off()', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:w');
+    const oncePromise = channel.presence.once('enter');
+    await waitFor(() => harness.presSubFrames.some((p) => p.type === 'presSub' && p.channel === 'chat:w'), 'watcher opened');
+    await channel.presence.enter({});
+    await oncePromise;
+    await waitFor(() => harness.presSubFrames.some((p) => p.type === 'presUnsub' && p.channel === 'chat:w'), 'watcher dropped after once fired');
+
+    channel.presence.on(() => {});
+    await waitFor(() => harness.presSubFrames.filter((p) => p.type === 'presSub' && p.channel === 'chat:w').length >= 2, 'watcher reopened');
+    channel.presence.off();
+    await waitFor(() => harness.presSubFrames.filter((p) => p.type === 'presUnsub' && p.channel === 'chat:w').length >= 2, 'watcher dropped after off');
+    await realtime.close();
+  });
+
+  it('strips a batch member suffix from the history start cursor', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    await realtime.channels.get('chat:hs').history({ start: '1751-abcd:3' });
+    expect(harness.histFrames.at(-1)).toEqual({ channel: 'chat:hs', start: '1751-abcd' });
+    await realtime.close();
+  });
+
+  it('an attach racing a detach survives the next reconnect', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:race');
+    await channel.attach();
+    const detaching = channel.detach();
+    const attaching = channel.attach();
+    await Promise.allSettled([detaching, attaching]);
+    expect(channel.state).toBe('attached');
+
+    // The re-attach must have kept the subscription remembered for reconnects.
+    const subsBefore = harness.subFrames.filter((sub) => sub.channel === 'chat:race').length;
+    harness.sockets.at(-1)?.terminate();
+    await waitFor(() => harness.subFrames.filter((sub) => sub.channel === 'chat:race').length > subsBefore, 'channel re-subscribed after reconnect');
+    await realtime.close();
+  });
+
+  it('rejects invalid channel names client-side', () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    expect(() => realtime.channels.get('chat.rooms.42')).toThrow(/invalid channel name/);
+    expect(() => realtime.channels.get(':lead')).toThrow(/invalid channel name/);
+    expect(() => realtime.channels.get('a'.repeat(256))).toThrow(/invalid channel name/);
+    expect(() => realtime.channels.get('chat:room-1_ok')).not.toThrow();
+  });
+
+  it('batchPublish enforces the per-channel message limit after merging specs', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const many = Array.from({ length: 600 }, (_, index) => ({ name: 'x', data: index }));
+    await expect(
+      realtime.batchPublish([
+        { channels: 'chat:big', messages: many },
+        { channels: 'chat:big', messages: many },
+      ]),
+    ).rejects.toThrow(/at most 1000/);
+    await realtime.close();
+  });
 });
 
 /** Poll until `predicate` is true or 2s elapses. */
@@ -1003,6 +1327,17 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 /** Resolve after `ms` milliseconds. */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Race `promise` against a deadline, reporting how it settled. 'timeout' means it hung. */
+function settleOrTimeout(promise: Promise<unknown>, ms: number): Promise<'resolved' | 'rejected' | 'timeout'> {
+  return Promise.race([
+    promise.then(
+      () => 'resolved' as const,
+      () => 'rejected' as const,
+    ),
+    delay(ms).then(() => 'timeout' as const),
+  ]);
 }
 
 function createCapturingWebSocket(urls: string[]): typeof WebSocket {

@@ -35,7 +35,11 @@ export type CipherAlgorithm = 'aes-256-gcm' | 'aes-128-gcm';
 export type CipherParams = {
   /** Secret key: raw bytes (16 or 32) or a base64 string of them. */
   readonly key: Uint8Array | string;
-  /** Informational only. The actual key length follows the supplied key. */
+  /**
+   * Optional declaration of the intended strength. The key length is what
+   * actually selects AES-128 vs AES-256, and the constructor throws when this
+   * label contradicts it.
+   */
   readonly algorithm?: CipherAlgorithm;
 };
 
@@ -82,6 +86,15 @@ export class Cipher {
     const length = this.keyBytes.byteLength;
     if (length !== 16 && length !== 32) {
       throw new Error(`Cipher: key must be 16 or 32 bytes (AES-128/256), got ${length}`);
+    }
+    if (params.algorithm !== undefined) {
+      // The key length decides the real strength, so a contradicting label must
+      // fail loudly. Otherwise a caller asking for AES-256 with a 16-byte key
+      // would silently get AES-128.
+      const expected = params.algorithm === 'aes-256-gcm' ? 32 : 16;
+      if (length !== expected) {
+        throw new Error(`Cipher: ${params.algorithm} needs a ${expected}-byte key, got ${length}`);
+      }
     }
   }
 

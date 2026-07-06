@@ -167,6 +167,8 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   private lastFlushMs = 0;
   private attachPromise: Promise<void> | null = null;
   private channelState: ChannelState = 'initialized';
+  /** Removes this channel's connection state listener. Called on release. */
+  private readonly connectionOff: EventUnsubscribeFn;
   /**
    * Bounded, insertion-ordered set of recently delivered (clientId, messageId)
    * keys, for exactly-once delivery. The server coalesces publishes across
@@ -211,7 +213,17 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       resumed: (resumed) => this.onResumed(resumed),
       reenterPresence: () => this.presence['reenterOnReconnect'](),
     });
-    this.connection.on((state, reason) => this.onConnectionState(state, reason));
+    this.connectionOff = this.connection.on((state, reason) => this.onConnectionState(state, reason));
+  }
+
+  /**
+   * Called by `channels.release` (via index access) when this instance is
+   * removed from the client. Detaches this channel's state machine from the
+   * connection so released instances are not retained forever by its
+   * listener set.
+   */
+  private dispose(): void {
+    this.connectionOff();
   }
 
   /** Current {@link ChannelState}. Listen on changes with `on(...)`. */
@@ -238,7 +250,12 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.connection['rememberSubscription'](this.name);
     this.attachPromise = this.connection['request'](this.subscribeFrame())
       .then((ack) => {
-        this.transition('attached', { resumed: ack.resumed ?? false });
+        // The reconnect restore path may have re-subscribed and reported the
+        // authoritative resume outcome while this request was in flight. Don't
+        // clobber it with a same-state re-confirmation (a spurious 'update').
+        if (this.channelState !== 'attached') {
+          this.transition('attached', { resumed: ack.resumed ?? false });
+        }
       })
       .catch((error: unknown) => {
         if (isCapabilityError(error)) {
@@ -287,11 +304,19 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     // Detaching the channel ends presence too: the server's unsub closes the presence
     // watcher, so stop re-opening it and re-entering on future reconnects.
     this.presence['onDetached']();
+    // A fresh attach (on this instance or on a replacement after `release`) can
+    // race this detach. Capture the subscription epoch now: if the attach
+    // re-remembered the channel while the unsub was in flight, the epoch moved
+    // on and this detach must not erase the newer intent or clobber the state.
+    const epoch = this.connection['subscriptionEpoch'](this.name);
     try {
       await this.connection['request']({ t: 'unsub', channel: this.name });
     } finally {
-      this.connection['forgetSubscription'](this.name);
-      this.transition('detached');
+      this.connection['forgetSubscription'](this.name, epoch);
+      // Narrowing note: read via the getter, TS narrowed the field above.
+      if (this.state === 'detaching') {
+        this.transition('detached');
+      }
     }
   }
 
@@ -496,11 +521,15 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    *   example a missing history capability.
    */
   async history(params?: { readonly limit?: number; readonly start?: string }): Promise<{ readonly messages: readonly MessageFrame[]; readonly more: boolean }> {
+    // A batch member's id is `<batchId>:<index>` (see memberFrame), but the
+    // server pages by stored record, so an unstripped member id would silently
+    // restart paging from the newest page. Page from the batch it belongs to.
+    const start = params?.start === undefined ? undefined : params.start.replace(/:\d+$/u, '');
     const response = await this.connection['requestHistory']({
       t: 'hist',
       channel: this.name,
       ...(params?.limit === undefined ? {} : { limit: params.limit }),
-      ...(params?.start === undefined ? {} : { start: params.start }),
+      ...(start === undefined ? {} : { start }),
     });
     // Expand any batch frames into their member frames before decrypting.
     const expanded = response.messages.flatMap(expandBatch);
@@ -611,7 +640,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * keys, evicting the oldest past the cap.
    */
   private isDuplicate(frame: MessageFrame): boolean {
-    const key = `${frame.clientId ?? ''} ${frame.messageId}`;
+    const key = `${frame.clientId ?? ''}\u0000${frame.messageId}`;
     if (this.seenMessages.has(key)) {
       return true;
     }
@@ -635,12 +664,20 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     if (this.isDuplicate(frame)) {
       return;
     }
-    if (!this.cipher || !isCipherEncoding(frame.encoding)) {
+    if (!this.cipher) {
       this.messages.dispatch(frame);
       return;
     }
     const cipher = this.cipher;
+    // On an encrypted channel EVERY frame rides the decrypt chain, including
+    // plaintext ones, so a plaintext frame can never overtake an encrypted one
+    // that is still decrypting (decrypt is async, dispatch order must match
+    // arrival order).
     this.decryptChain = this.decryptChain.then(async () => {
+      if (!isCipherEncoding(frame.encoding)) {
+        this.messages.dispatch(frame);
+        return;
+      }
       try {
         this.messages.dispatch(await decryptFrame(cipher, frame));
       } catch (error) {
@@ -792,18 +829,56 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   /** Invoke `listener` one time for the next presence event with a matching action. */
   override once(event: PresenceEventType, listener: PresenceEventListener): void;
   override once(first: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): Promise<PresenceEventResult> | void {
+    // A one-shot listener is removed by the emitter when it fires, so drop the
+    // watcher then too. Otherwise a lone `once` would hold the presence
+    // subscription open forever.
     if (second === undefined && typeof first !== 'function') {
-      const result = super.once(first);
+      const result = super.once(first).then((event) => {
+        this.maybeStopWatching();
+        return event;
+      });
       this.ensureWatching();
       return result;
     }
     if (second === undefined) {
-      super.once(first as PresenceEventListener);
+      const listener = first as PresenceEventListener;
+      super.once(((event) => {
+        try {
+          listener(event);
+        } finally {
+          this.maybeStopWatching();
+        }
+      }) as PresenceEventListener);
       this.ensureWatching();
       return;
     }
-    super.once(first as PresenceEventType, second);
+    super.once(first as PresenceEventType, ((event) => {
+      try {
+        second(event);
+      } finally {
+        this.maybeStopWatching();
+      }
+    }) as PresenceEventListener);
     this.ensureWatching();
+  }
+
+  /** Remove every presence listener. */
+  override off(): void;
+  /** Remove `listener` wherever it was registered. */
+  override off(listener: PresenceEventListener): void;
+  /** Remove `listener` only from `event`. */
+  override off(event: PresenceEventType, listener: PresenceEventListener): void;
+  override off(first?: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): void {
+    if (first === undefined) {
+      super.off();
+    } else if (typeof first === 'function') {
+      super.off(first);
+    } else if (second !== undefined) {
+      super.off(first, second);
+    }
+    // The watcher follows the listener count, so removing listeners here must
+    // release it just like the unsubscribe function returned by `on` does.
+    this.maybeStopWatching();
   }
 
   /** Alias of {@link Presence.on | `on(listener)`}: register a listener for every presence event. */
@@ -897,13 +972,20 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
    * through a promise chain so events keep their arrival order.
    */
   private emitPresence(event: PresenceEventFrame): void {
-    if (!this.cipher || !isCipherEncoding(event.encoding)) {
+    if (!this.cipher) {
       this.emit(event.action, event);
       return;
     }
     const cipher = this.cipher;
-    const encoding = event.encoding;
+    // On an encrypted channel EVERY event rides the decrypt chain, including
+    // payload-less ones like `leave`, so a leave can never overtake the enter
+    // it follows while the enter's data is still decrypting.
     this.decryptChain = this.decryptChain.then(async () => {
+      const encoding = event.encoding;
+      if (!isCipherEncoding(encoding)) {
+        this.emit(event.action, event);
+        return;
+      }
       try {
         const data = await cipher.decrypt(encoding, event.data);
         const { encoding: _encoding, ...rest } = event;

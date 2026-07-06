@@ -467,9 +467,15 @@ export class RestChannel {
     if (!this.cipher || !isCipherEncoding(item.encoding)) {
       return item;
     }
-    const data = await this.cipher.decrypt(item.encoding, item.data);
-    const { encoding: _consumed, ...decoded } = item;
-    return { ...decoded, data };
+    try {
+      const data = await this.cipher.decrypt(item.encoding, item.data);
+      const { encoding: _consumed, ...decoded } = item;
+      return { ...decoded, data };
+    } catch {
+      // Undecryptable (a rotated key, another key's publish): return the item
+      // undecoded with `encoding` intact rather than failing the whole page.
+      return item;
+    }
   }
 }
 
@@ -511,9 +517,15 @@ export class RestPresence {
     if (!this.cipher || !isCipherEncoding(member.encoding)) {
       return member;
     }
-    const data = await this.cipher.decrypt(member.encoding, member.data);
-    const { encoding: _consumed, ...decoded } = member;
-    return { ...decoded, data };
+    try {
+      const data = await this.cipher.decrypt(member.encoding, member.data);
+      const { encoding: _consumed, ...decoded } = member;
+      return { ...decoded, data };
+    } catch {
+      // Undecryptable (a rotated key, another key's entry): return the member
+      // undecoded with `encoding` intact rather than failing the whole snapshot.
+      return member;
+    }
   }
 }
 
@@ -538,6 +550,11 @@ export class RestAuth {
     const key = this.rest.key;
     if (!key) {
       throw new Error('Rest.auth.requestToken: an API key is required');
+    }
+    if (key.indexOf(':') <= 0) {
+      // Without this, a colon-less key would silently build a mangled URL and
+      // surface as a confusing 401 from the service.
+      throw new Error('Rest.auth.requestToken: malformed API key (expected "appSlug.publicKeyId:privateKey")');
     }
     const keyName = key.slice(0, key.indexOf(':'));
     const body: Record<string, unknown> = { clientId: params.clientId };
