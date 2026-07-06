@@ -59,8 +59,13 @@ export type EventEmitter<EventType extends PropertyKey, CallbackType extends (..
 export class TypedEventEmitter<EventType extends PropertyKey, CallbackType extends (...args: any[]) => void, ResultType>
   implements EventEmitter<EventType, CallbackType, ResultType>
 {
-  private readonly listeners = new Set<CallbackType>();
-  private readonly listenersByEvent = new Map<EventType, Set<CallbackType>>();
+  /**
+   * Listeners mapped to true when one-shot. One-shot listeners are stored
+   * under the caller's own function (not a hidden wrapper), so `off()` can
+   * remove a `once()` registration by identity.
+   */
+  private readonly listeners = new Map<CallbackType, boolean>();
+  private readonly listenersByEvent = new Map<EventType, Map<CallbackType, boolean>>();
   private readonly toResult: (event: EventType, args: Parameters<CallbackType>) => ResultType;
 
   constructor(toResult: (event: EventType, args: Parameters<CallbackType>) => ResultType) {
@@ -72,17 +77,12 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
   on(first: EventType | CallbackType, second?: CallbackType): EventUnsubscribeFn {
     if (typeof first === 'function' && second === undefined) {
       const listener = first as CallbackType;
-      this.listeners.add(listener);
+      this.listeners.set(listener, false);
       return () => this.off(listener);
     }
     if (second !== undefined) {
       const event = first as EventType;
-      let listenersForEvent = this.listenersByEvent.get(event);
-      if (!listenersForEvent) {
-        listenersForEvent = new Set();
-        this.listenersByEvent.set(event, listenersForEvent);
-      }
-      listenersForEvent.add(second);
+      this.eventListeners(event).set(second, false);
       return () => this.off(event, second);
     }
     throw new Error('EventEmitter.on: pass a listener or an event and listener');
@@ -92,25 +92,25 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
   off(listener: CallbackType): void;
   off(event: EventType, listener: CallbackType): void;
   off(first?: EventType | CallbackType, second?: CallbackType): void {
+    let removed = false;
     if (first === undefined) {
+      removed = this.hasAnyListeners();
       this.listeners.clear();
       this.listenersByEvent.clear();
-      return;
-    }
-    if (typeof first === 'function' && second === undefined) {
+    } else if (typeof first === 'function' && second === undefined) {
       const listener = first as CallbackType;
-      this.listeners.delete(listener);
+      removed = this.listeners.delete(listener);
       for (const listenersForEvent of this.listenersByEvent.values()) {
-        listenersForEvent.delete(listener);
+        removed = listenersForEvent.delete(listener) || removed;
       }
-      return;
+    } else if (second !== undefined) {
+      removed = this.listenersByEvent.get(first as EventType)?.delete(second) ?? false;
+    } else {
+      throw new Error('EventEmitter.off: pass no args, a listener, or an event and listener');
     }
-    if (second !== undefined) {
-      const listenersForEvent = this.listenersByEvent.get(first as EventType);
-      listenersForEvent?.delete(second);
-      return;
+    if (removed) {
+      this.onListenerRemoved();
     }
-    throw new Error('EventEmitter.off: pass no args, a listener, or an event and listener');
   }
 
   once(event: EventType): Promise<ResultType>;
@@ -118,42 +118,48 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
   once(event: EventType, listener: CallbackType): void;
   once(first: EventType | CallbackType, second?: CallbackType): Promise<ResultType> | void {
     if (typeof first === 'function' && second === undefined) {
-      const listener = first as CallbackType;
-      const wrapped = ((...args: Parameters<CallbackType>) => {
-        this.off(wrapped);
-        listener(...args);
-      }) as CallbackType;
-      this.on(wrapped);
+      this.listeners.set(first as CallbackType, true);
       return;
     }
     const event = first as EventType;
     if (second === undefined) {
       return new Promise<ResultType>((resolve) => {
-        const wrapped = ((...args: Parameters<CallbackType>) => {
-          this.off(event, wrapped);
+        const listener = ((...args: Parameters<CallbackType>) => {
           resolve(this.toResult(event, args));
         }) as CallbackType;
-        this.on(event, wrapped);
+        this.eventListeners(event).set(listener, true);
       });
     }
-    const listener = second;
-    const wrapped = ((...args: Parameters<CallbackType>) => {
-      this.off(event, wrapped);
-      listener(...args);
-    }) as CallbackType;
-    this.on(event, wrapped);
+    this.eventListeners(event).set(second, true);
   }
 
   protected emit(event: EventType, ...args: Parameters<CallbackType>): void {
-    for (const listener of [...this.listeners]) {
-      listener(...args);
+    // Snapshot, then drop one-shot listeners BEFORE invoking so a re-entrant
+    // emit from inside a listener cannot fire them twice.
+    const catchAll = [...this.listeners.entries()];
+    let removed = false;
+    for (const [listener, once] of catchAll) {
+      if (once) {
+        this.listeners.delete(listener);
+        removed = true;
+      }
     }
     const listenersForEvent = this.listenersByEvent.get(event);
-    if (!listenersForEvent) {
-      return;
+    const forEvent = listenersForEvent ? [...listenersForEvent.entries()] : [];
+    for (const [listener, once] of forEvent) {
+      if (once) {
+        listenersForEvent!.delete(listener);
+        removed = true;
+      }
     }
-    for (const listener of [...listenersForEvent]) {
+    for (const [listener] of catchAll) {
       listener(...args);
+    }
+    for (const [listener] of forEvent) {
+      listener(...args);
+    }
+    if (removed) {
+      this.onListenerRemoved();
     }
   }
 
@@ -168,6 +174,24 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
       }
     }
     return false;
+  }
+
+  /**
+   * Called after listeners are removed, by `off()`, by an unsubscribe
+   * function, or by a one-shot firing. Subclasses override it to react to the
+   * listener count dropping, e.g. Presence closes its server watcher when the
+   * last presence listener leaves. It fires after the listeners ran, so a
+   * listener that re-registers keeps `hasAnyListeners()` true.
+   */
+  protected onListenerRemoved(): void {}
+
+  private eventListeners(event: EventType): Map<CallbackType, boolean> {
+    let listenersForEvent = this.listenersByEvent.get(event);
+    if (!listenersForEvent) {
+      listenersForEvent = new Map();
+      this.listenersByEvent.set(event, listenersForEvent);
+    }
+    return listenersForEvent;
   }
 }
 
@@ -386,6 +410,17 @@ const READY_STATE_OPEN = 1;
  */
 const CLOSE_CODE_HANDSHAKE_FAILED = 4001;
 
+/** Close code used when the keep-alive deadline declares a silent link dead. */
+const CLOSE_CODE_KEEPALIVE_TIMEOUT = 4002;
+
+/**
+ * Bounds on how long we wait after a ping for proof of life (any inbound
+ * frame) before declaring the link dead. The deadline follows the server's
+ * advertised ping cadence, clamped to these.
+ */
+const MIN_PONG_DEADLINE_MS = 250;
+const MAX_PONG_DEADLINE_MS = 10_000;
+
 /**
  * A client-assigned message id for a publish — `<unixMillis>-<random>`, so it is
  * roughly time-sortable like the server's ids. Generated once per publish and reused
@@ -453,6 +488,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * Cloudflare's WebSocket idle timeout, which surfaces to the app as a 1006 drop.
    */
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
+  /** Armed after each ping, disarmed by any inbound frame. Fires when the link is dead. */
+  private pongDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  /** How long the dead-link detector waits, derived from the server's ping cadence. */
+  private pongDeadlineMs = MAX_PONG_DEADLINE_MS;
+  /** Sockets whose close was already handled (e.g. a synthesized keep-alive timeout), so the real event is ignored. */
+  private readonly closedSockets = new WeakSet<WebSocket>();
   private reconnectAttempt = 0;
   /** True once the first handshake has completed, so we can tell a reconnect from the first connect. */
   private hasConnectedBefore = false;
@@ -912,6 +953,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   /** Steady-state message handler, installed after a successful auth. Every server frame
    * arrives binary: one WebSocket message carries one or more opcode records. */
   private readonly handleMessage = (event: MessageEvent): void => {
+    // Anything inbound proves the link is alive.
+    this.clearPongDeadline();
     const binary = toArrayBuffer(event.data);
     if (!binary) return;
     for (const frame of decodeServerFrames(binary)) {
@@ -995,11 +1038,17 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   private handleClose(ws: WebSocket, event: CloseEvent): void {
+    if (this.closedSockets.has(ws)) {
+      // Already handled, e.g. synthesized by the keep-alive deadline. The real
+      // close event of a dead socket can arrive minutes later.
+      return;
+    }
     if (this.socket !== null && this.socket !== ws) {
       // A stale socket's close event (an earlier, already-replaced attempt)
       // must not tear down the live connection.
       return;
     }
+    this.closedSockets.add(ws);
     this.socket = null;
     this.stopKeepAlive();
     // The dead socket's requests can never be answered: drop the publish id
@@ -1103,23 +1152,59 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     if (!keepAliveMs || keepAliveMs <= 0) {
       return;
     }
+    this.pongDeadlineMs = Math.min(Math.max(keepAliveMs, MIN_PONG_DEADLINE_MS), MAX_PONG_DEADLINE_MS);
     this.keepAliveTimer = setInterval(() => {
       if (this.state !== 'connected' || !this.socket || this.socket.readyState !== READY_STATE_OPEN) {
         return;
       }
       try {
         this.sendRaw({ t: 'ping' });
+        this.armPongDeadline();
       } catch {
         // Socket is mid-teardown; the close handler will drive the reconnect.
       }
     }, keepAliveMs);
   }
 
-  /** Stop the keep-alive ping timer. */
+  /** Stop the keep-alive ping timer and the dead-link detector. */
   private stopKeepAlive(): void {
     if (this.keepAliveTimer) {
       clearInterval(this.keepAliveTimer);
       this.keepAliveTimer = null;
+    }
+    this.clearPongDeadline();
+  }
+
+  /**
+   * Arm the dead-link detector after sending a ping. Any inbound frame counts
+   * as proof of life and disarms it (a busy connection may deliver messages
+   * ahead of the pong). When nothing arrives before the deadline, the link is
+   * dead: without this, a half-dead TCP connection sits in `connected` with
+   * publishes pending until the kernel gives up minutes later, because only
+   * then does its close event fire.
+   */
+  private armPongDeadline(): void {
+    if (this.pongDeadlineTimer !== null) {
+      return;
+    }
+    this.pongDeadlineTimer = setTimeout(() => {
+      this.pongDeadlineTimer = null;
+      const ws = this.socket;
+      if (!ws || this.state !== 'connected') {
+        return;
+      }
+      // Drive the teardown ourselves instead of waiting for the dead socket's
+      // close event. handleClose ignores that event later (closedSockets).
+      safeClose(ws, CLOSE_CODE_KEEPALIVE_TIMEOUT, 'keep-alive timeout');
+      this.handleClose(ws, { code: CLOSE_CODE_KEEPALIVE_TIMEOUT, reason: 'keep-alive timeout' } as CloseEvent);
+    }, this.pongDeadlineMs);
+  }
+
+  /** Disarm the dead-link detector. Any inbound frame proves the link is alive. */
+  private clearPongDeadline(): void {
+    if (this.pongDeadlineTimer !== null) {
+      clearTimeout(this.pongDeadlineTimer);
+      this.pongDeadlineTimer = null;
     }
   }
 

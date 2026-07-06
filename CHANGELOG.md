@@ -5,6 +5,14 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ## 0.14.0
 
+### Added
+
+- **Dead connections are detected within seconds.** After each keep-alive ping
+  the SDK now waits for proof of life (any inbound frame) and tears the link
+  down when nothing arrives, letting the normal reconnect take over. Before, a
+  half-dead connection sat in `connected` with publishes pending until TCP gave
+  up minutes later.
+
 ### Removed
 
 - **The `ttlMs` publish option is gone** (`channel.publish(name, data, { ttlMs })`,
@@ -69,6 +77,10 @@ All notable changes to `@foony/realtime`. Format loosely follows
   intact, as the field docs always promised.
 - **`Rest.auth.requestToken` rejects a malformed API key** with a clear error
   instead of building a mangled URL and surfacing a confusing 401.
+- **`off()` removes `once()` listeners.** One-shot listeners used to be
+  registered under a hidden wrapper, so removing them by identity was
+  impossible. This also means removing a pending `presence.once(...)` releases
+  the watcher it was holding open.
 
 ## 0.13.0
 

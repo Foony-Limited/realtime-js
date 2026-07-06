@@ -816,10 +816,7 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   override on(first: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): UnsubscribeFn {
     const unsubscribe = second === undefined ? super.on(first as PresenceEventListener) : super.on(first as PresenceEventType, second);
     this.ensureWatching();
-    return () => {
-      unsubscribe();
-      this.maybeStopWatching();
-    };
+    return unsubscribe;
   }
 
   /** Resolve the next presence event with the matching action. */
@@ -829,55 +826,26 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   /** Invoke `listener` one time for the next presence event with a matching action. */
   override once(event: PresenceEventType, listener: PresenceEventListener): void;
   override once(first: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): Promise<PresenceEventResult> | void {
-    // A one-shot listener is removed by the emitter when it fires, so drop the
-    // watcher then too. Otherwise a lone `once` would hold the presence
-    // subscription open forever.
     if (second === undefined && typeof first !== 'function') {
-      const result = super.once(first).then((event) => {
-        this.maybeStopWatching();
-        return event;
-      });
+      const result = super.once(first);
       this.ensureWatching();
       return result;
     }
     if (second === undefined) {
-      const listener = first as PresenceEventListener;
-      super.once(((event) => {
-        try {
-          listener(event);
-        } finally {
-          this.maybeStopWatching();
-        }
-      }) as PresenceEventListener);
+      super.once(first as PresenceEventListener);
       this.ensureWatching();
       return;
     }
-    super.once(first as PresenceEventType, ((event) => {
-      try {
-        second(event);
-      } finally {
-        this.maybeStopWatching();
-      }
-    }) as PresenceEventListener);
+    super.once(first as PresenceEventType, second);
     this.ensureWatching();
   }
 
-  /** Remove every presence listener. */
-  override off(): void;
-  /** Remove `listener` wherever it was registered. */
-  override off(listener: PresenceEventListener): void;
-  /** Remove `listener` only from `event`. */
-  override off(event: PresenceEventType, listener: PresenceEventListener): void;
-  override off(first?: PresenceEventType | PresenceEventListener, second?: PresenceEventListener): void {
-    if (first === undefined) {
-      super.off();
-    } else if (typeof first === 'function') {
-      super.off(first);
-    } else if (second !== undefined) {
-      super.off(first, second);
-    }
-    // The watcher follows the listener count, so removing listeners here must
-    // release it just like the unsubscribe function returned by `on` does.
+  /**
+   * The watcher follows the listener count: every removal path (an unsubscribe
+   * function, `off()`, a one-shot firing) funnels through this hook, so the
+   * presence subscription is dropped as soon as the last listener leaves.
+   */
+  protected override onListenerRemoved(): void {
     this.maybeStopWatching();
   }
 

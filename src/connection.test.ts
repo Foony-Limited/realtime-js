@@ -10,7 +10,7 @@ import { AddressInfo } from 'node:net';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { Cipher, Realtime, generateRandomKey } from './index.js';
+import { Cipher, Realtime, TypedEventEmitter, generateRandomKey } from './index.js';
 import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
 import { decodeClientFrame, encodeServerFrame, frameBinaryRecord, splitBinaryRecords } from './binary.js';
 
@@ -67,6 +67,8 @@ type Harness = {
     dropNextSub: boolean;
     dropNextHist: boolean;
     dropNextFetch: boolean;
+    /** When true, pings are swallowed instead of answered, simulating a half-dead link. */
+    silencePongs: boolean;
     keepAliveMs: number;
     /** When set, the reply the edge returns for a `fetch` (gap-fill) request. */
     fetchReply: ((channel: string, fromSerial: number) => { messages: unknown[]; resumed: boolean }) | null;
@@ -93,6 +95,7 @@ async function startFakeEdge(): Promise<Harness> {
     dropNextSub: false,
     dropNextHist: false,
     dropNextFetch: false,
+    silencePongs: false,
     keepAliveMs: 30_000,
     fetchReply: null,
     coalesceWithConnected: null,
@@ -127,7 +130,9 @@ async function startFakeEdge(): Promise<Harness> {
       }
       if (frame.t === 'ping') {
         pings.push(Date.now());
-        sendFrame(socket, { t: 'pong' } satisfies ServerFrame);
+        if (!control.silencePongs) {
+          sendFrame(socket, { t: 'pong' } satisfies ServerFrame);
+        }
         return;
       }
       if (frame.t === 'sub') {
@@ -1292,6 +1297,76 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(() => realtime.channels.get(':lead')).toThrow(/invalid channel name/);
     expect(() => realtime.channels.get('a'.repeat(256))).toThrow(/invalid channel name/);
     expect(() => realtime.channels.get('chat:room-1_ok')).not.toThrow();
+  });
+
+  it('declares a silent connection dead after the pong deadline', async () => {
+    harness.control.keepAliveMs = 50;
+    harness.control.silencePongs = true;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    // Nothing arrives after the ping, so the deadline must tear the link down
+    // instead of letting it sit in `connected` until TCP gives up.
+    const change = await realtime.connection.once('disconnected');
+    expect(change.reason?.message).toContain('keep-alive timeout');
+    await realtime.close();
+  });
+
+  it('off() removes a once() listener', () => {
+    class TestEmitter extends TypedEventEmitter<string, (value: number) => void, number> {
+      fire(event: string, value: number): void {
+        this.emit(event, value);
+      }
+    }
+    const emitter = new TestEmitter((_event, args) => args[0]);
+    const seen: number[] = [];
+    const listener = (value: number): void => {
+      seen.push(value);
+    };
+
+    emitter.once('tick', listener);
+    emitter.off('tick', listener);
+    emitter.fire('tick', 1);
+    emitter.once(listener);
+    emitter.off(listener);
+    emitter.fire('tick', 2);
+    expect(seen).toEqual([]);
+
+    // A once that is not removed still fires exactly one time.
+    emitter.once('tick', listener);
+    emitter.fire('tick', 3);
+    emitter.fire('tick', 4);
+    expect(seen).toEqual([3]);
+  });
+
+  it('presence.off(listener) removes a once() listener and drops the watcher', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:po');
+    const seen: string[] = [];
+    const listener = (event: { action: string }): void => {
+      seen.push(event.action);
+    };
+    channel.presence.once('enter', listener);
+    await waitFor(() => harness.presSubFrames.some((p) => p.type === 'presSub' && p.channel === 'chat:po'), 'watcher opened');
+
+    channel.presence.off('enter', listener);
+    await waitFor(() => harness.presSubFrames.some((p) => p.type === 'presUnsub' && p.channel === 'chat:po'), 'watcher dropped');
+    await channel.presence.enter({});
+    await delay(100);
+    expect(seen).toEqual([]);
+    await realtime.close();
   });
 
   it('batchPublish enforces the per-channel message limit after merging specs', async () => {
