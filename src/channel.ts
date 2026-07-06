@@ -513,23 +513,20 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * [history docs](https://foony.io/docs/history). On a channel with a
    * `cipher`, messages are decrypted before they are returned.
    *
-   * @param params - `limit` caps how many messages are returned. `start` (a
-   *   message id) pages backward from that message.
+   * @param params - `limit` caps how many messages are returned. `before` (a
+   *   message serial, see {@link MessageFrame.seq}) pages backward: only
+   *   messages with a serial strictly below it are returned.
    * @returns Resolves with the messages and `more`, which is true when older
-   *   messages remain (pass the oldest message's id as `start` to fetch them).
-   *   Rejects with the server's error when history cannot be read, for
+   *   messages remain (pass the oldest message's `seq` as `before` to fetch
+   *   them). Rejects with the server's error when history cannot be read, for
    *   example a missing history capability.
    */
-  async history(params?: { readonly limit?: number; readonly start?: string }): Promise<{ readonly messages: readonly MessageFrame[]; readonly more: boolean }> {
-    // A batch member's id is `<batchId>:<index>` (see memberFrame), but the
-    // server pages by stored record, so an unstripped member id would silently
-    // restart paging from the newest page. Page from the batch it belongs to.
-    const start = params?.start === undefined ? undefined : params.start.replace(/:\d+$/u, '');
+  async history(params?: { readonly limit?: number; readonly before?: number }): Promise<{ readonly messages: readonly MessageFrame[]; readonly more: boolean }> {
     const response = await this.connection['requestHistory']({
       t: 'hist',
       channel: this.name,
       ...(params?.limit === undefined ? {} : { limit: params.limit }),
-      ...(start === undefined ? {} : { start }),
+      ...(params?.before === undefined ? {} : { before: params.before }),
     });
     // Expand any batch frames into their member frames before decrypting.
     const expanded = response.messages.flatMap(expandBatch);

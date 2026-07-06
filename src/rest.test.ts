@@ -172,14 +172,14 @@ describe('Rest history', () => {
     expect(fake.requests[1]!.path).toBe('/channels/c/messages?limit=1&start=m-3');
   });
 
-  it('passes direction and start params through', async () => {
+  it('passes direction and before params through', async () => {
     const { fake, endpoint } = await startFake();
     fake.handler = (_request, response) => json(response, 200, []);
 
     const rest = new Rest({ endpoint, key: 'myapp.key1:s3cret' });
-    await rest.channels.get('c').history({ direction: 'forwards', start: 'm-9', limit: 5 });
+    await rest.channels.get('c').history({ direction: 'forwards', before: 9, limit: 5 });
 
-    expect(fake.requests[0]!.path).toBe('/channels/c/messages?limit=5&start=m-9&direction=forwards');
+    expect(fake.requests[0]!.path).toBe('/channels/c/messages?limit=5&before=9&direction=forwards');
   });
 });
 

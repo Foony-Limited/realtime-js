@@ -327,7 +327,7 @@ function encodeHistory(frame: HistoryFrame): Uint8Array {
   pushUvarint(out, frame.id);
   pushUvarint(out, frame.limit ?? 0);
   pushString(out, frame.channel);
-  pushString(out, frame.start ?? '');
+  pushUvarint(out, frame.before ?? 0);
   return Uint8Array.from(out);
 }
 
@@ -587,8 +587,8 @@ export function decodeClientFrame(record: Uint8Array): ClientFrame {
       const id = reader.uvarint();
       const limit = reader.uvarint();
       const channel = reader.str();
-      const start = reader.str();
-      return { t: 'hist', id, channel, ...(limit ? { limit } : {}), ...(start ? { start } : {}) };
+      const before = reader.uvarint();
+      return { t: 'hist', id, channel, ...(limit ? { limit } : {}), ...(before ? { before } : {}) };
     }
     case Op.Fetch:
       return { t: 'fetch', id: reader.uvarint(), fromSerial: reader.uvarint(), channel: reader.str() };

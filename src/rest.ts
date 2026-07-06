@@ -136,8 +136,12 @@ export type RestHistoryParams = {
    * @defaultValue 100
    */
   readonly limit?: number;
-  /** Exclusive message-id cursor: return messages published strictly before it. */
-  readonly start?: string;
+  /**
+   * Exclusive serial cursor: return only messages with a serial strictly
+   * below it. Pass the oldest `serial` you already have (see
+   * {@link RestMessage.serial}) to page backward.
+   */
+  readonly before?: number;
   /**
    * `'backwards'` (newest first, the default) or `'forwards'` (oldest first).
    *
@@ -432,7 +436,7 @@ export class RestChannel {
   async history(params?: RestHistoryParams): Promise<PaginatedResult<RestMessage>> {
     const query = new URLSearchParams();
     if (params?.limit !== undefined) query.set('limit', String(params.limit));
-    if (params?.start !== undefined) query.set('start', params.start);
+    if (params?.before !== undefined) query.set('before', String(params.before));
     if (params?.direction !== undefined) query.set('direction', params.direction);
     const queryString = query.toString();
     const suffix = queryString === '' ? '' : `?${queryString}`;

@@ -194,8 +194,8 @@ export type HistoryFrame = {
   readonly channel: string;
   /** Maximum number of messages to return (server caps this). */
   readonly limit?: number;
-  /** Cursor: when set, page backward from this message id (exclusive). */
-  readonly start?: string;
+  /** Cursor: when set, return the messages with serial strictly below it (backward paging). */
+  readonly before?: number;
   /** Client request id echoed back on the matching `histRes` / `err` frame. */
   readonly id: number;
 };
@@ -269,7 +269,7 @@ export type MessageFrame = {
   readonly data: unknown;
   /** Server publish time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
-  /** Unique, ordered message id. Pass it as history's `start` to page backward from this message. */
+  /** Unique message id, for dedup and idempotent publishing. */
   readonly messageId: string;
   /** Client id of the publisher, when known. */
   readonly clientId?: string;
@@ -277,8 +277,9 @@ export type MessageFrame = {
   readonly encoding?: string;
   /**
    * Contiguous per-channel serial (0/absent for ephemeral/retained/unsequenced messages). The
-   * SDK uses it to detect gaps (serial != last+1) and as the migration-safe resume cursor. For a
-   * bundle the outer serial is absent and each member carries its own.
+   * SDK uses it to detect gaps (serial != last+1), as the migration-safe resume cursor, and as
+   * history's `before` cursor to page backward from this message. For a bundle the outer serial
+   * is absent and each member carries its own.
    */
   readonly seq?: number;
   /** Batch members; when set, this frame carries a batch and `name`/`data` are ignored. */
@@ -308,7 +309,7 @@ export type BundledMessage = {
   readonly data: unknown;
   /** Server publish time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
-  /** This member's own message id. Pass it as history's `start` to page backward from this message. */
+  /** This member's own message id, for dedup and idempotent publishing. */
   readonly messageId: string;
   /** Client id of the publisher, when known. */
   readonly clientId?: string;

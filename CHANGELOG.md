@@ -23,6 +23,13 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ### Changed
 
+- **Breaking: history pages by serial instead of message id.**
+  `channel.history({ before })` and REST `history({ before })` take the oldest
+  message's serial (`seq` on realtime frames, `serial` on REST messages) and
+  return only messages strictly below it. The `start` message-id cursor is
+  gone. Serials are server-assigned and unique, so paging cannot loop or skip
+  when a publisher reuses a message id, and deep scrollback into archived
+  history is much faster.
 - **`channels.get` validates channel names client-side** against the server's
   grammar (`A-Z a-z 0-9 : - _`, at most 255 characters, no leading `:`) and
   throws immediately. Before, a bad name attach-looped against `BadFrame`

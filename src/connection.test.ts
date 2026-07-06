@@ -159,7 +159,7 @@ async function startFakeEdge(): Promise<Harness> {
         }
       }
       if (frame.t === 'hist') {
-        histFrames.push({ channel: frame.channel, ...(frame.start === undefined ? {} : { start: frame.start }) });
+        histFrames.push({ channel: frame.channel, ...(frame.before === undefined ? {} : { before: frame.before }) });
         if (control.dropNextHist) {
           control.dropNextHist = false;
           // Die between receiving the hist and answering it, so the request is orphaned.
@@ -1248,7 +1248,7 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
-  it('strips a batch member suffix from the history start cursor', async () => {
+  it('sends the history before cursor as given', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,
       token: 'GOOD',
@@ -1257,8 +1257,8 @@ describe('Connection end-to-end (fake edge)', () => {
     });
     await realtime.connect();
 
-    await realtime.channels.get('chat:hs').history({ start: '1751-abcd:3' });
-    expect(harness.histFrames.at(-1)).toEqual({ channel: 'chat:hs', start: '1751-abcd' });
+    await realtime.channels.get('chat:hs').history({ before: 42 });
+    expect(harness.histFrames.at(-1)).toEqual({ channel: 'chat:hs', before: 42 });
     await realtime.close();
   });
 
