@@ -1,6 +1,6 @@
 /**
  * Realtime is the top-level client class. It owns a Connection and a
- * `channels.get(name)` registry — the public entry point for app code.
+ * `channels.get(name)` registry, and is the public entry point for app code.
  */
 
 import { Auth } from './auth.js';
@@ -8,20 +8,28 @@ import { Channel, type BatchOptions } from './channel.js';
 import { Connection, type ConnectionOptions, type ConnectionState } from './connection.js';
 import type { CipherParams } from './crypto.js';
 
-/** Options for the Realtime client; the connection options plus a default batch config. */
+/** Options for the {@link Realtime} client: the {@link ConnectionOptions} plus a default batch config. */
 export type RealtimeOptions = ConnectionOptions & {
   /**
-   * Tuning for the always-on auto-batching applied to every channel
-   * (overridable per channel). Batching is on by default; this only adjusts it.
+   * Configuration for the always-on auto-batching applied to every channel,
+   * overridable per channel via {@link ChannelOptions.batch}. Batching is on
+   * by default. Defaults are documented on {@link BatchOptions}.
    */
   readonly batch?: BatchOptions;
 };
 
-/** Per-channel options passed to `channels.get(name, options)`. */
+/**
+ * Per-channel options passed to `channels.get(name, options)`. They apply only
+ * on the first `get` of a given name (see {@link Realtime.channels}).
+ */
 export type ChannelOptions = {
-  /** Enable end-to-end payload encryption on this channel. */
+  /**
+   * Enable end-to-end payload encryption on this channel with the given {@link CipherParams}.
+   * This prevents the Foony backend from seeing the plaintext `data` of messages published to this channel.
+   * The `cipher` key should be kept private and never shared with the public or our backend.
+   */
   readonly cipher?: CipherParams;
-  /** Auto-batch tuning for this channel; overrides the client-level default. */
+  /** Auto-batch tuning for this channel. Overrides the {@link RealtimeOptions.batch} default. */
   readonly batch?: BatchOptions;
 };
 
@@ -35,33 +43,56 @@ export type BatchMessage = {
 
 /** A batch-publish spec: send `messages` to each of `channels`. */
 export type BatchSpec = {
-  /** One channel name or a list of them. */
+  /** One channel name or a list of them to which `messages` will be published. */
   readonly channels: string | readonly string[];
   /** One message or a list of them, published to every channel in `channels`. */
   readonly messages: BatchMessage | readonly BatchMessage[];
 };
 
-/** Per-channel outcome from {@link Realtime.batchPublish}. */
+/** Per-channel results from {@link Realtime.batchPublish}. */
 export type BatchPublishResult = {
   /** Number of channels published successfully. */
   readonly successCount: number;
-  /** Number of channels that failed. */
+  /** Number of channels that failed to publish. */
   readonly failureCount: number;
-  /** One entry per (spec × channel); `error` is set when that channel failed. */
+  /** One entry per channel. `error` is set when that channel's publish failed. */
   readonly results: ReadonlyArray<{ readonly channel: string; readonly error?: Error }>;
 };
 
-/** Batch limits, enforced client-side. */
+/** Maximum number of channels per batch. */
 const MAX_BATCH_CHANNELS = 100;
+
+/** Maximum number of messages per channel per batch. */
 const MAX_BATCH_MESSAGES = 1000;
 
 /**
- * Realtime client — call `new Realtime({ token })` and use
- * `client.channels.get('chat:1')` to start sending and receiving.
+ * The realtime client and the entry point for app code. It owns one WebSocket
+ * {@link Connection} (opened lazily on first use) and a map of
+ * {@link Channel} instances retrieved via {@link Realtime.channels | `channels.get(name)`}.
+ * See the [getting started guide](https://foony.io/docs/getting-started) for
+ * the auth options and a full walkthrough.
+ *
+ * @example
+ * ```ts
+ * // Prefer `authCallback` over `key` for production apps.
+ * const client = new Realtime({ authCallback: () => fetchTokenFromYourServer() });
+ * const channel = client.channels.get('chat:room-1');
+ * channel.subscribe((message) => {
+ *   console.log(message.name, message.data);
+ * });
+ * await channel.publish('greeting', { text: 'hi' });
+ * ```
  */
 export class Realtime {
+  /**
+   * The underlying {@link Connection}. Listen on lifecycle state with
+   * `connection.on(...)` and read it with {@link Realtime.getState | `getState()`}.
+   */
   readonly connection: Connection;
-  /** Token-minting namespace. Signs with the client's key. */
+  /**
+   * Token-minting namespace. Signs with the client's key. See the
+   * [auth docs](https://foony.io/docs/auth) for when to mint tokens yourself.
+   */
   readonly auth: Auth;
   private readonly channelsByName = new Map<string, Channel>();
   private readonly batchDefault: BatchOptions | undefined;
@@ -69,11 +100,15 @@ export class Realtime {
   /** Map-like accessor for channels. Stable instance per name. */
   readonly channels = {
     /**
-     * Gets a channel by `name` (or creates the channel if it doesn't yet exist). `name` may only
-     * consist of the characters: `/[a-zA-Z0-9._-:]+/`, and may not start with a ':'.
+     * Get the {@link Channel} named `name`, creating it on first use. The same
+     * name always returns the same instance. `name` is 1 to 255 characters
+     * from `A-Z a-z 0-9 : - _` and may not start with a ':'. Colons express
+     * hierarchy (e.g. `chat:rooms:42`), dots are not allowed, and the server
+     * rejects an invalid name with `BadFrame` (40001).
      *
-     * `options` (e.g. `cipher`) apply when the channel is first created; passing different
-     * options to a later `get` of the same name returns the existing instance unchanged.
+     * `options` (e.g. `cipher`) apply when the channel is first created.
+     * Passing different {@link ChannelOptions} to a later `get` of the same
+     * name returns the existing instance unchanged.
      */
     get: (name: string, options?: ChannelOptions): Channel => {
       let existing = this.channelsByName.get(name);
@@ -83,9 +118,11 @@ export class Realtime {
       }
       return existing;
     },
+
     /**
-     * Releases a channel by `name`. The channel will be detached and removed from the client.
-     * If the channel is not found, this is a no-op.
+     * Release the channel named `name`. The channel is detached and removed
+     * from the client, so a later `get` of the same name returns a fresh
+     * instance. A no-op when no channel with that name exists.
      */
     release: (name: string): void => {
       const channel = this.channelsByName.get(name);
@@ -102,12 +139,23 @@ export class Realtime {
     this.batchDefault = options.batch;
   }
 
-  /** Eagerly open the WebSocket. Optional — channels attach lazily. */
+  /**
+   * Eagerly open the WebSocket and complete the auth handshake. Calling this
+   * is optional: channels connect and attach lazily on first use. This
+   * method is idempotent, and concurrent calls await the same in-flight
+   * connect. Resolves once the connection is `connected`. Rejects with the
+   * handshake error when auth fails (for example a bad key, or an expired
+   * static `token` with no `authCallback` to re-mint one).
+   */
   async connect(): Promise<void> {
     await this.connection.connect();
   }
 
-  /** Close the WebSocket and release every channel. */
+  /**
+   * Close the WebSocket and release every channel. Resolves once the
+   * connection reaches `closed`. Publishes still awaiting an ack reject with
+   * a "connection closed" error.
+   */
   async close(): Promise<void> {
     for (const name of [...this.channelsByName.keys()]) {
       this.channels.release(name);
@@ -116,13 +164,21 @@ export class Realtime {
   }
 
   /**
-   * Publish messages to many channels in one call. Each spec
-   * sends its `messages` to each of its `channels`; messages to a single channel
-   * go as one idempotent batch frame. This is publish-only — it does not attach
-   * or subscribe the channels (so it scales to many channels), and it sends
-   * payloads as-is (use `channel.publish` for an end-to-end-encrypted channel).
+   * Publish messages to many channels in one call. Each {@link BatchSpec}
+   * sends its `messages` to each of its `channels`, and all messages to a
+   * single channel go as one idempotent batch frame. `batchPublish` is
+   * publish-only and does not handle end-to-end encryption. If you need that,
+   * use {@link Channel.publish | `channel.publish()`} (which is the preferred
+   * method of publishing all messages).
    *
-   * @returns Per-channel success/failure; one channel failing does not fail the others.
+   * A `batchPublish` is limited to at most 100 distinct channels per call and
+   * at most 1000 messages per spec. Throws an `Error` before sending anything
+   * when a limit is exceeded.
+   *
+   * @param specs - One {@link BatchSpec} or a list of them.
+   * @returns Resolves with a {@link BatchPublishResult}. A channel that fails
+   *   shows up there as an `error` entry rather than rejecting the call, so
+   *   one channel failing does not fail the others.
    */
   async batchPublish(specs: BatchSpec | readonly BatchSpec[]): Promise<BatchPublishResult> {
     const list = Array.isArray(specs) ? (specs as readonly BatchSpec[]) : [specs as BatchSpec];
@@ -157,17 +213,22 @@ export class Realtime {
     return { successCount: results.length - failureCount, failureCount, results };
   }
 
-  /** Current connection state. */
+  /** Current {@link ConnectionState}. Observe changes with `connection.on(...)`. */
   getState(): ConnectionState {
     return this.connection.getState();
   }
 
-  /** Server-issued connection id, populated after auth. */
+  /** Server-issued connection id, or `null` before the auth handshake completes. */
   getConnectionId(): string | null {
     return this.connection.getConnectionId();
   }
 
-  /** Server-confirmed client id (from the JWT), populated after auth. */
+  /**
+   * Client id this connection is authenticated as, or `null` before the auth
+   * handshake completes. Never `null` once connected: the server resolves it
+   * from the JWT's subject (token / `authCallback` auth), from the
+   * `clientId` option (key auth), or assigns one when neither names a client.
+   */
   getClientId(): string | null {
     return this.connection.getClientId();
   }

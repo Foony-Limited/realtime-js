@@ -12,15 +12,15 @@ import { TypedEventEmitter, type Connection, type ConnectionState, type EventUns
 import { Cipher, isCipherEncoding, type CipherParams } from './crypto.js';
 import type { BatchMember, BundledMessage, MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
 
-/** Listener handle returned by `subscribe` — call to remove the listener. */
+/** Function returned by `subscribe`. Call it to remove the listener. */
 export type UnsubscribeFn = EventUnsubscribeFn;
 
 /**
- * Tuning for automatic publish batching. Single `publish(name, data)` calls are
- * always auto-batched: buffered and flushed as one batch frame (one stored,
- * dedupable message), which massively raises per-channel throughput for little
- * to no latency cost. This type only tunes that behavior; it is never needed to
- * turn batching on. Array publishes and `batchPublish` are never buffered.
+ * Configuration for automatic publish batching. Single `publish(name, data)`
+ * calls are always auto-batched, buffered and flushed as one batch frame (one
+ * stored, dedupable message), which massively raises per-channel throughput for
+ * little to no latency cost. Batching is always on. Array publishes and
+ * `batchPublish` are never batched (they assume the caller is managing batching).
  */
 export type BatchOptions = {
   /**
@@ -28,10 +28,16 @@ export type BatchOptions = {
    * sent right away unless a batch went out within the last `intervalMs`, in
    * which case it waits until the window is up. Publishes spaced further apart
    * than `intervalMs` are never batched together and add no latency. Only fast
-   * bursts get grouped into one batch. Default 10.
+   * bursts get grouped into one batch.
+   *
+   * @defaultValue 10
    */
   readonly intervalMs?: number;
-  /** Flush early once this many messages are buffered. Default 200. */
+  /**
+   * Flush early once this many messages are buffered.
+   *
+   * @defaultValue 200
+   */
   readonly maxMessages?: number;
 };
 
@@ -46,31 +52,39 @@ const DEFAULT_BATCH_INTERVAL_MS = 10;
 const DEFAULT_BATCH_MAX_MESSAGES = 200;
 
 /**
- * Cap on the per-channel delivered-message dedup cache. Bounds memory; the window
- * it covers (this many recent messages) comfortably exceeds any realistic
- * publisher-retry or live/coalescing reorder gap.
+ * Cap on the per-channel delivered-message dedup cache (number of message ids).
+ * This limit determines how many recent messages are stored for "exactly-once
+ * delivery" guarantees. A larger limit means more memory, but more reliable delivery.
  */
 const DEDUP_CACHE_MAX = 8192;
 
 /**
- * Channel lifecycle states. A channel walks this set as it attaches to
- * and detaches from the server, exposed so callers can react to (re)attach
- * and failure transitions.
+ * Channel lifecycle states. A healthy channel follows the lifecycle states in order:
+ * `initialized` -> `attaching` -> `attached` -> `detaching` -> `detached` -> `attaching`, etc.
+ * A channel in a `failed` state is not retried and is not re-attached.
  */
 export type ChannelState =
-  /** Created locally; no attach has been attempted yet. */
+  /** Created locally. No attach has been attempted yet. */
   | 'initialized'
   /** An attach has been requested and is awaiting server confirmation. */
   | 'attaching'
-  /** Attached — messages and presence for this channel are flowing. */
+  /** Attached. Messages and presence for this channel are flowing. */
   | 'attached'
   /** A detach has been requested and is awaiting server confirmation. */
   | 'detaching'
-  /** Detached — no messages or presence are delivered until re-attached. */
+  /** Detached. No messages or presence are delivered until re-attached. */
   | 'detached'
-  /** Temporarily lost (e.g. the connection dropped); the SDK will re-attach on reconnect. */
+  /**
+   * Temporarily lost, for example because the connection dropped. The SDK
+   * re-attaches on reconnect. You can keep publishing: with `queueMessages` on
+   * (the default), publishes are queued locally and sent once reconnected.
+   */
   | 'suspended'
-  /** Attach failed and will not be retried automatically (e.g. permission denied). */
+  /**
+   * The attach failed with an error that a retry will not fix, for example a
+   * missing capability, and the SDK will not retry it. Call `attach()` to try
+   * again manually, for example after obtaining a token with more capabilities.
+   */
   | 'failed';
 
 /**
@@ -80,9 +94,11 @@ export type ChannelState =
 export type ChannelEventType =
   | ChannelState
   /**
-   * A change that is not a state transition — the channel stayed in the
-   * same state but something was re-confirmed (e.g. the subscription was
-   * resumed after a reconnect). Carries `resumed` on the state change.
+   * A change that is not a state transition. The channel stayed in the same
+   * state but something was updated, for example the server reported a
+   * resume outcome while the channel was already attached. Check `resumed` on
+   * the payload: `false` means messages may have been missed beyond
+   * retention, so reload state or read history.
    */
   | 'update';
 
@@ -114,15 +130,28 @@ export type PresenceEventType = PresenceAction;
 export type PresenceEventResult = PresenceEventFrame;
 
 /**
- * One subscription handle per (channel, listener) pair. Channels are
- * value-equal by name on a given Realtime client — calling
- * `client.channels.get('chat:1')` twice returns the same instance.
+ * A named channel. Subscribe to receive its messages, publish to send them,
+ * and use {@link Channel.presence | `presence`} to see who is there. Get
+ * instances via `client.channels.get(name)`. The same name always returns the
+ * same instance on a given client.
  *
- * `on` / `once` / `off` observe the channel's {@link ChannelState};
- * `subscribe` / `unsubscribe` receive {@link MessageFrame} messages.
+ * The channel has two separate listener surfaces: `on` / `once` / `off` listen
+ * on the channel's lifecycle {@link ChannelState}, while `subscribe` /
+ * `unsubscribe` receive application messages.
+ *
+ * @example
+ * ```ts
+ * const channel = client.channels.get('chat:room-1');
+ * channel.subscribe('greeting', (message) => {
+ *   console.log(message.data);
+ * });
+ * await channel.publish('greeting', { text: 'hi' });
+ * ```
  */
 export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateListener, ChannelStateChange> {
+  /** The channel name this instance is bound to (e.g. "chat:room-1"). */
   readonly name: string;
+  /** Presence for this channel: announce membership and listen on who comes and goes. */
   readonly presence: Presence;
   private readonly connection: Connection;
   private readonly messages = new ChannelMessageEmitter((_event, args) => args[0]);
@@ -134,7 +163,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   /** Buffered single publishes awaiting the next auto-batch flush. */
   private batchBuffer: BufferedPublish[] = [];
   private batchTimer: ReturnType<typeof setTimeout> | null = null;
-  /** When the last batch was sent, to throttle sends to one per `intervalMs`. */
+  /** Unix timestamp when the last batch was sent. Used to throttle sends to one per `intervalMs`. */
   private lastFlushMs = 0;
   private attachPromise: Promise<void> | null = null;
   private channelState: ChannelState = 'initialized';
@@ -142,23 +171,27 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * Bounded, insertion-ordered set of recently delivered (clientId, messageId)
    * keys, for exactly-once delivery. The server coalesces publishes across
    * clients into one record and does not dedup the individual messages within
-   * it, so a publisher retry can deliver a message twice — we drop the repeat
+   * it, so a publisher retry can deliver a message twice. We drop the repeat
    * here. Keyed on the server-stamped clientId, so one client cannot suppress
    * another's message by reusing its id.
    */
   private readonly seenMessages = new Map<string, true>();
 
   /**
-   * The highest serial up to which this channel has received every message with no gap — the
-   * resume cursor sent on (re)subscribe so the server replays anything missed during a disconnect.
-   * Contiguous per channel and identical across cells, so resume is exact and migration-safe. 0
-   * means no baseline yet: the next sequenced message is adopted as the baseline (a fresh
-   * subscriber starts from "now", not from serial 1). A channel that has only seen unsequenced
-   * messages keeps 0 and resubscribes fresh.
+   * The highest serial up to which this channel has received every message with no gap. This
+   * serial is sent on (re)subscribe so the server replays anything missed during a disconnect.
+   * Contiguous per channel and identical across cells (e.g. "us-west"), so resume is exact and
+   * migration-safe. 0 means no baseline yet: the next sequenced message is adopted as the baseline
+   * (a fresh subscriber starts from "now", not from serial 1). A channel that has only seen unsequenced
+   * messages (such as `{ephemeral: true}` messages) keeps 0 and resubscribes fresh.
    */
   private contiguousSerial = 0;
 
-  /** True while a gap-fill re-subscribe is in flight, so a burst of gapped messages triggers one. */
+  /**
+   * True while a gap-fill fetch is in flight. Gapped messages arriving during
+   * that window do not start more fetches: one fetch from the cursor replays
+   * everything after it, so it heals the whole burst.
+   */
   private backfilling = false;
 
   constructor(connection: Connection, name: string, cipher?: CipherParams, batch?: BatchOptions) {
@@ -181,16 +214,19 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
     this.connection.on((state, reason) => this.onConnectionState(state, reason));
   }
 
-  /** Current channel lifecycle state. */
+  /** Current {@link ChannelState}. Listen on changes with `on(...)`. */
   get state(): ChannelState {
     return this.channelState;
   }
 
   /**
-   * Ensure the server is subscribed to this channel. Called implicitly
-   * by `subscribe()` and `presence.subscribe()`; expose it so callers
-   * can pre-attach if they want to surface attach errors before the
-   * first message arrives.
+   * Ensure the server is subscribed to this channel. `subscribe()` and the
+   * presence methods call this implicitly, so calling it yourself is optional.
+   * It is useful for surfacing attach errors before the first message arrives.
+   * Resolves once the server confirms the channel subscription. Rejects with the
+   * server's error when the token lacks the subscribe capability (the channel
+   * moves to `failed` and is not retried) or when the request fails in transit
+   * (the channel moves to `suspended` and re-attaches on reconnect).
    */
   async attach(): Promise<void> {
     if (this.channelState === 'attached') return;
@@ -237,9 +273,11 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Detach from the server (stop receiving messages and presence
-   * events). Local listeners are preserved — call `off()` or
-   * `unsubscribe()` to clear them.
+   * Detach from the server: stop receiving messages and presence events.
+   * Buffered auto-batched publishes are flushed first. Local listeners are
+   * preserved, call `off()` or `unsubscribe()` to clear them. Resolves once
+   * the server confirms the detach. Rejects when the request fails, though
+   * the channel is marked detached either way.
    */
   async detach(): Promise<void> {
     // Don't strand buffered auto-batched publishes on detach.
@@ -258,8 +296,10 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Register a listener for every message frame on this channel.
-   * Implicitly attaches if needed. Returns an unsubscribe function.
+   * Register a listener for every message on this channel. Implicitly attaches
+   * if needed and returns an unsubscribe function. `subscribe` itself is
+   * synchronous, so attach failures do not surface here: call
+   * {@link Channel.attach | `attach()`} first if you want to observe them.
    */
   subscribe(listener: MessageListener): UnsubscribeFn;
   /** Register a listener for messages with a matching `name`. */
@@ -314,40 +354,45 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Publish one application-level message to the channel. Publishing does not
-   * subscribe you to the channel; call `subscribe()` if you also want to receive.
+   * Publish one message to the channel. On a channel with a `cipher`, `data`
+   * is end-to-end encrypted before it is sent. Resolves once the server acks
+   * the publish. With `queueMessages` on (the default), publishes made while
+   * the connection is down are queued locally and sent on reconnect. Rejects
+   * with the server's error when the service refuses the publish (for example
+   * a token without the publish capability), and rejects immediately when the
+   * connection is `closing`, `closed`, or `failed`. With `queueMessages` off,
+   * any connection state but `connected` rejects immediately.
    *
    * @param name - The event name.
    * @param data - The data to publish.
-   * @param options - Optional publish controls. `ttlMs` requests how long the
-   *   message is retained for history (server-clamped to your plan ceiling);
-   *   omit it for the short ephemeral default.
+   * @param options - Optional publish controls. `ephemeral: true` marks a
+   *   fire-and-forget message: delivered live to current subscribers but never
+   *   stored, so it is excluded from history and reconnect replay.
    */
-  publish(name: string, data: unknown, options?: { readonly ttlMs?: number; readonly ephemeral?: boolean }): Promise<void>;
+  publish(name: string, data: unknown, options?: { readonly ephemeral?: boolean }): Promise<void>;
   /**
-   * Publish a batch of messages in a single frame under one message id. The
-   * batch is the atomic unit: the server stores and dedups it as one durable
-   * message (so a resend is collapsed), while subscribers receive the members
-   * individually. Reduces stored-message count and transport overhead.
+   * Publish a batch of messages in a single frame under one message id. This is
+   * an atomic batch. The server stores and dedups it as one durable message, while
+   * subscribers receive the members individually. This counts as 1 message for the
+   * purposes of usage limits / quotas (message size limits still apply).
    *
    * @param messages - The messages to publish, each with its own `name`/`data`.
-   * @param options - Optional publish controls (e.g. `ttlMs`).
+   * @param options - Optional publish controls (e.g. `ephemeral`).
    */
-  publish(messages: ReadonlyArray<{ readonly name: string; readonly data: unknown }>, options?: { readonly ttlMs?: number; readonly ephemeral?: boolean }): Promise<void>;
+  publish(messages: ReadonlyArray<{ readonly name: string; readonly data: unknown }>, options?: { readonly ephemeral?: boolean }): Promise<void>;
   async publish(
     nameOrMessages: string | ReadonlyArray<{ readonly name: string; readonly data: unknown }>,
     dataOrOptions?: unknown,
-    options?: { readonly ttlMs?: number; readonly ephemeral?: boolean },
+    options?: { readonly ephemeral?: boolean },
   ): Promise<void> {
     // Publishing does not attach: a publisher that never subscribed should not
     // hold a server-side subscription. Offline publishes are still buffered and
     // resent by the connection's queueMessages, independent of attach state.
     if (typeof nameOrMessages === 'string') {
       const member = await this.toMember(nameOrMessages, dataOrOptions);
-      // Auto-batch single publishes — but not when a per-message ttl override or the
-      // ephemeral flag is set (a batch shares one ttl and one ephemeral disposition),
-      // so send those immediately.
-      if (options?.ttlMs === undefined && options?.ephemeral !== true) {
+      // Auto-batch single publishes, but not ephemeral ones (a batch shares one
+      // ephemeral disposition), so send those immediately.
+      if (options?.ephemeral !== true) {
         return this.enqueue(member);
       }
       await this.connection['publish']({
@@ -356,12 +401,11 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
         name: member.name,
         data: member.data,
         ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
-        ...(options?.ttlMs === undefined ? {} : { ttlMs: options.ttlMs }),
-        ...(options?.ephemeral === true ? { ephemeral: true } : {}),
+        ephemeral: true,
       });
       return;
     }
-    const opts = dataOrOptions as { readonly ttlMs?: number; readonly ephemeral?: boolean } | undefined;
+    const opts = dataOrOptions as { readonly ephemeral?: boolean } | undefined;
     const members = await Promise.all(nameOrMessages.map((message) => this.toMember(message.name, message.data)));
     await this.connection['publish']({
       t: 'pub',
@@ -369,7 +413,6 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       name: '',
       data: null,
       messages: members,
-      ...(opts?.ttlMs === undefined ? {} : { ttlMs: opts.ttlMs }),
       ...(opts?.ephemeral === true ? { ephemeral: true } : {}),
     });
   }
@@ -385,9 +428,9 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
 
   /**
    * Flush any buffered (auto-batched) publishes now, as a single batch frame.
-   * Runs automatically once the throttle window elapses, when the buffer is
-   * full, and on detach; call it to force an immediate send. No-op when nothing
-   * is buffered.
+   * This runs automatically once the throttle window elapses, when the buffer
+   * is full, and on detach. Call it to force an immediate send. A no-op when
+   * nothing is buffered.
    */
   flush(): void {
     if (this.batchTimer !== null) {
@@ -439,8 +482,18 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Fetch recent messages for this channel, oldest-first. Does not interleave
-   * with the live subscription. Pass `start` (a message id) to page backward.
+   * Fetch recent messages for this channel, oldest first. History is a
+   * one-shot read and does not interleave with the live subscription. How far
+   * back it reaches depends on each message's retention, see the
+   * [history docs](https://foony.io/docs/history). On a channel with a
+   * `cipher`, messages are decrypted before they are returned.
+   *
+   * @param params - `limit` caps how many messages are returned. `start` (a
+   *   message id) pages backward from that message.
+   * @returns Resolves with the messages and `more`, which is true when older
+   *   messages remain (pass the oldest message's id as `start` to fetch them).
+   *   Rejects with the server's error when history cannot be read, for
+   *   example a missing history capability.
    */
   async history(params?: { readonly limit?: number; readonly start?: string }): Promise<{ readonly messages: readonly MessageFrame[]; readonly more: boolean }> {
     const response = await this.connection['requestHistory']({
@@ -461,7 +514,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
 
   /**
    * Deliver an inbound frame to subscribers. A batch frame is expanded into its
-   * member frames (in order) first; each member is then dispatched like a single
+   * member frames (in order) first. Each member is then dispatched like a single
    * message.
    */
   private deliverMessage(frame: MessageFrame): void {
@@ -495,13 +548,13 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * Track the contiguous per-channel serial and detect gaps. The fence on the server means stored
    * order equals serial order and the live tail delivers in that order, so the only way a serial
    * arrives out of sequence is real loss (a dropped message to a briefly-slow consumer). When that
-   * happens we trigger a gap-fill re-subscribe, whose ordered replay backfills the hole.
+   * happens we trigger a gap-fill fetch, whose ordered replay closes the hole.
    *
    *  - no baseline yet (cursor 0): adopt this serial as the baseline (fresh subscriber starts now).
    *  - next in sequence: advance the cursor.
-   *  - already covered (<= cursor): a replay/duplicate; ignore (dedup handles the payload).
-   *  - ahead of sequence (> cursor + 1): a gap; backfill from the cursor, leave it un-advanced so
-   *    the replay can close the hole before the cursor moves past it.
+   *  - already covered (<= cursor): a replay or duplicate, ignored (dedup handles the payload).
+   *  - ahead of sequence (> cursor + 1): a gap. Backfill from the cursor and leave it un-advanced
+   *    so the replay can close the hole before the cursor moves past it.
    */
   private recordSerial(seq: number | undefined): void {
     if (seq === undefined || seq === 0) {
@@ -518,11 +571,11 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * Heal a detected gap with a surgical fetch from the contiguous-serial cursor — NOT a
+   * Heal a detected gap with a surgical fetch from the contiguous-serial cursor, NOT a
    * re-subscribe. The server returns just the messages after the cursor, leaving the live
    * subscription, presence watcher, and retained replay untouched (a re-subscribe would tear all
    * three down for one dropped message). The returned messages are applied in order, so the cursor
-   * walks forward past the gap; dedup drops any overlap with messages already delivered live.
+   * walks forward past the gap, and dedup drops any overlap with messages already delivered live.
    * Debounced to one in-flight fetch. If the cursor has aged out of retention the server reports a
    * discontinuity (resumed=false), which we surface and re-baseline from rather than re-applying.
    */
@@ -553,7 +606,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
-   * True if this (clientId, messageId) was already delivered — drops duplicates
+   * True if this (clientId, messageId) was already delivered. Drops duplicates
    * a publisher retry can introduce once the server coalesces. Records unseen
    * keys, evicting the oldest past the cap.
    */
@@ -601,7 +654,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
    * Finalize a reconnect re-subscribe: the connection re-issued the `sub` with our resume
    * cursor and the server reported whether the gap was replayed. resumed=false is a
    * discontinuity (messages may have been missed beyond retention), which listeners can
-   * act on — e.g. reload state or read history.
+   * act on by reloading state or reading history.
    */
   private onResumed(resumed: boolean): void {
     // A discontinuity means the cursor aged out of retention, so the gap can't be filled. Drop the
@@ -646,7 +699,20 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   private transition(next: ChannelState, options?: { readonly reason?: Error; readonly resumed?: boolean }): void {
-    if (this.channelState === next) return;
+    if (this.channelState === next) {
+      // No transition, but a re-confirmation that carries information (e.g. a
+      // resume outcome while already attached) still matters to listeners:
+      // emit 'update' instead of dropping it.
+      if (options !== undefined) {
+        this.emit('update', {
+          current: next,
+          previous: next,
+          resumed: options.resumed ?? false,
+          ...(options.reason !== undefined ? { reason: options.reason } : {}),
+        });
+      }
+      return;
+    }
     const previous = this.channelState;
     this.channelState = next;
     this.emit(next, {
@@ -659,8 +725,18 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
 }
 
 /**
- * Per-channel presence facade. Wraps the `pres` frame and `presEvt`
- * listener dispatch.
+ * Presence for one channel. Announce this connection with `enter` / `update` /
+ * `leave`, and listen on who comes and goes with `on`. Reached via
+ * {@link Channel.presence | `channel.presence`}. See the
+ * [presence docs](https://foony.io/docs/presence) for the full model.
+ *
+ * @example
+ * ```ts
+ * channel.presence.on('enter', (member) => {
+ *   console.log(`${member.clientId} joined`);
+ * });
+ * await channel.presence.enter({ status: 'online' });
+ * ```
  */
 export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEventListener, PresenceEventResult> {
   private readonly connection: Connection;
@@ -677,8 +753,8 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   private watching = false;
   /**
    * What this connection has entered into the presence set, or null if not present. Kept so
-   * the SDK can re-enter automatically after a reconnect (matching Ably). `{ data }` rather
-   * than the raw value so "entered with no data" is distinct from "not entered".
+   * the SDK can re-enter automatically after a reconnect. `{ data }` rather than the raw
+   * value so "entered with no data" is distinct from "not entered".
    */
   private enteredState: { readonly data: unknown } | null = null;
 
@@ -691,10 +767,11 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   }
 
   /**
-   * Register a listener for presence events. Requests presence events on this channel
-   * from the server (an initial member snapshot, then live transitions) — independent of
-   * a message `subscribe`, so a channel used only for messages never opens a watcher.
-   * The watcher is dropped again when the last presence listener is removed.
+   * Register a listener for presence events. Adding the first listener asks
+   * the server for presence on this channel: an initial member snapshot, then
+   * live transitions. This is independent of a message `subscribe`, so a
+   * channel used only for messages never opens a presence watcher, and the
+   * watcher is dropped again when the last presence listener is removed.
    */
   override on(listener: PresenceEventListener): UnsubscribeFn;
   /** Register a listener for presence events with a matching action. */
@@ -729,34 +806,49 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
     this.ensureWatching();
   }
 
+  /** Alias of {@link Presence.on | `on(listener)`}: register a listener for every presence event. */
   subscribe(listener: PresenceEventListener): UnsubscribeFn {
     return this.on(listener);
   }
 
   /**
-   * Announce this connection as present in the channel. The membership is remembered so the
-   * SDK re-enters it automatically after a reconnect, the way Ably does.
+   * Announce this connection as present on the channel, with optional `data`
+   * (a display name, a status) shown to other members. Implicitly attaches
+   * the channel. The membership is remembered, and the SDK re-enters it
+   * automatically after a reconnect. Resolves once the server acks the entry.
+   * Rejects with the server's error when the token lacks the presence
+   * capability.
    */
   async enter(data?: unknown): Promise<void> {
     this.enteredState = { data };
     await this.send('enter', data);
   }
 
-  /** Update the data attached to this connection's presence entry. */
+  /**
+   * Replace the `data` on this connection's presence entry. Other members
+   * receive an `update` event. Resolves once the server acks the update.
+   * Rejects with the server's error when the token lacks the presence
+   * capability.
+   */
   async update(data?: unknown): Promise<void> {
     this.enteredState = { data };
     await this.send('update', data);
   }
 
-  /** Remove this connection's presence entry. Stops automatic re-entry on reconnect. */
+  /**
+   * Remove this connection's presence entry and stop the automatic re-entry
+   * on reconnect. Resolves once the server acks the leave. Rejects with the
+   * server's error when the request fails.
+   */
   async leave(): Promise<void> {
     this.enteredState = null;
     await this.send('leave', undefined);
   }
 
   /**
-   * Ask the server to start sending presence events on this channel, once. Idempotent and
-   * remembered so it is re-sent on reconnect. A terminal capability denial gives up.
+   * Ask the server to start sending presence events on this channel, once. This is
+   * idempotent and remembered so it is re-sent on reconnect. A capability denial
+   * gives up (the permission will not change on retry).
    */
   private ensureWatching(): void {
     if (this.watching) {
@@ -840,7 +932,7 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
 /**
  * Message-name event emitter for a channel. Separate from the channel's
  * own state emitter so `subscribe` (messages) and `on` (state) don't
- * collide; exposes `dispatch` so the Connection transport can deliver
+ * collide. Exposes `dispatch` so the Connection transport can deliver
  * frames into it.
  */
 class ChannelMessageEmitter extends TypedEventEmitter<string, MessageListener, MessageFrame> {
@@ -855,17 +947,18 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-/** Build a per-member message frame from a batch frame; member id is `<batchId>:<index>`. */
 /**
- * True for a server error that won't change on retry — the forbidden / capability /
- * channel-denied family (403xx). A failed attach with such an error is terminal; any
- * other failure (e.g. a dropped connection) is transient and recovers on reconnect.
+ * True for a server error that won't change on retry: the forbidden / capability /
+ * channel-denied family (403xx). A failed attach with such an error is terminal.
+ * Any other failure (e.g. a dropped connection) is transient and recovers on
+ * reconnect.
  */
 function isCapabilityError(error: unknown): boolean {
   const code = (error as { code?: number } | null)?.code;
   return typeof code === 'number' && code >= 40300 && code < 40400;
 }
 
+/** Build a per-member message frame from a batch frame. The member id is `<batchId>:<index>`. */
 function memberFrame(base: MessageFrame, member: BatchMember, index: number): MessageFrame {
   return {
     t: 'msg',
@@ -897,7 +990,7 @@ function bundledToFrame(channel: string, member: BundledMessage): MessageFrame {
   };
 }
 
-/** Expand a batch frame into its member frames; a non-batch frame is returned as a single-item array. */
+/** Expand a batch frame into its member frames. A non-batch frame is returned as a single-item array. */
 function expandBatch(frame: MessageFrame): MessageFrame[] {
   if (frame.messages !== undefined && frame.messages.length > 0) {
     return frame.messages.map((member, index) => memberFrame(frame, member, index));

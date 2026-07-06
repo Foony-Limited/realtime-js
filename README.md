@@ -1,8 +1,8 @@
 # @foony/realtime
 
 TypeScript SDK for the Foony Realtime service. A small client for the
-wire protocol implemented by `services/realtime-saas` — connect, sub /
-unsub, publish, and presence.
+wire protocol implemented by `services/realtime-saas`: connect, subscribe,
+publish, presence, and history, plus a REST client for backends.
 
 ## Install
 
@@ -28,7 +28,7 @@ const realtime = new Realtime({
 
 const channel = realtime.channels.get('chat:room-1');
 
-channel.on((message) => {
+channel.subscribe((message) => {
   console.log('chat message:', message.data);
 });
 
@@ -43,8 +43,9 @@ await channel.presence.enter({ name: 'Alice' });
 ### Node / server (browser auth)
 
 Browser clients should fetch a short-lived JWT from your backend via the SDK's `authCallback`
-option. Your backend obtains that JWT by exchanging its Realtime API key at the service's
-`POST /auth/token` endpoint — the signing key never leaves Foony's infrastructure.
+option. Your backend mints that JWT locally with `createJwt` (it signs with your Realtime API
+key, with no network call), or asks the service to mint one with `rest.auth.requestToken`.
+Either way the API key stays on your backend and never ships to browsers.
 
 ## Local development against the realtime backend
 
@@ -65,21 +66,23 @@ const realtime = new Realtime({
 });
 ```
 
-Omit `endpoint` in production to use `wss://realtime.foony.com`.
+Omit `endpoint` in production to use `wss://realtime.foony.io`.
 
 ## Channel names
 
-Channel names must match `[A-Za-z0-9._-]{1,255}` and cannot start or
-end with a `.`. Use dots to express hierarchy (`chat.rooms.42`). The
-server rejects invalid names with error code `40001` (`BadFrame`).
+Channel names are 1 to 255 ASCII characters from `A-Z a-z 0-9 : - _` and
+cannot start with a `:`. Use colons to express hierarchy (`chat:rooms:42`).
+Dots are not allowed. The server rejects invalid names with error code
+`40001` (`BadFrame`).
 
 ## API surface
 
 - `Realtime` — top-level client. Owns the WebSocket; channels attach lazily.
 - `client.channels.get(name)` — returns a stable `Channel` for that name.
-- `channel.on(fn)` — message listener; returns an unsubscribe fn.
-- `channel.on(name, fn)` — message listener for one message name.
-- `channel.publish(name, data)` — publish one message; resolves on ack.
+- `channel.subscribe(fn)` — message listener. Returns an unsubscribe fn.
+- `channel.subscribe(name, fn)` — message listener for one message name.
+- `channel.on(fn)` / `channel.on('attached', fn)` — channel lifecycle state listener.
+- `channel.publish(name, data)` — publish one message. Resolves on ack.
 - `channel.presence.on(fn)` — presence listener.
 - `channel.presence.enter|update|leave(data?)` — mutate this connection's membership.
 - `client.connection.on(fn)` — observe all connection events.
@@ -133,16 +136,17 @@ encryption. Errors reject with `RestError`, which carries the numeric protocol
 ## Reconnect
 
 When the connection drops unexpectedly the client retries with
-exponential backoff (1s, 2s, 4s, ..., capped at 30s). All
-subscriptions that were established before the disconnect are
-re-issued automatically; presence membership is NOT automatically
-restored — call `enter()` again on the `disconnected -> connected`
-transition if you need it.
+exponential backoff (1s, 2s, 4s, ..., capped at 30s). Everything is
+restored automatically on reconnect: subscriptions are re-issued (with a
+resume cursor, so missed messages within retention are replayed), presence
+watchers are re-opened, and whatever presence membership this connection
+had entered is re-entered. Call `presence.leave()` if you no longer want
+to be present.
 
 Pass `autoReconnect: false` to disable retries entirely (useful in tests).
 
 Publishes made while the connection is establishing or temporarily down are
-queued locally and flushed on the next successful (re)connect — so a publish
+queued locally and flushed on the next successful (re)connect, so a publish
 during a brief blip resolves rather than rejects. A publish that was already in
 flight when the connection dropped is resent on reconnect too. Every publish
 carries a stable client-assigned id, so the server collapses any duplicate that

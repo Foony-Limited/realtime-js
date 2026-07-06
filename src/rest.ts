@@ -1,5 +1,5 @@
 /**
- * REST client for Foony Realtime — request/response access to the same
+ * REST client for Foony Realtime: request/response access to the same
  * service the WebSocket `Realtime` client talks to. Use it from backends and
  * integrations that publish or read without holding a connection open (cron
  * jobs, serverless functions, webhooks): `new Rest({ key })`, then
@@ -22,11 +22,15 @@ export type RestOptions = {
   /**
    * Service host or absolute http(s) URL. Defaults to `realtime.foony.io`,
    * which resolves to `https://realtime.foony.io`.
+   *
+   * @defaultValue `'realtime.foony.io'`
    */
   readonly endpoint?: string;
   /**
    * A Realtime API key in `appSlug.publicKeyId:privateKey` form. This is the
-   * preferred (and simplest) auth method for server-side callers.
+   * preferred (and simplest) auth method for server-side callers. The key is
+   * a long-lived secret, so keep it server-side and never ship it in browser
+   * code.
    */
   readonly key?: string;
   /**
@@ -53,7 +57,11 @@ export type RestOptions = {
 
 /** Per-channel options passed to `rest.channels.get(name, options)`. */
 export type RestChannelOptions = {
-  /** Enable end-to-end payload encryption on this channel. */
+  /**
+   * Enable end-to-end payload encryption on this channel with the given {@link CipherParams}.
+   * This prevents the Foony backend from seeing the plaintext `data` of messages published to this channel.
+   * The `cipher` key should be kept private and never shared with the public or our backend.
+   */
   readonly cipher?: CipherParams;
 };
 
@@ -69,7 +77,10 @@ export type RestPublishMessage = {
    * applies automatically) and anything else is rejected.
    */
   readonly clientId?: string;
-  /** Resend-stable idempotency id (single-message publishes only). */
+  /**
+   * Stable id reused across resends so the server can drop duplicates of the
+   * same publish. Single-message publishes only.
+   */
   readonly id?: string;
   /** Fire-and-forget: delivered live but excluded from history and resume. */
   readonly ephemeral?: boolean;
@@ -77,15 +88,15 @@ export type RestPublishMessage = {
 
 /** Result of a successful publish. */
 export type PublishResult = {
-  /** Server-assigned (or echoed) message id; an array publish shares one id. */
+  /** Server-assigned (or echoed) message id. An array publish shares one id. */
   readonly messageId: string;
-  /** Contiguous per-channel serial for durable publishes; absent for ephemeral ones. */
+  /** Contiguous per-channel serial for durable publishes. Absent for ephemeral ones. */
   readonly serial?: number;
 };
 
 /** One message returned from {@link RestChannel.history}. */
 export type RestMessage = {
-  /** Message id; batch members share their batch's id. */
+  /** Message id. Batch members share their batch's id. */
   readonly id: string;
   /** Application-level event name. */
   readonly name?: string;
@@ -119,11 +130,19 @@ export type PresenceMember = {
 
 /** Query params for {@link RestChannel.history}. */
 export type RestHistoryParams = {
-  /** Page size, default 100. */
+  /**
+   * Page size. The default is 100.
+   *
+   * @defaultValue 100
+   */
   readonly limit?: number;
   /** Exclusive message-id cursor: return messages published strictly before it. */
   readonly start?: string;
-  /** `'backwards'` (newest first, the default) or `'forwards'` (oldest first). */
+  /**
+   * `'backwards'` (newest first, the default) or `'forwards'` (oldest first).
+   *
+   * @defaultValue `'backwards'`
+   */
   readonly direction?: 'backwards' | 'forwards';
 };
 
@@ -141,9 +160,18 @@ export type RestPresenceParams = {
 export type TokenParams = {
   /** The clientId the token authenticates as. Required. */
   readonly clientId: string;
-  /** Token lifetime in ms. Defaults to one hour, capped at 24 hours. */
+  /**
+   * Token lifetime in ms. Defaults to one hour, and the service caps it at
+   * 24 hours.
+   *
+   * @defaultValue 3600000
+   */
   readonly ttl?: number;
-  /** Capability to grant; must be a subset of the key's. Defaults to the key's own. */
+  /**
+   * Capability to grant. It must be a subset of the key's own capability.
+   *
+   * @defaultValue The key's own capability.
+   */
   readonly capability?: Capability | string;
 };
 
@@ -179,11 +207,12 @@ export class RestError extends Error {
 }
 
 /**
- * One page of a paginated response. `items` is the current page; `next()`
+ * One page of a paginated response. `items` is the current page, and `next()`
  * fetches the following page (older messages for a newest-first history) or
  * resolves null on the last page.
  */
 export class PaginatedResult<T> {
+  /** The items on this page. */
   readonly items: readonly T[];
   private readonly nextPath: string | null;
   private readonly load: (path: string) => Promise<PaginatedResult<T>>;
@@ -204,7 +233,10 @@ export class PaginatedResult<T> {
     return this.nextPath === null;
   }
 
-  /** Fetch the next page, or resolve null when this is the last one. */
+  /**
+   * Fetch the next page. Resolves with the page, or with null when this is
+   * the last one. Rejects with {@link RestError} when the fetch fails.
+   */
   async next(): Promise<PaginatedResult<T> | null> {
     if (this.nextPath === null) {
       return null;
@@ -215,7 +247,18 @@ export class PaginatedResult<T> {
 
 /**
  * REST client. Construct with an API key (or a token/authCallback) and use
- * `channels.get(name)` for publish, history, and presence reads.
+ * `channels.get(name)` for publish, history, and presence reads. Use the
+ * WebSocket `Realtime` client instead when you need to receive live messages.
+ *
+ * @example
+ * ```ts
+ * // Server-side: an API key is the simplest auth method here.
+ * const rest = new Rest({ key: process.env.REALTIME_API_KEY });
+ * const channel = rest.channels.get('chat:room-1');
+ * await channel.publish('greeting', { text: 'hi' });
+ * const history = await channel.history({ limit: 10 });
+ * console.log(history.items);
+ * ```
  */
 export class Rest {
   /** Token minting against the service, authenticated by this client's key. */
@@ -229,8 +272,8 @@ export class Rest {
   /** Map-like accessor for channels. Stable instance per name. */
   readonly channels = {
     /**
-     * Gets a channel by `name` (or creates it). `options` (e.g. `cipher`)
-     * apply when the channel is first created.
+     * Get the {@link RestChannel} named `name`, creating it on first use.
+     * `options` (e.g. `cipher`) apply when the channel is first created.
      */
     get: (name: string, options?: RestChannelOptions): RestChannel => {
       let existing = this.channelsByName.get(name);
@@ -240,7 +283,7 @@ export class Rest {
       }
       return existing;
     },
-    /** Removes the channel instance for `name`. A no-op when it doesn't exist. */
+    /** Remove the channel instance for `name`. A no-op when it doesn't exist. */
     release: (name: string): void => {
       this.channelsByName.delete(name);
     },
@@ -255,7 +298,11 @@ export class Rest {
     this.auth = new RestAuth(this);
   }
 
-  /** Current service time, ms since epoch. Useful for measuring clock skew. */
+  /**
+   * Fetch the current service time, in ms since the Unix epoch. Useful for
+   * measuring clock skew. Rejects with {@link RestError} when the request
+   * fails.
+   */
   async time(): Promise<number> {
     const body = (await this.request('GET', '/time', undefined, { auth: false })) as { json: unknown };
     const times = body.json as number[];
@@ -331,9 +378,10 @@ export class Rest {
 
 /**
  * A channel handle for REST operations: publish, history, and presence.
- * Obtained from `rest.channels.get(name)`; holds no server-side state.
+ * Obtained from `rest.channels.get(name)`. It holds no server-side state.
  */
 export class RestChannel {
+  /** The channel name this instance is bound to. */
   readonly name: string;
   /** Presence reads for this channel. */
   readonly presence: RestPresence;
@@ -348,12 +396,16 @@ export class RestChannel {
   }
 
   /**
-   * Publish to the channel: an event name plus payload, one message object,
-   * or an array of messages (stored and delivered as one atomic batch).
-   * Resolves once the service has accepted the message durably.
+   * Publish one message from an event name plus payload. On a channel with a
+   * `cipher`, the payload is end-to-end encrypted before it is sent.
+   * Resolves with the {@link PublishResult} once the service has accepted
+   * the message durably. Rejects with {@link RestError} when the request
+   * fails, for example a key without the publish capability.
    */
   async publish(name: string, data: unknown): Promise<PublishResult>;
+  /** Publish one {@link RestPublishMessage}, which can also set `clientId`, `id`, or `ephemeral`. */
   async publish(message: RestPublishMessage): Promise<PublishResult>;
+  /** Publish an array of messages, stored and delivered as one atomic batch under one id. */
   async publish(messages: readonly RestPublishMessage[]): Promise<PublishResult>;
   async publish(
     first: string | RestPublishMessage | readonly RestPublishMessage[],
@@ -368,9 +420,14 @@ export class RestChannel {
   }
 
   /**
-   * Read the channel's message history, newest-first by default. Batch
+   * Read the channel's message history, newest first by default. Batch
    * publishes come back as one item per message, sharing the batch's id and
-   * serial. Page through older messages with `result.next()`.
+   * serial. On a channel with a `cipher`, messages are decrypted before they
+   * are returned. How far back history reaches depends on each message's
+   * retention, see the [history docs](https://foony.io/docs/history).
+   * Resolves with one page. Page through older messages with
+   * `result.next()`. Rejects with {@link RestError} when history cannot be
+   * read.
    */
   async history(params?: RestHistoryParams): Promise<PaginatedResult<RestMessage>> {
     const query = new URLSearchParams();
@@ -429,8 +486,10 @@ export class RestPresence {
   }
 
   /**
-   * The channel's current members. The snapshot is complete (presence sets
-   * are bounded), so the result is a single page.
+   * Fetch the channel's current members. The snapshot is complete (presence
+   * sets are bounded), so the result is a single page. Resolves with the
+   * members, decrypting their `data` when the channel has a `cipher`.
+   * Rejects with {@link RestError} when the request fails.
    */
   async get(params?: RestPresenceParams): Promise<PaginatedResult<PresenceMember>> {
     const query = new URLSearchParams();
@@ -468,8 +527,12 @@ export class RestAuth {
 
   /**
    * Ask the service to mint a client JWT from this client's API key. The
-   * granted capability must be a subset of the key's; the returned details
-   * carry the expiry so callers can cache the token.
+   * granted capability must be a subset of the key's own. Resolves with the
+   * {@link TokenDetails}, whose `expires` lets callers cache the token.
+   * Throws when this client has no `key`, and rejects with {@link RestError}
+   * when the service refuses, for example a capability outside the key's
+   * grant. See the [auth docs](https://foony.io/docs/auth) for the full
+   * token flow.
    */
   async requestToken(params: TokenParams): Promise<TokenDetails> {
     const key = this.rest.key;

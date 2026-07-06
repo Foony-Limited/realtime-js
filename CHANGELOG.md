@@ -3,6 +3,23 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.14.0
+
+### Removed
+
+- **The `ttlMs` publish option is gone** (`channel.publish(name, data, { ttlMs })`,
+  `PublishFrame.ttlMs`): the service no longer honors per-message TTLs, retention
+  comes from the channel's namespace rule. `ephemeral: true` still works, and
+  publishes that passed `ttlMs` now join auto-batching instead of being sent alone.
+  The token-lifetime `ttlMs` on `createJwt` is unchanged.
+
+### Fixed
+
+- **The `update` channel event fires now.** A discontinuity found while the channel
+  stayed attached previously emitted nothing, so listeners never learned messages
+  were lost. Check `resumed` on the payload and reload state or read history when
+  it is `false`.
+
 ## 0.13.0
 
 ### Added

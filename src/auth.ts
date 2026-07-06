@@ -1,18 +1,19 @@
 /**
  * Token minting for trusted callers that hold a Realtime API key.
  *
- * `createJwt` signs a compact HS256 token locally with the key's secret — no
- * network round-trip. A trusted backend mints a
- * short-lived, capability-scoped token for a less-trusted browser client, which
- * returns it from its `authCallback`; the edge verifies the signature against
- * the same key secret on the WebSocket handshake. The key secret never leaves
- * the backend, and the token carries no secret material.
+ * `createJwt` signs a compact HS256 token locally with the key's secret, with
+ * no network round-trip. A trusted backend mints a short-lived,
+ * capability-scoped token for a less-trusted browser client, which returns it
+ * from its `authCallback`. The edge verifies the signature against the same
+ * key secret on the WebSocket handshake. The key secret never leaves the
+ * backend, and the token carries no secret material. See the
+ * [auth docs](https://foony.io/docs/auth) for the full flow.
  *
  * Signing uses `globalThis.crypto.subtle` (browsers and Node 20+), so this
  * module is isomorphic and pulls in no Node-only crypto.
  */
 
-/** Capability map: channel pattern → allowed operations. */
+/** Capability map from channel pattern to allowed operations (e.g. `{ 'chat:site:*': ['subscribe', 'publish'] }`). */
 export type Capability = Record<string, readonly string[]>;
 
 /** Inputs describing the token to mint. */
@@ -23,9 +24,14 @@ export type CreateJwtParams = {
    * the signing key's own capability or the edge rejects it on connect.
    */
   readonly capability: Capability | string;
-  /** Identifier for the end user the token represents; echoed back as `clientId`. */
+  /** Identifier for the end user the token represents. Echoed back as `clientId`. */
   readonly clientId: string;
-  /** Token lifetime in milliseconds. Defaults to one hour. */
+  /**
+   * Token lifetime in milliseconds. Defaults to one hour, short enough to
+   * bound a leaked token.
+   *
+   * @defaultValue 3600000
+   */
   readonly ttlMs?: number;
 };
 
@@ -33,8 +39,8 @@ export type CreateJwtParams = {
 export type CreateJwtOptions = {
   /**
    * The API key (`appSlug.publicKeyId:privateKey`) to sign with. Optional on
-   * {@link Auth.createJwt} (defaults to the client's configured key); required
-   * for the standalone {@link createJwt}.
+   * {@link Auth.createJwt}, which defaults to the client's configured key.
+   * Required for the standalone {@link createJwt}.
    */
   readonly key?: string;
 };
@@ -43,10 +49,21 @@ export type CreateJwtOptions = {
 const DEFAULT_JWT_TTL_MS = 60 * 60 * 1_000;
 
 /**
- * Sign a JWT locally with `options.key`. The token's `kid` header is the
- * public key name (`appSlug.publicKeyId`) so the edge can look up the secret to
- * verify it; the payload carries only the subject, capability, and expiry — no
- * secret. Returns the compact `header.payload.signature` string.
+ * Sign a JWT locally with `options.key`, with no network call. The token's
+ * `kid` header is the public key name (`appSlug.publicKeyId`) so the edge can
+ * look up the secret to verify it. The payload carries only the subject,
+ * capability, and expiry, and no secret. Resolves with the compact
+ * `header.payload.signature` string. Throws when the key is missing or
+ * malformed, or when `ttlMs` is not positive.
+ *
+ * @example
+ * ```ts
+ * // In your token endpoint. The key stays server-side.
+ * const token = await createJwt(
+ *   { clientId: userId, capability: { [`chat:${userId}:*`]: ['subscribe', 'publish'] } },
+ *   { key: process.env.FOONY_API_KEY! },
+ * );
+ * ```
  */
 export async function createJwt(params: CreateJwtParams, options: CreateJwtOptions): Promise<string> {
   if (!options.key) {
@@ -81,7 +98,8 @@ export class Auth {
 
   /**
    * Mint a short-lived JWT scoped to `params.capability`, signed with the
-   * client's API key (override with `options.key`). Local — no network call.
+   * client's API key (override with `options.key`). This is local, with no
+   * network call. Throws when neither the client nor `options` provides a key.
    */
   async createJwt(params: CreateJwtParams, options?: CreateJwtOptions): Promise<string> {
     const key = options?.key ?? this.resolveKey();

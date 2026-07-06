@@ -3,11 +3,11 @@
  * frame shapes; on the wire every frame travels in the binary opcode format (binary.ts),
  * with `t` as the local discriminator the codec maps to and from opcodes.
  *
- * Mirrors `services/realtime-saas/internal/wire/wire.go` exactly — any
+ * Mirrors `services/realtime-saas/internal/wire/wire.go` exactly. Any
  * change here MUST be mirrored on the Go side and vice versa. The Go file is
- * the canonical source. The two tables that have drifted before, so watch
- * them: the `FrameType` discriminator list (Go `Frame*` consts) and the
- * `ErrorCode` table (Go `Code*` consts) — both must stay one-for-one.
+ * the canonical source. Two tables have drifted before, so watch them: the
+ * `FrameType` discriminator list (Go `Frame*` consts) and the `ErrorCode`
+ * table (Go `Code*` consts). Both must stay one-for-one.
  *
  * Conventions:
  *  - Client-originated frames carry a numeric `id`; the server echoes it
@@ -17,7 +17,7 @@
 
 /**
  * Discriminator values for the `t` field. Must list every `Frame*` const in
- * the Go `FrameType` tables (`internal/wire/wire.go`) — see the sync note in
+ * the Go `FrameType` tables (`internal/wire/wire.go`). See the sync note in
  * this file's header.
  */
 export type FrameType =
@@ -56,7 +56,7 @@ export type BatchMember = {
   readonly name: string;
   /** Arbitrary JSON-serializable payload. */
   readonly data: unknown;
-  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`). Absent for plain JSON. */
   readonly encoding?: string;
 };
 
@@ -66,9 +66,9 @@ export type BatchMember = {
 export type AuthFrame = {
   /** Frame discriminator: authentication handshake. */
   readonly t: 'auth';
-  /** JWT minted by your server for token auth; mutually exclusive with `key`. */
+  /** JWT minted by your server for token auth. Mutually exclusive with `key`. */
   readonly token?: string;
-  /** API key for direct key auth from trusted servers; mutually exclusive with `token`. */
+  /** API key for direct key auth from trusted servers. Mutually exclusive with `token`. */
   readonly key?: string;
   /** Stable identifier for this client, surfaced to others in presence. */
   readonly clientId?: string;
@@ -107,8 +107,8 @@ export type UnsubscribeFrame = {
 };
 
 /**
- * Publish a message to `channel`. Single by default (`name` + `data`); set
- * `messages` to publish a batch — many messages under one `messageId`, stored
+ * Publish a message to `channel`. Single by default (`name` + `data`). Set
+ * `messages` to publish a batch: many messages under one `messageId`, stored
  * and deduped by the server as one durable message. When `messages` is present,
  * `name`/`data` are ignored.
  */
@@ -136,15 +136,9 @@ export type PublishFrame = {
    */
   readonly messageId: string;
   /**
-   * Requested retention for this message, in milliseconds. The server clamps it
-   * to your plan's ceiling; omit it for the short default (ephemeral). Set a
-   * larger value to opt into durable history.
-   */
-  readonly ttlMs?: number;
-  /**
    * How `data` is encoded, e.g. `cipher+aes-256-gcm/base64` for an encrypted
-   * payload. Opaque to the server, which stores and forwards it verbatim; only
-   * SDKs interpret it. Absent means `data` is the plain JSON value.
+   * payload. Opaque to the server, which stores and forwards it verbatim, and
+   * only SDKs interpret it. Absent means `data` is the plain JSON value.
    */
   readonly encoding?: string;
   /** Client request id echoed back on the matching `ack` / `err` frame. */
@@ -161,7 +155,7 @@ export type PresenceFrame = {
   readonly action: PresenceAction;
   /** Optional presence payload attached to an enter or update. */
   readonly data?: unknown;
-  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`). Absent for plain JSON. */
   readonly encoding?: string;
   /** Client request id echoed back on the matching `ack` / `err` frame. */
   readonly id: number;
@@ -225,7 +219,7 @@ export type FetchFrame = {
 
 /** Application-level liveness probe. Server replies with `pong`. */
 export type PingFrame = {
-  /** Frame discriminator: liveness probe; server replies with `pong`. */
+  /** Frame discriminator: liveness probe. The server replies with `pong`. */
   readonly t: 'ping';
 };
 
@@ -275,11 +269,11 @@ export type MessageFrame = {
   readonly data: unknown;
   /** Server publish time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
-  /** Unique, ordered message id usable as a history resume cursor. */
+  /** Unique, ordered message id. Pass it as history's `start` to page backward from this message. */
   readonly messageId: string;
   /** Client id of the publisher, when known. */
   readonly clientId?: string;
-  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`). Absent for plain JSON. */
   readonly encoding?: string;
   /**
    * Contiguous per-channel serial (0/absent for ephemeral/retained/unsequenced messages). The
@@ -295,7 +289,7 @@ export type MessageFrame = {
    * Server-coalesced bundle: several independent publishes the edge packed into
    * one stream record. Each member is a full message with its own server-stamped
    * `clientId` + `messageId` (and may itself be a client batch). When set,
-   * `name`/`data`/`messages` are ignored — the SDK unwraps the members and dedups
+   * `name`/`data`/`messages` are ignored. The SDK unwraps the members and dedups
    * by (clientId, messageId).
    */
   readonly bundle?: readonly BundledMessage[];
@@ -308,16 +302,23 @@ export type MessageFrame = {
  * client batch.
  */
 export type BundledMessage = {
+  /** Application-level event name the message was published under. */
   readonly name: string;
+  /** Message payload as published. */
   readonly data: unknown;
+  /** Server publish time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
+  /** This member's own message id. Pass it as history's `start` to page backward from this message. */
   readonly messageId: string;
+  /** Client id of the publisher, when known. */
   readonly clientId?: string;
+  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`). Absent for plain JSON. */
   readonly encoding?: string;
   /** This member's contiguous per-channel serial (see {@link MessageFrame.seq}). */
   readonly seq?: number;
   /** Fire-and-forget message: not stored in history and not replayed on resume. */
   readonly ephemeral?: boolean;
+  /** Batch members, set when this member was itself a client batch. */
   readonly messages?: readonly BatchMember[];
 };
 
@@ -335,7 +336,7 @@ export type PresenceEventFrame = {
   readonly connectionId: string;
   /** Presence payload supplied on enter/update, if any. */
   readonly data?: unknown;
-  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`); absent for plain JSON. */
+  /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`). Absent for plain JSON. */
   readonly encoding?: string;
   /** Transition time in milliseconds since the Unix epoch. */
   readonly timestamp: number;
@@ -417,15 +418,15 @@ export type ServerFrame =
 
 /**
  * Error codes the server uses on `err` frames. Mirrors the `Code*` constant
- * table in the Go `internal/wire/wire.go` (the canonical source) one-for-one —
- * see the sync note in this file's header. Keep the order and values identical.
+ * table in the Go `internal/wire/wire.go` (the canonical source) one-for-one.
+ * See the sync note in this file's header. Keep the order and values identical.
  */
 export const ErrorCode = {
   /** Malformed or unparseable frame. */
   BadFrame: 40001,
   /** Authentication failed (bad token or key). */
   BadAuth: 40101,
-  /** Previously valid auth has expired; re-authenticate. */
+  /** Previously valid auth has expired. Re-authenticate. */
   AuthExpired: 40102,
   /** Authenticated but not permitted for this channel or action. */
   Forbidden: 40300,
@@ -435,11 +436,11 @@ export const ErrorCode = {
   ChannelDenied: 40302,
   /** Referenced resource (e.g. channel) does not exist. */
   NotFound: 40400,
-  /** Too many requests; the publish or connection rate limit was exceeded. */
+  /** Too many requests. The publish or connection rate limit was exceeded. */
   RateLimited: 42900,
   /** Unexpected server-side error. */
   Server: 50000,
-  /** The edge could not bootstrap its NATS streams/buckets; retry later. */
+  /** The edge could not bootstrap its NATS streams/buckets. Retry later. */
   Bootstrap: 50001,
 } as const;
 

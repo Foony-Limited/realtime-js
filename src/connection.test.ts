@@ -40,7 +40,7 @@ type Harness = {
   readonly sockets: NodeWebSocket[];
   readonly authFrames: AuthFrame[];
   /** Every publish frame the edge received (across reconnects), in order. */
-  readonly publishFrames: { messageId?: string; name: string; ttlMs?: number; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
+  readonly publishFrames: { messageId?: string; name: string; data?: unknown; encoding?: string; channel?: string; messages?: readonly { name: string; data: unknown; encoding?: string }[] }[];
   /** Every sub frame the edge received, tagged with the connection index it arrived on. */
   readonly subFrames: { channel: string; conn: number; lastSerial?: number }[];
   /** Every presence subscribe/unsubscribe frame the edge received, tagged with connection index. */
@@ -120,7 +120,7 @@ async function startFakeEdge(): Promise<Harness> {
         }
       }
       if (frame.t === 'pub') {
-        publishFrames.push({ messageId: frame.messageId, name: frame.name, ttlMs: frame.ttlMs, data: frame.data, encoding: frame.encoding, channel: frame.channel, messages: frame.messages });
+        publishFrames.push({ messageId: frame.messageId, name: frame.name, data: frame.data, encoding: frame.encoding, channel: frame.channel, messages: frame.messages });
         if (control.dropNextPublish) {
           control.dropNextPublish = false;
           // Simulate the socket dying in the gap between receiving the publish and
@@ -306,26 +306,6 @@ describe('Connection end-to-end (fake edge)', () => {
 
     await waitFor(() => seen.length >= 1, 'decrypted presence event');
     expect(seen[0]).toEqual({ name: 'alice' });
-    await realtime.close();
-  });
-
-  it('sends ttlMs on publish when requested, and omits it otherwise', async () => {
-    const realtime = new Realtime({
-      endpoint: harness.endpoint,
-      token: 'GOOD',
-      autoReconnect: false,
-      webSocket: NodeWebSocket as unknown as typeof WebSocket,
-    });
-    await realtime.connect();
-
-    const channel = realtime.channels.get('chat:1');
-    await channel.publish('chat.message', { text: 'persist me' }, { ttlMs: 31_536_000_000 });
-    await channel.publish('chat.typing', { state: 'started' });
-
-    await waitFor(() => harness.publishFrames.length === 2, 'two publishes received');
-    const [persisted, ephemeral] = harness.publishFrames;
-    expect(persisted?.ttlMs).toBe(31_536_000_000);
-    expect(ephemeral?.ttlMs).toBeUndefined();
     await realtime.close();
   });
 
@@ -695,6 +675,38 @@ describe('Connection end-to-end (fake edge)', () => {
     // 5 (delivered live) and 4 (backfilled) are both present; dedup keeps each once.
     expect(received.filter((n) => n === 4)).toHaveLength(1);
     expect(received).toContain(5);
+    await realtime.close();
+  });
+
+  it("emits 'update' with resumed=false when a gap-fill finds the cursor aged out", async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    // The cursor has aged out of retention: the edge cannot replay the gap.
+    harness.control.fetchReply = () => ({ messages: [], resumed: false });
+
+    const channel = realtime.channels.get('chat:aged');
+    channel.subscribe(() => {});
+    const updates: { current: string; previous: string; resumed: boolean }[] = [];
+    channel.on('update', (change) => updates.push({ current: change.current, previous: change.previous, resumed: change.resumed }));
+    await channel.attach();
+    await waitFor(() => harness.sockets.length > 0, 'edge socket');
+    const edge = harness.sockets[0]!;
+
+    // Serials 1,2 establish the cursor; serial 9 is a gap that triggers the fetch.
+    for (const serial of [1, 2, 9]) {
+      sendFrame(edge, { t: 'msg', channel: 'chat:aged', name: 'm', data: { n: serial }, messageId: `a-${serial}`, seq: serial, timestamp: serial, clientId: 'alice' });
+    }
+
+    // The discontinuity must surface as an 'update' (the channel never left 'attached').
+    await waitFor(() => updates.length === 1, "'update' event for the discontinuity");
+    expect(updates[0]).toEqual({ current: 'attached', previous: 'attached', resumed: false });
+    expect(channel.state).toBe('attached');
     await realtime.close();
   });
 

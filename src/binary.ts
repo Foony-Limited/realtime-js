@@ -348,7 +348,10 @@ export function encodeBinaryPublish(frame: PublishFrame): Uint8Array {
   pushJson(out, frame.data);
   pushString(out, frame.encoding ?? '');
   pushString(out, frame.messageId);
-  pushUvarint(out, frame.ttlMs ?? 0);
+  // Reserved slot: was the per-message ttlMs, which the retention-tier rework made
+  // dead (the edge ignores it). Kept as a zero so the frame layout stays compatible.
+  // Remove the slot in the next wire format version.
+  pushUvarint(out, 0);
   const members = frame.messages ?? [];
   pushUvarint(out, members.length);
   for (const member of members) {
@@ -604,7 +607,10 @@ function decodePublish(reader: Reader): PublishFrame {
   const data = reader.json();
   const encoding = reader.str();
   const messageId = reader.str();
-  const ttlMs = reader.uvarint();
+  // Reserved slot: was the per-message ttlMs, dead since the retention-tier rework.
+  // Read and discarded for frame-layout compatibility. Remove the slot in the next
+  // wire format version.
+  reader.uvarint();
   const memberCount = reader.uvarint();
   const messages: BatchMember[] = [];
   for (let index = 0; index < memberCount; index++) {
@@ -615,7 +621,7 @@ function decodePublish(reader: Reader): PublishFrame {
   }
   return {
     t: 'pub', channel, name, data, id, messageId,
-    ...(encoding ? { encoding } : {}), ...(ttlMs ? { ttlMs } : {}),
+    ...(encoding ? { encoding } : {}),
     ...(flags & FLAG_EPHEMERAL ? { ephemeral: true } : {}), ...(messages.length ? { messages } : {}),
   };
 }

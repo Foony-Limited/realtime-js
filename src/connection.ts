@@ -2,7 +2,7 @@
  * Low-level WebSocket connection manager. Handles framing, request /
  * response correlation, and dispatch to per-channel listeners.
  *
- * The class is intentionally protocol-aware but channel-agnostic — the
+ * The class is intentionally protocol-aware but channel-agnostic. The
  * Channel and Realtime classes layer the public API on top.
  */
 
@@ -173,7 +173,7 @@ export class TypedEventEmitter<EventType extends PropertyKey, CallbackType exten
 
 /**
  * Frames the SDK can issue with `request()`. Each carries an `id` the
- * server echoes on the matching ack/err frame; Connection assigns the
+ * server echoes on the matching ack/err frame. Connection assigns the
  * id so callers can omit it.
  */
 export type AckableFrame =
@@ -184,56 +184,81 @@ export type AckableFrame =
   | Omit<PresenceSubscribeFrame, 'id'>
   | Omit<PresenceUnsubscribeFrame, 'id'>;
 
-/** Options that control how Connection reaches the edge. */
+/**
+ * Options that control how Connection reaches the edge. Exactly one of `key`,
+ * `token`, or `authCallback` must be set. The constructor throws otherwise.
+ */
 export type ConnectionOptions = {
   /**
    * Realtime edge host or absolute ws(s) URL. Defaults to
    * `realtime.foony.io`, which resolves to `wss://realtime.foony.io`.
+   *
+   * @defaultValue `'realtime.foony.io'`
    */
   readonly endpoint?: string;
   /**
-   * A Realtime API key in `appSlug.publicKeyId:privateKey` form. Convenient for trusted
-   * quick starts and server-side scripts; browser apps should prefer JWTs
-   * returned from `authCallback`.
+   * A Realtime API key in `appSlug.publicKeyId:privateKey` form. The key is a
+   * long-lived secret, so use it only in server-side code and trusted quick
+   * starts. Never ship it in browser code: browser apps should use
+   * short-lived JWTs from `authCallback`.
    */
   readonly key?: string;
-  /** Optional client id to attach to a direct key-auth connection. */
+  /**
+   * Client id to attach when authenticating with `key`. With token auth the
+   * client id comes from the JWT's subject instead, and this option is not
+   * sent.
+   */
   readonly clientId?: string;
   /**
    * A static JWT to send in the auth handshake. Mutually exclusive with
-   * `authCallback`. Useful for local dev and short scripts.
+   * `authCallback`. Useful for local dev and short scripts. A static token is
+   * never renewed: once it expires, the connection ends in the terminal
+   * `failed` state, so use `authCallback` for anything long-running.
    */
   readonly token?: string;
   /**
    * Async callback that returns a fresh JWT. Called once on connect and
-   * again on every reconnect. Use this when the token is short-lived
-   * (the production path).
+   * again on every reconnect. This is the recommended auth method for
+   * browsers and anything long-running, because the SDK can renew the token
+   * whenever it needs one. See the [auth docs](https://foony.io/docs/auth).
    */
   readonly authCallback?: () => Promise<string> | string;
   /**
-   * Override the WebSocket constructor. Mostly useful in tests; defaults
+   * Override the WebSocket constructor. Mostly useful in tests. Defaults
    * to `globalThis.WebSocket` (browsers and Node 22+), falling back to
    * the `ws` package on older Node runtimes.
    */
   readonly webSocket?: typeof WebSocket;
   /**
-   * If true, attempt to reconnect after unexpected disconnects with
-   * exponential backoff. Defaults to true. An auth error that cannot be
-   * recovered (a bad/expired static `token` or `key` with no `authCallback` to
-   * re-mint) still ends in the terminal `failed` state rather than retrying.
+   * If true (the default), the SDK reconnects after unexpected disconnects
+   * with exponential backoff. If false, a dropped connection stays down until
+   * you call `connect()` again. An auth error that cannot be recovered (a bad
+   * or expired static `token`, or a bad `key`, with no `authCallback` to
+   * re-mint a credential) still ends in the terminal `failed` state rather
+   * than retrying.
+   *
+   * @defaultValue `true`
    */
   readonly autoReconnect?: boolean;
   /**
-   * Initial backoff for reconnects (default 1000ms). Doubles each
-   * attempt up to maxReconnectDelayMs.
+   * Initial backoff for reconnects, in ms. The delay doubles each attempt up
+   * to `maxReconnectDelayMs`. The default is 1000.
+   *
+   * @defaultValue 1000
    */
   readonly initialReconnectDelayMs?: number;
-  /** Cap on the reconnect backoff (default 30000ms). */
+  /**
+   * Cap on the reconnect backoff, in ms. The default is 30000.
+   *
+   * @defaultValue 30000
+   */
   readonly maxReconnectDelayMs?: number;
   /**
    * If true (the default), publishes made while the connection is establishing or
    * temporarily down are queued locally and flushed on (re)connect. If false,
    * publishing while not connected rejects immediately.
+   *
+   * @defaultValue `true`
    */
   readonly queueMessages?: boolean;
 };
@@ -243,12 +268,38 @@ export const DEFAULT_REALTIME_ENDPOINT = 'realtime.foony.io';
 
 /** Connection lifecycle states. */
 export type ConnectionState =
+  /** Created locally. No connect has been attempted yet. */
   | 'initialized'
+  /**
+   * The WebSocket is opening and the auth handshake is in flight. Publishes
+   * made now are queued when `queueMessages` is on (the default).
+   */
   | 'connecting'
+  /**
+   * Connected and authenticated. Messages flow, and `getConnectionId()` and
+   * `getClientId()` are populated.
+   */
   | 'connected'
+  /**
+   * The connection dropped unexpectedly. The state change's `reason` says
+   * why. With `autoReconnect` on (the default), the SDK retries with
+   * exponential backoff, starting at `initialReconnectDelayMs` (1 second)
+   * and doubling up to `maxReconnectDelayMs` (30 seconds). You can keep
+   * publishing: with `queueMessages` on, publishes queue locally and are
+   * sent on reconnect, and channels re-attach and replay the messages they
+   * missed (within retention).
+   */
   | 'disconnected'
+  /** `close()` was called and the socket is shutting down. */
   | 'closing'
+  /** Closed by `close()`. Publishes that were awaiting an ack have been rejected. */
   | 'closed'
+  /**
+   * A failure the SDK will not retry on its own, for example a bad or
+   * expired credential with no `authCallback` to re-mint one. The state
+   * change's `reason` carries the error. An explicit `connect()` starts a
+   * fresh attempt.
+   */
   | 'failed';
 
 /** Connection event names are the same lifecycle states exposed by the SDK. */
@@ -259,7 +310,9 @@ export type ConnectionEventListener = (state: ConnectionState, reason?: Error) =
 
 /** Result returned by promise-based `connection.once(event)`. */
 export type ConnectionEventResult = {
+  /** State the connection is now in. */
   readonly state: ConnectionState;
+  /** Error that caused the transition, when the event was error-driven. */
   readonly reason?: Error;
 };
 
@@ -317,7 +370,10 @@ type ChannelDispatchers = {
   readonly reenterPresence: () => void;
 };
 
+/** Default initial reconnect backoff, in ms. */
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
+
+/** Default cap on the reconnect backoff, in ms. */
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30_000;
 /** WebSocket.OPEN — duplicated here so we do not depend on a global. */
 const READY_STATE_OPEN = 1;
@@ -340,12 +396,6 @@ function newClientMessageId(): string {
 }
 
 /**
- * Close a socket without ever throwing. `WebSocket.close()` throws synchronously
- * on a reserved/invalid code, and in a message-event listener that throw escapes
- * to `process.nextTick` and kills the process. We never want a teardown to crash
- * the caller, so swallow any error here.
- */
-/**
  * Build an Error for a server `err` frame, tagging it with the numeric code so callers
  * (e.g. Channel.attach) can tell a terminal capability denial apart from a transient
  * failure that should recover on reconnect.
@@ -354,6 +404,12 @@ function serverError(code: number, message: string): Error & { code: number } {
   return Object.assign(new Error(`server error ${code}: ${message}`), { code });
 }
 
+/**
+ * Close a socket without ever throwing. `WebSocket.close()` throws synchronously
+ * on a reserved/invalid code, and in a message-event listener that throw escapes
+ * to `process.nextTick` and kills the process. We never want a teardown to crash
+ * the caller, so swallow any error here.
+ */
 function safeClose(ws: WebSocket, code: number, reason: string): void {
   try {
     ws.close(code, reason);
@@ -365,16 +421,19 @@ function safeClose(ws: WebSocket, code: number, reason: string): void {
 }
 
 /**
- * Connection is the transport layer. One Realtime client owns one
- * Connection; channels share it.
+ * Connection is the transport layer. One Realtime client owns one Connection
+ * and all of its channels share it. Listen on lifecycle changes with
+ * `connection.on(...)`, which delivers every {@link ConnectionState}
+ * transition.
  *
  * Several methods here are `private` yet called from the sibling `Channel` and
  * `Realtime` classes via index access (e.g. `connection['rememberSubscription']`).
  * That is intentional: they form the SDK-internal contract between those classes,
  * and `private` keeps them off the public `@foony/realtime` type surface. A search
- * for `this.method(` will not find these call sites — look for `['method']` too.
+ * for `this.method(` will not find these call sites, so search for `['method']` too.
  */
 export class Connection extends TypedEventEmitter<ConnectionEventType, ConnectionEventListener, ConnectionEventResult> {
+  /** The options this connection was created with. */
   readonly options: ConnectionOptions;
   private socket: WebSocket | null = null;
   private state: ConnectionState = 'initialized';
@@ -403,11 +462,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * credential that will be rejected identically forever.
    */
   private fatalError: Error | null = null;
-  /** Channels the SDK has asked to be subscribed to; re-sent on reconnect. */
+  /** Channels the SDK has asked to be subscribed to. Re-sent on reconnect. */
   private readonly desiredSubscriptions = new Set<string>();
-  /** Channels the SDK has asked for presence events on; re-sent on reconnect. */
+  /** Channels the SDK has asked for presence events on. Re-sent on reconnect. */
   private readonly desiredPresence = new Set<string>();
-  /** Publishes awaiting ack, keyed by client messageId; (re)sent on (re)connect. */
+  /** Publishes awaiting ack, keyed by client messageId. (Re)sent on (re)connect. */
   private readonly outstandingPublishes = new Map<string, OutstandingPublish>();
   /** Maps a send attempt's request id back to its publish messageId, to route ack/err. */
   private readonly publishRequestIds = new Map<number, string>();
@@ -424,7 +483,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.options = options;
   }
 
-  /** Current connection state. */
+  /** Current {@link ConnectionState}. Listen on changes with `on(...)`. */
   getState(): ConnectionState {
     return this.state;
   }
@@ -434,14 +493,22 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     return this.connectionId;
   }
 
-  /** The client id encoded in the token, populated after auth. */
+  /**
+   * Client id this connection is authenticated as, or `null` before the auth
+   * handshake completes. Never `null` once connected: the server resolves it
+   * from the JWT's subject (token and `authCallback` auth), from the
+   * `clientId` option (key auth), or assigns one when neither names a client.
+   */
   getClientId(): string | null {
     return this.serverClientId;
   }
 
   /**
-   * Open the WebSocket and complete the auth handshake. Idempotent —
-   * concurrent calls await the same in-flight connect.
+   * Open the WebSocket and complete the auth handshake. This method is
+   * idempotent, and concurrent calls await the same in-flight connect.
+   * Resolves once the connection is `connected`. Rejects with the handshake
+   * error when auth fails, for example a bad key or an expired static
+   * `token` with no `authCallback` to re-mint one.
    */
   async connect(): Promise<void> {
     if (this.state === 'connected') return;
@@ -452,7 +519,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     return this.connectPromise;
   }
 
-  /** Close the WebSocket and release resources. */
+  /**
+   * Close the WebSocket and release resources. Resolves once the connection
+   * reaches `closed`. Requests and publishes still awaiting an ack reject
+   * with a "connection closed" error.
+   */
   async close(): Promise<void> {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -544,8 +615,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * `queueMessages` is enabled (the default), the publish is buffered and sent on
    * the next successful (re)connect. A publish that was already in flight when the
    * connection dropped is resent on reconnect (its stable `messageId` dedupes it
-   * server-side). With `queueMessages` disabled, or in a terminal connection state,
-   * it rejects fast.
+   * server-side). It rejects fast when the state is `closing`, `closed`, or
+   * `failed`, and with `queueMessages` disabled, in any state but `connected`.
    */
   private async publish(input: Omit<PublishFrame, 'id' | 'messageId'>): Promise<void> {
     const frame = { ...input, messageId: newClientMessageId() };
@@ -775,7 +846,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     return { t: 'auth', token: await this.options.authCallback(), ...resume };
   }
 
-  /** Steady-state message handler; installed after a successful auth. Every server frame
+  /** Steady-state message handler, installed after a successful auth. Every server frame
    * arrives binary: one WebSocket message carries one or more opcode records. */
   private readonly handleMessage = (event: MessageEvent): void => {
     const binary = toArrayBuffer(event.data);
@@ -946,8 +1017,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     for (const channel of this.desiredPresence) {
       this.request({ t: 'presSub', channel }).catch(() => {});
     }
-    // Re-announce presence membership: each channel re-enters whatever it had entered,
-    // matching Ably's automatic re-entry after a reconnect.
+    // Re-announce presence membership: each channel re-enters whatever it had entered.
     for (const dispatchers of this.channelDispatchers.values()) {
       dispatchers.reenterPresence();
     }

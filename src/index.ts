@@ -1,8 +1,10 @@
 /**
  * Public entry point for @foony/realtime.
  *
- * Public surface: a `Realtime` class, a `channels.get(name)` registry,
- * and per-channel `subscribe` / `publish` / `presence` methods.
+ * Public surface: the WebSocket `Realtime` client (a `channels.get(name)` map
+ * with per-channel `subscribe` / `publish` / `presence`), the request/response
+ * `Rest` client for backends, `createJwt` for server-side token minting, and
+ * the `Cipher` helpers for end-to-end encryption.
  */
 
 export {
