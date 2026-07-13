@@ -69,6 +69,8 @@ type Harness = {
     skipNextRetainedReplay: boolean;
     /** Current document to replay when its channel is successfully subscribed. */
     retainedDoc: { channel: string; data: unknown } | null;
+    /** When set, the next sub is answered with an `err` frame carrying this code (then cleared). */
+    failNextSubCode: number | null;
     dropNextHist: boolean;
     dropNextFetch: boolean;
     /** When true, pings are swallowed instead of answered, simulating a half-dead link. */
@@ -99,6 +101,7 @@ async function startFakeEdge(): Promise<Harness> {
     dropNextSub: false,
     skipNextRetainedReplay: false,
     retainedDoc: null,
+    failNextSubCode: null,
     dropNextHist: false,
     dropNextFetch: false,
     silencePongs: false,
@@ -151,6 +154,14 @@ async function startFakeEdge(): Promise<Harness> {
           control.dropNextSub = false;
           // Die in the gap between receiving the sub and acking it, so the attach fails.
           socket.close(1001, 'drop before sub ack');
+          return;
+        }
+        if (control.failNextSubCode !== null) {
+          const code = control.failNextSubCode;
+          control.failNextSubCode = null;
+          // Reject the sub while keeping the connection alive (a capability denial,
+          // or a transient server error during a redeploy).
+          sendFrame(socket, { t: 'err', id: frame.id, code, message: `sub rejected ${code}` });
           return;
         }
         if (control.skipNextRetainedReplay) {
@@ -1077,6 +1088,56 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(outcome).toBe('rejected');
     // The subscription intent stays remembered, so the reconnect restores the channel.
     await waitFor(() => channel.state === 'attached', 'channel recovered after reconnect');
+    await realtime.close();
+  });
+
+  it('retries a reconnect re-subscribe the server rejected transiently, on the same connection', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:restore');
+    channel.subscribe(() => {});
+    await waitFor(() => channel.state === 'attached', 'initial attach');
+
+    // Kill the socket; the restore re-subscribe on the new connection gets a transient
+    // server error (e.g. mid-redeploy). The channel must not stay parked in 'attaching'
+    // until the next reconnect — the SDK retries while the connection stays up.
+    harness.control.failNextSubCode = 50000;
+    harness.sockets[0]?.terminate();
+
+    await waitFor(() => channel.state === 'attached' && harness.subFrames.filter((sub) => sub.channel === 'chat:restore').length >= 3, 'restore retried and re-attached');
+    await realtime.close();
+  });
+
+  it('fails a channel terminally when the reconnect re-subscribe hits a capability denial', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const channel = realtime.channels.get('chat:denied');
+    channel.subscribe(() => {});
+    await waitFor(() => channel.state === 'attached', 'initial attach');
+
+    // A capability denial won't change on retry: the channel must surface 'failed'
+    // (so apps can react) and the SDK must stop re-subscribing it.
+    harness.control.failNextSubCode = 40301;
+    harness.sockets[0]?.terminate();
+
+    await waitFor(() => channel.state === 'failed', 'terminal failure surfaced');
+    const subsAtFailure = harness.subFrames.filter((sub) => sub.channel === 'chat:denied').length;
+    await delay(80);
+    expect(harness.subFrames.filter((sub) => sub.channel === 'chat:denied').length).toBe(subsAtFailure);
     await realtime.close();
   });
 

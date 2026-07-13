@@ -3,6 +3,17 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.16.1
+
+### Fixed
+
+- **A rejected reconnect re-subscribe no longer freezes the channel.** When the
+  server rejected the automatic re-subscribe after a reconnect, the channel
+  stayed in `attaching` with no data until the next reconnect, which might
+  never come. Now a transient rejection retries with the reconnect backoff
+  while the connection stays up, and a capability denial (403xx) moves the
+  channel to `failed` (mirroring a denied attach) instead of retrying forever.
+
 ## 0.16.0
 
 ### Added

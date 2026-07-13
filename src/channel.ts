@@ -8,7 +8,7 @@
  * `unsubscribe` carry application *messages* (open-ended event names).
  */
 
-import { TypedEventEmitter, type Connection, type ConnectionState, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
+import { TypedEventEmitter, isCapabilityError, type Connection, type ConnectionState, type EventUnsubscribeFn, type MessageListener, type PresenceEventListener } from './connection.js';
 import { Cipher, isCipherEncoding, type CipherParams } from './crypto.js';
 import type { BatchMember, BundledMessage, MessageFrame, PresenceAction, PresenceEventFrame } from './wire.js';
 
@@ -211,6 +211,7 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
       presence: (event) => this.presence['emitPresence'](event),
       lastSerial: () => (this.contiguousSerial > 0 ? this.contiguousSerial : undefined),
       resumed: (resumed) => this.onResumed(resumed),
+      restoreFailed: (error) => this.transition('failed', { reason: error }),
       reenterPresence: () => this.presence['reenterOnReconnect'](),
     });
     this.connectionOff = this.connection.on((state, reason) => this.onConnectionState(state, reason));
@@ -1026,17 +1027,6 @@ class ChannelMessageEmitter extends TypedEventEmitter<string, MessageListener, M
 /** Coerce an unknown thrown value into an Error for state-change reasons. */
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
-}
-
-/**
- * True for a server error that won't change on retry: the forbidden / capability /
- * channel-denied family (403xx). A failed attach with such an error is terminal.
- * Any other failure (e.g. a dropped connection) is transient and recovers on
- * reconnect.
- */
-function isCapabilityError(error: unknown): boolean {
-  const code = (error as { code?: number } | null)?.code;
-  return typeof code === 'number' && code >= 40300 && code < 40400;
 }
 
 /** Build a per-member message frame from a batch frame. The member id is `<batchId>:<index>`. */

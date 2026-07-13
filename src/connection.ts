@@ -427,9 +427,22 @@ type ChannelDispatchers = {
   readonly lastSerial: () => number | undefined;
   /** Report the resume outcome once a reconnect re-subscribe has acked. */
   readonly resumed: (resumed: boolean) => void;
+  /** Report a capability denial of a reconnect re-subscribe (the channel moves to `failed`). */
+  readonly restoreFailed: (error: Error) => void;
   /** Re-announce this channel's presence membership after a reconnect (re-enter what was entered). */
   readonly reenterPresence: () => void;
 };
+
+/**
+ * True for a server error that won't change on retry — the forbidden / capability /
+ * channel-denied family (403xx). A failed attach or re-subscribe with such an error is
+ * terminal; any other failure (e.g. a dropped connection) is transient and recovers on
+ * reconnect.
+ */
+export function isCapabilityError(error: unknown): boolean {
+  const code = (error as { code?: number } | null)?.code;
+  return typeof code === 'number' && code >= 40300 && code < 40400;
+}
 
 /** Default initial reconnect backoff, in ms. */
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000;
@@ -599,6 +612,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private fatalError: Error | null = null;
   /** Channels the SDK has asked to be subscribed to. Re-sent on reconnect. */
   private readonly desiredSubscriptions = new Set<string>();
+  /**
+   * Bumped on every socket close so restore retries scheduled against a dead
+   * connection abandon themselves instead of racing the next reconnect's restore
+   * pass (which would send duplicate subs and surface spurious channel updates).
+   */
+  private restoreGeneration = 0;
   /** Per-channel counter bumped on every rememberSubscription, so a stale detach cannot forget a newer attach. */
   private readonly subscriptionEpochs = new Map<string, number>();
   /** Channels the SDK has asked for presence events on. Re-sent on reconnect. */
@@ -1364,6 +1383,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
     this.closedSockets.add(ws);
     this.socket = null;
+    // Any restore retry scheduled against the dead socket's connection is obsolete:
+    // the next reconnect runs a fresh restore pass for every desired subscription.
+    this.restoreGeneration += 1;
     this.stopKeepAlive();
     // The dead socket's requests can never be answered: drop the publish id
     // mappings and reject in-flight acks, history, and fetches so attach,
@@ -1442,18 +1464,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // server replays whatever was published during the disconnect, then report the
     // resume outcome (replayed vs discontinuity) back to the channel.
     for (const channel of this.desiredSubscriptions) {
-      const dispatchers = this.channelDispatchers.get(channel);
-      // Resume from the serial cursor (exact + migration-safe). A channel that has only seen
-      // unsequenced messages has none and resubscribes fresh.
-      const lastSerial = dispatchers?.lastSerial();
-      const frame: Omit<SubscribeFrame, 'id'> =
-        lastSerial !== undefined ? { t: 'sub', channel, lastSerial } : { t: 'sub', channel };
-      this.request(frame)
-        .then((ack) => dispatchers?.resumed(ack.resumed ?? false))
-        .catch(() => {
-          // A failed restore surfaces via channel state on the next reconnect; the
-          // channel stays 'attaching' until then.
-        });
+      this.restoreSubscription(channel, 0);
     }
     // Re-open presence watchers for channels the app is watching presence on.
     for (const channel of this.desiredPresence) {
@@ -1463,6 +1474,51 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     for (const dispatchers of this.channelDispatchers.values()) {
       dispatchers.reenterPresence();
     }
+  }
+
+  /**
+   * Re-issue the `sub` for one remembered channel after a reconnect, carrying its resume
+   * cursor (the contiguous serial — exact and migration-safe; a channel that has only seen
+   * unsequenced messages has none and resubscribes fresh), then report the resume outcome
+   * (replayed vs discontinuity) back to the channel.
+   *
+   * A rejected re-subscribe used to park the channel in `attaching` until the next
+   * reconnect, freezing its data while the connection stayed healthy. Instead: a
+   * capability denial fails the channel terminally (mirroring attach), and any other
+   * rejection retries with the reconnect backoff while this connection is still up. A
+   * scheduled retry abandons itself when the connection drops (the next reconnect's
+   * restore pass supersedes it) or the channel is no longer desired (detached/released).
+   */
+  private restoreSubscription(channel: string, attempt: number): void {
+    const generation = this.restoreGeneration;
+    const dispatchers = this.channelDispatchers.get(channel);
+    const lastSerial = dispatchers?.lastSerial();
+    const frame: Omit<SubscribeFrame, 'id'> =
+      lastSerial !== undefined ? { t: 'sub', channel, lastSerial } : { t: 'sub', channel };
+    this.request(frame)
+      .then((ack) => dispatchers?.resumed(ack.resumed ?? false))
+      .catch((error: unknown) => {
+        if (generation !== this.restoreGeneration || !this.desiredSubscriptions.has(channel)) {
+          return;
+        }
+        if (isCapabilityError(error)) {
+          // Permission won't change on retry — stop trying and surface it.
+          this.desiredSubscriptions.delete(channel);
+          dispatchers?.restoreFailed(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        if (this.state !== 'connected') {
+          return;
+        }
+        const initial = this.options.initialReconnectDelayMs ?? DEFAULT_INITIAL_RECONNECT_DELAY_MS;
+        const max = this.options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
+        const delay = Math.min(initial * 2 ** attempt, max);
+        setTimeout(() => {
+          if (generation === this.restoreGeneration && this.state === 'connected' && this.desiredSubscriptions.has(channel)) {
+            this.restoreSubscription(channel, attempt + 1);
+          }
+        }, delay);
+      });
   }
 
   /** Start sending a keep-alive ping every `keepAliveMs` (no-op when non-positive). */
