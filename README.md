@@ -68,6 +68,23 @@ const realtime = new Realtime({
 
 Omit `endpoint` in production to use `wss://realtime.foony.io`.
 
+## Transports
+
+The client connects over WebSocket. When the WebSocket cannot be established,
+for example behind a corporate proxy that blocks upgrades, it automatically
+falls back to HTTP long-polling within about 5 seconds, and everything keeps
+working: publish, subscribe, presence, history, resume, and exactly-once
+delivery. Long-polling has higher latency and more per-request overhead, so
+the WebSocket is always tried first. Force a transport with the `transport`
+option (`'auto'` is the default):
+
+```ts
+const realtime = new Realtime({
+  token,
+  transport: 'long-polling', // or 'websocket' to never fall back
+});
+```
+
 ## Channel names
 
 Channel names are 1 to 255 ASCII characters from `A-Z a-z 0-9 : - _` and

@@ -3,6 +3,21 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.15.0
+
+### Added
+
+- **Automatic long-polling fallback.** When the WebSocket cannot be
+  established, for example behind a corporate proxy that blocks upgrades, the
+  client now falls back to HTTP long-polling and everything keeps working:
+  publish, subscribe, presence, history, resume, and exactly-once delivery.
+  The fallback kicks in within about 5 seconds and the client then stays on
+  long-polling for its lifetime. A failure the server answered (like a bad
+  token) never triggers the fallback.
+- **New `transport` option** (`'auto'` default, `'websocket'`,
+  `'long-polling'`) to force one transport, and a **`fetch` option** to
+  override the HTTP client the long-polling transport uses, mostly for tests.
+
 ## 0.14.0
 
 ### Added

@@ -28,6 +28,7 @@ import type {
 } from './wire.js';
 import { ErrorCode } from './wire.js';
 import { decodeServerFrames, encodeClientFrame, frameBinaryRecord } from './binary.js';
+import { LongPollSocket, endpointToHttpUrl } from './longpoll.js';
 
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
@@ -254,6 +255,23 @@ export type ConnectionOptions = {
    */
   readonly webSocket?: typeof WebSocket;
   /**
+   * Which transport to use. `'auto'` (the default) connects over WebSocket
+   * and falls back to HTTP long-polling when the WebSocket cannot be
+   * established (for example a proxy that blocks upgrades); once fallen
+   * back, the client stays on long-polling for its lifetime. `'websocket'`
+   * and `'long-polling'` force one transport and never switch. Long-polling
+   * trades higher latency and per-request overhead for working on networks
+   * that break WebSockets, so prefer `'auto'` outside of tests.
+   *
+   * @defaultValue `'auto'`
+   */
+  readonly transport?: 'auto' | 'websocket' | 'long-polling';
+  /**
+   * Override the fetch implementation used by the long-polling transport.
+   * Mostly useful in tests. Defaults to the global `fetch`.
+   */
+  readonly fetch?: typeof fetch;
+  /**
    * If true (the default), the SDK reconnects after unexpected disconnects
    * with exponential backoff. If false, a dropped connection stays down until
    * you call `connect()` again. An auth error that cannot be recovered (a bad
@@ -413,6 +431,17 @@ const CLOSE_CODE_HANDSHAKE_FAILED = 4001;
 /** Close code used when the keep-alive deadline declares a silent link dead. */
 const CLOSE_CODE_KEEPALIVE_TIMEOUT = 4002;
 
+/** Close code used when a WebSocket fails to open within the fallback window. */
+const CLOSE_CODE_OPEN_TIMEOUT = 4003;
+
+/**
+ * How long a WebSocket may take to reach `open` before the attempt is failed
+ * so the auto fallback can try long-polling. Only armed when a fallback is
+ * still available; a forced `'websocket'` transport keeps the old behavior of
+ * waiting the connection out.
+ */
+const WEBSOCKET_OPEN_TIMEOUT_MS = 5_000;
+
 /**
  * Bounds on how long we wait after a ping for proof of life (any inbound
  * frame) before declaring the link dead. The deadline follows the server's
@@ -517,6 +546,18 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private readonly subscriptionEpochs = new Map<string, number>();
   /** Channels the SDK has asked for presence events on. Re-sent on reconnect. */
   private readonly desiredPresence = new Set<string>();
+  /**
+   * The transport connect attempts use. Starts on WebSocket (unless the
+   * `transport` option forces long-polling) and flips to long-polling when an
+   * auto-mode WebSocket attempt fails at the transport level. Never flips
+   * back: a network that broke WebSockets once will keep breaking them, and
+   * flapping between transports would churn presence and resume state.
+   */
+  private activeTransport: 'websocket' | 'long-polling';
+  /** True once the current connect attempt created its socket (a transport was actually tried). */
+  private attemptReachedTransport = false;
+  /** True once the current connect attempt received any server frame (the transport works). */
+  private attemptSawFrame = false;
   /** Publishes awaiting ack, keyed by client messageId. (Re)sent on (re)connect. */
   private readonly outstandingPublishes = new Map<string, OutstandingPublish>();
   /** Maps a send attempt's request id back to its publish messageId, to route ack/err. */
@@ -532,6 +573,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       throw new Error('Connection: pass exactly one of options.token, options.authCallback, or options.key');
     }
     this.options = options;
+    this.activeTransport = options.transport === 'long-polling' ? 'long-polling' : 'websocket';
   }
 
   /** Current {@link ConnectionState}. Listen on changes with `on(...)`. */
@@ -564,9 +606,25 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   async connect(): Promise<void> {
     if (this.state === 'connected') return;
     if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this.doConnect().finally(() => {
-      this.connectPromise = null;
-    });
+    this.connectPromise = this.doConnect()
+      .catch((error) => {
+        // Auto fallback: a WebSocket attempt that died without a single
+        // server frame means the transport itself is blocked (proxy,
+        // antivirus), so retry immediately over long-polling. An attempt the
+        // server answered (an auth rejection, a protocol error) would fail
+        // identically on any transport and is rethrown instead.
+        const transportFailed = this.attemptReachedTransport && !this.attemptSawFrame;
+        const fallbackAvailable = (this.options.transport ?? 'auto') === 'auto' && this.activeTransport === 'websocket';
+        const stillWanted = this.state !== 'closing' && this.state !== 'closed' && this.state !== 'failed';
+        if (transportFailed && fallbackAvailable && stillWanted) {
+          this.activeTransport = 'long-polling';
+          return this.doConnect();
+        }
+        throw error;
+      })
+      .finally(() => {
+        this.connectPromise = null;
+      });
     return this.connectPromise;
   }
 
@@ -799,6 +857,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
 
   private async doConnect(): Promise<void> {
     this.setState('connecting');
+    // Per-attempt transport telemetry, read by connect()'s fallback decision:
+    // an attempt that created a socket but never saw a server frame failed at
+    // the transport level, not at the protocol level.
+    this.attemptReachedTransport = false;
+    this.attemptSawFrame = false;
     // Build the auth frame BEFORE opening the socket. createAuthFrame may await an async
     // authCallback (a token fetch); if that await straddled socket creation, the WebSocket
     // could fire 'open' before the listener below was attached — the event would be lost,
@@ -809,6 +872,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     try {
       authFrame = await this.createAuthFrame();
       ws = await this.makeSocket();
+      this.attemptReachedTransport = true;
     } catch (error) {
       // No socket exists yet, so no close event will drive the state machine.
       // Mirror handleClose here: mark disconnected and schedule the retry, or a
@@ -831,7 +895,22 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.socket = ws;
 
     return new Promise<void>((resolve, reject) => {
+      // While a fallback is still available, bound how long the WebSocket may
+      // take to open: a proxy that blackholes the upgrade would otherwise pin
+      // the attempt (and the user) in `connecting` indefinitely.
+      const fallbackAvailable = (this.options.transport ?? 'auto') === 'auto' && this.activeTransport === 'websocket';
+      let openTimer: ReturnType<typeof setTimeout> | null = fallbackAvailable
+        ? setTimeout(() => safeClose(ws, CLOSE_CODE_OPEN_TIMEOUT, 'open timeout'), WEBSOCKET_OPEN_TIMEOUT_MS)
+        : null;
+      const clearOpenTimer = (): void => {
+        if (openTimer !== null) {
+          clearTimeout(openTimer);
+          openTimer = null;
+        }
+      };
+
       const onOpen = (): void => {
+        clearOpenTimer();
         try {
           // A binary auth frame makes the whole connection binary (the edge decides by the
           // WebSocket opcode of this frame).
@@ -842,6 +921,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       };
 
       const onAuthMessage = (event: MessageEvent): void => {
+        this.attemptSawFrame = true;
         const binary = toArrayBuffer(event.data);
         const frames = binary ? decodeServerFrames(binary) : [];
         const parsed = frames[0];
@@ -900,6 +980,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       };
 
       const onClose = (event: CloseEvent): void => {
+        clearOpenTimer();
         this.handleClose(ws, event);
         // If close fires before we finished the handshake, the
         // surrounding promise hasn't been settled yet — surface it as
@@ -920,6 +1001,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   private async makeSocket(): Promise<WebSocket> {
+    if (this.activeTransport === 'long-polling') {
+      // The long-poll transport presents the WebSocket surface Connection
+      // drives (readyState / send / close / events), so the whole state
+      // machine runs unchanged over it.
+      const shim = new LongPollSocket(endpointToHttpUrl(this.options.endpoint ?? DEFAULT_REALTIME_ENDPOINT), this.options.fetch);
+      return shim as unknown as WebSocket;
+    }
     const ctor =
       this.options.webSocket ??
       (globalThis as typeof globalThis & { WebSocket?: typeof WebSocket }).WebSocket ??
