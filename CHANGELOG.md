@@ -3,6 +3,19 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.15.1
+
+### Fixed
+
+- **A connect attempt can no longer hang forever.** Every attempt now has a
+  hard deadline covering the socket open AND the auth reply: 5 seconds while
+  the long-polling fallback is available, 15 seconds on a forced transport.
+  Before, a middlebox that admitted the WebSocket upgrade and then went
+  silent could park the client in `connecting` forever, and a forced
+  `'websocket'` client had no bound at all. On expiry the attempt fails
+  normally, so auto mode falls back to long-polling and a forced transport
+  lands in the reconnect backoff.
+
 ## 0.15.0
 
 ### Added

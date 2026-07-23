@@ -431,16 +431,19 @@ const CLOSE_CODE_HANDSHAKE_FAILED = 4001;
 /** Close code used when the keep-alive deadline declares a silent link dead. */
 const CLOSE_CODE_KEEPALIVE_TIMEOUT = 4002;
 
-/** Close code used when a WebSocket fails to open within the fallback window. */
-const CLOSE_CODE_OPEN_TIMEOUT = 4003;
+/** Close code used when a connect attempt fails to reach `connected` in time. */
+const CLOSE_CODE_CONNECT_TIMEOUT = 4003;
 
 /**
- * How long a WebSocket may take to reach `open` before the attempt is failed
- * so the auto fallback can try long-polling. Only armed when a fallback is
- * still available; a forced `'websocket'` transport keeps the old behavior of
- * waiting the connection out.
+ * Deadlines on one connect attempt, covering everything from socket creation
+ * through the server's `connected` frame. While a long-polling fallback is
+ * still available, the WebSocket attempt gets the short deadline so the
+ * fallback stays snappy. Everywhere else (a forced transport, or long-polling
+ * itself) expiry means backoff-and-retry rather than a transport switch, so
+ * the laxer deadline avoids churning slow-but-working links.
  */
-const WEBSOCKET_OPEN_TIMEOUT_MS = 5_000;
+const CONNECT_TIMEOUT_WITH_FALLBACK_MS = 5_000;
+const CONNECT_TIMEOUT_MS = 15_000;
 
 /**
  * Bounds on how long we wait after a ping for proof of life (any inbound
@@ -895,22 +898,29 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     this.socket = ws;
 
     return new Promise<void>((resolve, reject) => {
-      // While a fallback is still available, bound how long the WebSocket may
-      // take to open: a proxy that blackholes the upgrade would otherwise pin
-      // the attempt (and the user) in `connecting` indefinitely.
+      // One deadline covers the whole attempt, socket creation through the
+      // server's `connected` frame. It MUST NOT be cleared at `open`: a
+      // middlebox that admits the upgrade and then blackholes frames would
+      // otherwise park the attempt in `connecting` forever, because keep-alive
+      // only starts after `connected` and the fallback check only runs once
+      // the attempt settles. Expiry closes the socket, and the close event
+      // drives everything else through the normal paths: the handshake
+      // rejects, and connect() falls back to long-polling (auto mode) or
+      // handleClose schedules the reconnect backoff (forced transport).
       const fallbackAvailable = (this.options.transport ?? 'auto') === 'auto' && this.activeTransport === 'websocket';
-      let openTimer: ReturnType<typeof setTimeout> | null = fallbackAvailable
-        ? setTimeout(() => safeClose(ws, CLOSE_CODE_OPEN_TIMEOUT, 'open timeout'), WEBSOCKET_OPEN_TIMEOUT_MS)
-        : null;
-      const clearOpenTimer = (): void => {
-        if (openTimer !== null) {
-          clearTimeout(openTimer);
-          openTimer = null;
+      const deadlineMs = fallbackAvailable ? CONNECT_TIMEOUT_WITH_FALLBACK_MS : CONNECT_TIMEOUT_MS;
+      let connectDeadline: ReturnType<typeof setTimeout> | null = setTimeout(
+        () => safeClose(ws, CLOSE_CODE_CONNECT_TIMEOUT, 'connect timeout'),
+        deadlineMs,
+      );
+      const clearConnectDeadline = (): void => {
+        if (connectDeadline !== null) {
+          clearTimeout(connectDeadline);
+          connectDeadline = null;
         }
       };
 
       const onOpen = (): void => {
-        clearOpenTimer();
         try {
           // A binary auth frame makes the whole connection binary (the edge decides by the
           // WebSocket opcode of this frame).
@@ -921,6 +931,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       };
 
       const onAuthMessage = (event: MessageEvent): void => {
+        // Every branch below settles the handshake (resolve or reject), so
+        // the attempt deadline has done its job whatever happens next.
+        clearConnectDeadline();
         this.attemptSawFrame = true;
         const binary = toArrayBuffer(event.data);
         const frames = binary ? decodeServerFrames(binary) : [];
@@ -975,12 +988,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       };
 
       const onError = (event: Event): void => {
+        clearConnectDeadline();
         const errMessage = (event as ErrorEvent).message ?? 'websocket error';
         reject(new Error(`websocket error: ${errMessage}`));
       };
 
       const onClose = (event: CloseEvent): void => {
-        clearOpenTimer();
+        clearConnectDeadline();
         this.handleClose(ws, event);
         // If close fires before we finished the handshake, the
         // surrounding promise hasn't been settled yet — surface it as

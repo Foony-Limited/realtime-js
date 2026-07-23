@@ -209,6 +209,69 @@ class BlockedWebSocket extends FakeSocketBase {
   }
 }
 
+/**
+ * A WebSocket behind a middlebox that admits the upgrade and then blackholes
+ * every frame: it opens, swallows sends, and never delivers or closes.
+ */
+class SilentWebSocket extends FakeSocketBase {
+  constructor(_url: string) {
+    super();
+    setTimeout(() => {
+      this.readyState = 1;
+      this.emit('open', {});
+    }, 5);
+  }
+}
+
+/**
+ * An in-memory /lp/* edge as a fetch stub, for tests that run under fake
+ * timers (a real HTTP fake edge would need real IO waits). Answers connect
+ * with a connected frame, acks sends, and holds polls until frames pend.
+ */
+function makeFetchLpEdge(): { fetchStub: typeof fetch; state: { connectCount: number } } {
+  const state = { connectCount: 0 };
+  let pending: Buffer[] = [];
+  let wake: (() => void) | null = null;
+  function deliver(frame: ServerFrame): void {
+    pending.push(record(frame));
+    wake?.();
+    wake = null;
+  }
+  const fetchStub = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const path = new URL(String(input)).pathname;
+    const raw = init?.body ? Buffer.from(init.body as ArrayBuffer) : Buffer.alloc(0);
+    if (path === '/lp/connect') {
+      state.connectCount += 1;
+      return new Response(
+        record({ t: 'connected', connectionId: 'conn-lp-1', clientId: 'client-1', keepAliveMs: 60_000 }),
+        { status: 200, headers: { [SESSION_HEADER]: 'sess-1' } },
+      );
+    }
+    if (path === '/lp/send') {
+      for (const frame of decodeClientRecords(raw)) {
+        if (frame.t === 'ping') {
+          deliver({ t: 'pong' });
+        } else if ('id' in frame) {
+          deliver({ t: 'ack', id: frame.id });
+        }
+      }
+      return new Response(null, { status: 200 });
+    }
+    if (path === '/lp/poll') {
+      if (pending.length === 0) {
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+      }
+      const body = Buffer.concat(pending);
+      pending = [];
+      return new Response(body, { status: 200 });
+    }
+    return new Response(null, { status: path === '/lp/disconnect' ? 200 : 404 });
+  }) as typeof fetch;
+  return { fetchStub, state };
+}
+
 /** A WebSocket whose server answers the auth frame with a 40101 rejection. */
 class AuthRejectingWebSocket extends FakeSocketBase {
   constructor(_url: string) {
@@ -292,6 +355,68 @@ describe('long-polling transport', () => {
 
     await expect(client.connect()).rejects.toThrow(/auth failed: 40101/u);
     expect(edge.connectCount).toBe(0);
+  });
+
+  it('falls back when the WebSocket opens but the handshake reply never arrives', async () => {
+    // A middlebox that admits the upgrade and then blackholes frames. The
+    // connect attempt must hit a deadline, fail over to long-polling, and
+    // settle — not park in `connecting` forever.
+    vi.useFakeTimers();
+    cleanups.push(() => vi.useRealTimers());
+    const { fetchStub, state } = makeFetchLpEdge();
+    const client = new Realtime({
+      token: 'T',
+      endpoint: 'https://blackhole.example',
+      webSocket: SilentWebSocket as unknown as typeof WebSocket,
+      fetch: fetchStub,
+    });
+    cleanups.push(() => client.close());
+
+    let settled = false;
+    const connected = client.connect().then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    // A full virtual minute is far past any sane deadline. If the attempt is
+    // still pending after it, the client is stalled.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(true);
+    await connected;
+    expect(client.getState()).toBe('connected');
+    expect(state.connectCount).toBe(1);
+  });
+
+  it('bounds a forced-websocket handshake instead of hanging in connecting', async () => {
+    vi.useFakeTimers();
+    cleanups.push(() => vi.useRealTimers());
+    const client = new Realtime({
+      token: 'T',
+      endpoint: 'wss://blackhole.example',
+      transport: 'websocket',
+      autoReconnect: false,
+      webSocket: SilentWebSocket as unknown as typeof WebSocket,
+    });
+    cleanups.push(() => client.close());
+
+    let outcome = 'pending';
+    const connected = client.connect().then(
+      () => {
+        outcome = 'resolved';
+      },
+      () => {
+        outcome = 'rejected';
+      },
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(outcome).toBe('rejected');
+    await connected;
+    // With autoReconnect off the failed attempt lands in `disconnected`,
+    // where an explicit connect() can retry. Never a silent forever-hang.
+    expect(client.getState()).toBe('disconnected');
   });
 
   it('reconnects with a fresh long-poll session when the session dies', async () => {
