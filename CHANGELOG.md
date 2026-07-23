@@ -15,6 +15,13 @@ All notable changes to `@foony/realtime`. Format loosely follows
   `'websocket'` client had no bound at all. On expiry the attempt fails
   normally, so auto mode falls back to long-polling and a forced transport
   lands in the reconnect backoff.
+- **A network outage no longer demotes the client to long-polling for good.**
+  In 0.15.0 any failed WebSocket attempt switched the client to long-polling
+  permanently, so a wifi blip or a server deploy during a reconnect left it
+  there for the life of the page. Now the switch only sticks while the
+  WebSocket is actually blocked: if the long-polling attempt fails the same
+  way, the next attempt is WebSocket again, and a client parked on
+  long-polling re-probes the WebSocket about once a minute.
 
 ## 0.15.0
 

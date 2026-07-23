@@ -228,10 +228,23 @@ class SilentWebSocket extends FakeSocketBase {
  * timers (a real HTTP fake edge would need real IO waits). Answers connect
  * with a connected frame, acks sends, and holds polls until frames pend.
  */
-function makeFetchLpEdge(): { fetchStub: typeof fetch; state: { connectCount: number } } {
-  const state = { connectCount: 0 };
+function makeFetchLpEdge(): {
+  fetchStub: typeof fetch;
+  state: { connectCount: number; killSession: () => void };
+} {
+  let sessionDead = false;
   let pending: Buffer[] = [];
   let wake: (() => void) | null = null;
+  const state = {
+    connectCount: 0,
+    // Turns every later poll/send into a 410, waking a held poll, the way the
+    // real edge sheds a session. A later connect mints a fresh session.
+    killSession(): void {
+      sessionDead = true;
+      wake?.();
+      wake = null;
+    },
+  };
   function deliver(frame: ServerFrame): void {
     pending.push(record(frame));
     wake?.();
@@ -242,12 +255,16 @@ function makeFetchLpEdge(): { fetchStub: typeof fetch; state: { connectCount: nu
     const raw = init?.body ? Buffer.from(init.body as ArrayBuffer) : Buffer.alloc(0);
     if (path === '/lp/connect') {
       state.connectCount += 1;
+      sessionDead = false;
       return new Response(
         record({ t: 'connected', connectionId: 'conn-lp-1', clientId: 'client-1', keepAliveMs: 60_000 }),
         { status: 200, headers: { [SESSION_HEADER]: 'sess-1' } },
       );
     }
     if (path === '/lp/send') {
+      if (sessionDead) {
+        return new Response(null, { status: 410 });
+      }
       for (const frame of decodeClientRecords(raw)) {
         if (frame.t === 'ping') {
           deliver({ t: 'pong' });
@@ -258,10 +275,13 @@ function makeFetchLpEdge(): { fetchStub: typeof fetch; state: { connectCount: nu
       return new Response(null, { status: 200 });
     }
     if (path === '/lp/poll') {
-      if (pending.length === 0) {
+      if (pending.length === 0 && !sessionDead) {
         await new Promise<void>((resolve) => {
           wake = resolve;
         });
+      }
+      if (sessionDead) {
+        return new Response(null, { status: 410 });
       }
       const body = Buffer.concat(pending);
       pending = [];
@@ -270,6 +290,41 @@ function makeFetchLpEdge(): { fetchStub: typeof fetch; state: { connectCount: nu
     return new Response(null, { status: path === '/lp/disconnect' ? 200 : 404 });
   }) as typeof fetch;
   return { fetchStub, state };
+}
+
+/**
+ * A WebSocket constructor whose server a test reconfigures at runtime:
+ * 'silent' opens and blackholes every frame, 'working' opens and answers the
+ * auth frame with a connected frame. Counts constructions so tests can see
+ * when the client gave the WebSocket another try.
+ */
+function makeControlledWebSocket(): {
+  impl: typeof WebSocket;
+  state: { mode: 'silent' | 'working'; attempts: number };
+} {
+  const state: { mode: 'silent' | 'working'; attempts: number } = { mode: 'silent', attempts: 0 };
+  class ControlledWebSocket extends FakeSocketBase {
+    private answered = false;
+
+    constructor(_url: string) {
+      super();
+      state.attempts += 1;
+      setTimeout(() => {
+        this.readyState = 1;
+        this.emit('open', {});
+      }, 5);
+    }
+
+    override send(_data: unknown): void {
+      if (state.mode !== 'working' || this.answered) return;
+      this.answered = true;
+      const reply = record({ t: 'connected', connectionId: 'conn-ws-1', clientId: 'client-1', keepAliveMs: 60_000 });
+      queueMicrotask(() =>
+        this.emit('message', { data: reply.buffer.slice(reply.byteOffset, reply.byteOffset + reply.byteLength) }),
+      );
+    }
+  }
+  return { impl: ControlledWebSocket as unknown as typeof WebSocket, state };
 }
 
 /** A WebSocket whose server answers the auth frame with a 40101 rejection. */
@@ -417,6 +472,75 @@ describe('long-polling transport', () => {
     // With autoReconnect off the failed attempt lands in `disconnected`,
     // where an explicit connect() can retry. Never a silent forever-hang.
     expect(client.getState()).toBe('disconnected');
+  });
+
+  it('returns to WebSocket when the long-poll fallback also fails (outage, not blocking)', async () => {
+    // A full network outage kills the WebSocket attempt AND the long-poll
+    // attempt. That must not demote the client: when the network returns,
+    // the next attempt goes over WebSocket again.
+    vi.useFakeTimers();
+    cleanups.push(() => vi.useRealTimers());
+    const ws = makeControlledWebSocket();
+    const failingFetch = (async () => {
+      throw new TypeError('fetch failed');
+    }) as typeof fetch;
+    const client = new Realtime({
+      token: 'T',
+      endpoint: 'https://offline.example',
+      autoReconnect: false,
+      webSocket: ws.impl,
+      fetch: failingFetch,
+    });
+    cleanups.push(() => client.close());
+
+    const outageAttempt = client.connect().catch(() => 'rejected');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await outageAttempt).toBe('rejected');
+    expect(ws.state.attempts).toBe(1);
+
+    // Network is back. The retry must not wait out the WebSocket re-probe
+    // interval: the failed fallback already proved long-polling was not the
+    // answer. The fetch stub still fails, so connecting proves WebSocket.
+    ws.state.mode = 'working';
+    const reconnected = client.connect();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await reconnected;
+    expect(client.getState()).toBe('connected');
+    expect(ws.state.attempts).toBe(2);
+  });
+
+  it('re-probes the WebSocket after a minute parked on long-polling', async () => {
+    vi.useFakeTimers();
+    cleanups.push(() => vi.useRealTimers());
+    const ws = makeControlledWebSocket();
+    const { fetchStub, state } = makeFetchLpEdge();
+    const client = new Realtime({
+      token: 'T',
+      endpoint: 'https://blocked.example',
+      initialReconnectDelayMs: 20,
+      webSocket: ws.impl,
+      fetch: fetchStub,
+    });
+    cleanups.push(() => client.close());
+
+    // Blocked WebSocket parks the client on long-polling.
+    const connected = client.connect();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await connected;
+    expect(client.getState()).toBe('connected');
+    expect(ws.state.attempts).toBe(1);
+    expect(state.connectCount).toBe(1);
+
+    // The block clears (say the edge deploy finished). When the long-poll
+    // session dies past the re-probe interval, the reconnect tries the
+    // WebSocket first and stays there.
+    ws.state.mode = 'working';
+    await vi.advanceTimersByTimeAsync(61_000);
+    state.killSession();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(client.getState()).toBe('connected');
+    expect(ws.state.attempts).toBe(2);
+    expect(state.connectCount).toBe(1);
   });
 
   it('reconnects with a fresh long-poll session when the session dies', async () => {

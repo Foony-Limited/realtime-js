@@ -257,8 +257,11 @@ export type ConnectionOptions = {
   /**
    * Which transport to use. `'auto'` (the default) connects over WebSocket
    * and falls back to HTTP long-polling when the WebSocket cannot be
-   * established (for example a proxy that blocks upgrades); once fallen
-   * back, the client stays on long-polling for its lifetime. `'websocket'`
+   * established (for example a proxy that blocks upgrades). The client stays
+   * on long-polling only while the WebSocket stays blocked: if the fallback
+   * attempt fails the same way (the network was down, not the WebSocket
+   * blocked) the next attempt is WebSocket again, and a client parked on
+   * long-polling re-probes the WebSocket about once a minute. `'websocket'`
    * and `'long-polling'` force one transport and never switch. Long-polling
    * trades higher latency and per-request overhead for working on networks
    * that break WebSockets, so prefer `'auto'` outside of tests.
@@ -446,6 +449,14 @@ const CONNECT_TIMEOUT_WITH_FALLBACK_MS = 5_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 
 /**
+ * How long a client parked on long-polling waits before probing the WebSocket
+ * again. Demotions are often transient (an edge deploy, a network blip during
+ * one connect attempt), so long-polling must never be a life sentence; a
+ * still-blocked network re-pays one short connect deadline per probe.
+ */
+const WEBSOCKET_REPROBE_INTERVAL_MS = 60_000;
+
+/**
  * Bounds on how long we wait after a ping for proof of life (any inbound
  * frame) before declaring the link dead. The deadline follows the server's
  * advertised ping cadence, clamped to these.
@@ -557,6 +568,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * flapping between transports would churn presence and resume state.
    */
   private activeTransport: 'websocket' | 'long-polling';
+  /**
+   * When the last WebSocket attempt died at the transport level, driving the
+   * once-a-minute WebSocket re-probe while parked on long-polling.
+   */
+  private lastWebSocketFailureAt = 0;
   /** True once the current connect attempt created its socket (a transport was actually tried). */
   private attemptReachedTransport = false;
   /** True once the current connect attempt received any server frame (the transport works). */
@@ -609,19 +625,42 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   async connect(): Promise<void> {
     if (this.state === 'connected') return;
     if (this.connectPromise) return this.connectPromise;
+    // Parked on long-polling with the last WebSocket failure a while back?
+    // Probe the WebSocket again: the block may have been one bad moment (an
+    // edge deploy, a blip during connect), and this attempt falls back to
+    // long-polling below if it is still real.
+    if (
+      (this.options.transport ?? 'auto') === 'auto' &&
+      this.activeTransport === 'long-polling' &&
+      Date.now() - this.lastWebSocketFailureAt >= WEBSOCKET_REPROBE_INTERVAL_MS
+    ) {
+      this.activeTransport = 'websocket';
+    }
     this.connectPromise = this.doConnect()
       .catch((error) => {
         // Auto fallback: a WebSocket attempt that died without a single
-        // server frame means the transport itself is blocked (proxy,
+        // server frame means the transport itself may be blocked (proxy,
         // antivirus), so retry immediately over long-polling. An attempt the
         // server answered (an auth rejection, a protocol error) would fail
         // identically on any transport and is rethrown instead.
         const transportFailed = this.attemptReachedTransport && !this.attemptSawFrame;
         const fallbackAvailable = (this.options.transport ?? 'auto') === 'auto' && this.activeTransport === 'websocket';
         const stillWanted = this.state !== 'closing' && this.state !== 'closed' && this.state !== 'failed';
+        if (transportFailed && fallbackAvailable) {
+          this.lastWebSocketFailureAt = Date.now();
+        }
         if (transportFailed && fallbackAvailable && stillWanted) {
           this.activeTransport = 'long-polling';
-          return this.doConnect();
+          return this.doConnect().catch((fallbackError) => {
+            // The fallback died the same transport-level death, so the
+            // network was down rather than the WebSocket blocked. Return to
+            // WebSocket for the next attempt: an outage must never demote
+            // the client for good.
+            if (this.attemptReachedTransport && !this.attemptSawFrame) {
+              this.activeTransport = 'websocket';
+            }
+            throw fallbackError;
+          });
         }
         throw error;
       })
