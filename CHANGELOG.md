@@ -14,6 +14,23 @@ All notable changes to `@foony/realtime`. Format loosely follows
   rejects) left the client in `connecting` for the life of the page, with
   nothing scheduled to retry.
 
+### Changed
+
+- **The connection now reacts to the browser's online and offline events.**
+  When the browser reports it is offline, the connection state changes to
+  `disconnected` right away. Before, a dead link was only detected by the
+  keep-alive timeout, which took up to 25 seconds. When the browser reports it
+  is back online, the SDK clears the reconnect backoff that built up while
+  there was no route, so a client that had reached `maxReconnectDelayMs`
+  retries after `initialReconnectDelayMs` instead. This applies to browsers
+  only, and `autoReconnect: false` still means the SDK never reconnects on its
+  own.
+- **A presence `leave` event now includes the member's last payload.** Its
+  `data` is the same one that member last published, so a member list built
+  from presence events can show who left instead of falling back to their
+  client id. A member is also removed as soon as their connection closes,
+  instead of staying in the list for 15 seconds.
+
 ## 0.15.1
 
 ### Fixed

@@ -1419,7 +1419,112 @@ describe('Connection end-to-end (fake edge)', () => {
     ).rejects.toThrow(/at most 1000/);
     await realtime.close();
   });
+
+  // Chrome's DevTools "Offline" mode does not tear down an already-open WebSocket, so
+  // without these listeners the SDK keeps happily sending on a link the browser has
+  // already declared dead. On a real network loss the keep-alive does notice eventually,
+  // but only after a ping interval plus a pong deadline.
+  it('B: goes disconnected as soon as the browser reports the network is gone', async () => {
+    const network = installNetworkEvents();
+    try {
+      const realtime = new Realtime({
+        endpoint: harness.endpoint,
+        token: 'GOOD',
+        autoReconnect: false,
+        webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      });
+      await realtime.connect();
+      expect(realtime.connection.getState()).toBe('connected');
+
+      network.fire('offline');
+      await waitFor(() => realtime.connection.getState() === 'disconnected', 'offline disconnect');
+      await realtime.close();
+    } finally {
+      network.uninstall();
+    }
+  });
+
+  it('B: ignores the browser coming back when autoReconnect is off', async () => {
+    const network = installNetworkEvents();
+    try {
+      const realtime = new Realtime({
+        endpoint: harness.endpoint,
+        token: 'GOOD',
+        autoReconnect: false,
+        webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      });
+      await realtime.connect();
+      const socketsBefore = harness.sockets.length;
+
+      network.fire('offline');
+      await waitFor(() => realtime.connection.getState() === 'disconnected', 'offline disconnect');
+
+      // An app that opted out of reconnecting must stay down; the online hint cannot
+      // override it.
+      network.fire('online');
+      await delay(50);
+      expect(realtime.connection.getState()).toBe('disconnected');
+      expect(harness.sockets.length).toBe(socketsBefore);
+      await realtime.close();
+    } finally {
+      network.uninstall();
+    }
+  });
+
+  it('B: detaches its network listeners on close', async () => {
+    const network = installNetworkEvents();
+    try {
+      const realtime = new Realtime({
+        endpoint: harness.endpoint,
+        token: 'GOOD',
+        autoReconnect: false,
+        webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      });
+      await realtime.connect();
+      expect(network.count('offline')).toBe(1);
+      expect(network.count('online')).toBe(1);
+
+      // A closed Connection must not stay reachable from globalThis.
+      await realtime.close();
+      expect(network.count('offline')).toBe(0);
+      expect(network.count('online')).toBe(0);
+    } finally {
+      network.uninstall();
+    }
+  });
 });
+
+/**
+ * Install a minimal `addEventListener`/`removeEventListener` on globalThis so tests can
+ * drive the browser's online/offline events. Node's globalThis has neither, which is
+ * exactly why the SDK treats them as optional.
+ */
+function installNetworkEvents() {
+  const handlers = new Map<string, Set<() => void>>();
+  const scope = globalThis as unknown as Record<string, unknown>;
+  scope.addEventListener = (type: string, handler: () => void) => {
+    const existing = handlers.get(type) ?? new Set<() => void>();
+    existing.add(handler);
+    handlers.set(type, existing);
+  };
+  scope.removeEventListener = (type: string, handler: () => void) => {
+    handlers.get(type)?.delete(handler);
+  };
+  return {
+    fire(type: string): void {
+      for (const handler of [...(handlers.get(type) ?? [])]) {
+        handler();
+      }
+    },
+    count(type: string): number {
+      return handlers.get(type)?.size ?? 0;
+    },
+    uninstall(): void {
+      delete scope.addEventListener;
+      delete scope.removeEventListener;
+    },
+  };
+}
 
 /** Poll until `predicate` is true or 2s elapses. */
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {

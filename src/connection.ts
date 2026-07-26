@@ -441,6 +441,9 @@ const CLOSE_CODE_KEEPALIVE_TIMEOUT = 4002;
 /** Close code used when a connect attempt fails to reach `connected` in time. */
 const CLOSE_CODE_CONNECT_TIMEOUT = 4003;
 
+/** Close code used when the browser reports the network went away. */
+const CLOSE_CODE_BROWSER_OFFLINE = 4004;
+
 /**
  * Deadlines on one connect attempt, covering everything from socket creation
  * through the server's `connected` frame. While a long-polling fallback is
@@ -558,6 +561,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private pongDeadlineMs = MAX_PONG_DEADLINE_MS;
   /** Sockets whose close was already handled (e.g. a synthesized keep-alive timeout), so the real event is ignored. */
   private readonly closedSockets = new WeakSet<WebSocket>();
+  /**
+   * Removes the browser online/offline listeners, or null outside a browser. Held so
+   * `close()` can detach them. A Connection that has been closed must not keep a
+   * reference alive on `window`.
+   */
+  private detachNetworkListeners: (() => void) | null = null;
   private reconnectAttempt = 0;
   /** True once the first handshake has completed, so we can tell a reconnect from the first connect. */
   private hasConnectedBefore = false;
@@ -638,6 +647,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    */
   async connect(): Promise<void> {
     if (this.state === 'connected') return;
+    this.attachNetworkListeners();
     if (this.connectPromise) return this.connectPromise;
     // Parked on long-polling with the last WebSocket failure a while back?
     // Probe the WebSocket again: the block may have been one bad moment (an
@@ -694,6 +704,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.detachNetworkListeners?.();
+    this.detachNetworkListeners = null;
     this.stopKeepAlive();
     this.setState('closing');
     if (this.socket && (this.socket.readyState === READY_STATE_CONNECTING || this.socket.readyState === READY_STATE_OPEN)) {
@@ -1386,6 +1398,57 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       safeClose(ws, CLOSE_CODE_KEEPALIVE_TIMEOUT, 'keep-alive timeout');
       this.handleClose(ws, { code: CLOSE_CODE_KEEPALIVE_TIMEOUT, reason: 'keep-alive timeout' } as CloseEvent);
     }, this.pongDeadlineMs);
+  }
+
+  /**
+   * Listen for the browser's network transitions so a lost or restored connection is acted
+   * on at once instead of waiting on timers. Without this the keep-alive is the only
+   * detector, and it needs a ping interval plus a pong deadline (up to ~25s) to notice a
+   * link that is already gone. Coming back is worse, because a restored network waits out
+   * whatever reconnect backoff was running, up to `maxReconnectDelayMs`.
+   *
+   * The two signals get different trust. `offline` is worth acting on: the browser is
+   * telling us there is no route, and the socket is already dead whether or not it has
+   * noticed. `online` only means an interface came back, not that anything is reachable (a
+   * captive portal reports online), so it is treated as a hint to retry now rather than
+   * proof a connect will succeed. A failed attempt just resumes the normal backoff.
+   *
+   * No-op outside a browser: Node and the other SDKs have no such events.
+   */
+  private attachNetworkListeners(): void {
+    if (this.detachNetworkListeners || typeof globalThis.addEventListener !== 'function') {
+      return;
+    }
+    const onOffline = () => {
+      const ws = this.socket;
+      if (!ws || this.state !== 'connected') {
+        return;
+      }
+      // Drive the teardown rather than waiting for the dead socket's own close event, the
+      // same way the keep-alive deadline does.
+      safeClose(ws, CLOSE_CODE_BROWSER_OFFLINE, 'browser offline');
+      this.handleClose(ws, { code: CLOSE_CODE_BROWSER_OFFLINE, reason: 'browser offline' } as CloseEvent);
+    };
+    const onOnline = () => {
+      if (this.state !== 'disconnected' || this.options.autoReconnect === false) {
+        return;
+      }
+      // Drop the backoff that built up while there was no route at all and retry from the
+      // start of the schedule. That is the initial delay rather than zero, which doubles as
+      // a debounce: an interface often reports online a moment before it can carry traffic.
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.reconnectAttempt = 0;
+      this.scheduleReconnect();
+    };
+    globalThis.addEventListener('offline', onOffline);
+    globalThis.addEventListener('online', onOnline);
+    this.detachNetworkListeners = () => {
+      globalThis.removeEventListener('offline', onOffline);
+      globalThis.removeEventListener('online', onOnline);
+    };
   }
 
   /** Disarm the dead-link detector. Any inbound frame proves the link is alive. */
