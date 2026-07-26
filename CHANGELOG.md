@@ -30,6 +30,12 @@ All notable changes to `@foony/realtime`. Format loosely follows
   from presence events can show who left instead of falling back to their
   client id. A member is also removed as soon as their connection closes,
   instead of staying in the list for 15 seconds.
+- **Presence now includes your own events.** The service echoes your own
+  `enter`, `update`, and `leave` back to you, and the initial member snapshot
+  includes your own entry, so a member list built from presence events
+  contains this client too. Previously your own events were filtered out
+  server-side. This is a service-side change with no SDK code change. Each
+  echoed event bills as one outbound message like any other presence delivery.
 
 ## 0.15.1
 

@@ -760,7 +760,9 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
 
 /**
  * Presence for one channel. Announce this connection with `enter` / `update` /
- * `leave`, and listen on who comes and goes with `on`. Reached via
+ * `leave`, and listen on who comes and goes with `on`. Events include this
+ * connection's own transitions, so a member list built from events contains
+ * this client too. Reached via
  * {@link Channel.presence | `channel.presence`}. See the
  * [presence docs](https://foony.io/docs/presence) for the full model.
  *
@@ -803,7 +805,9 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   /**
    * Register a listener for presence events. Adding the first listener asks
    * the server for presence on this channel: an initial member snapshot, then
-   * live transitions. This is independent of a message `subscribe`, so a
+   * live transitions. Both include this connection's own membership, so your
+   * own `enter`, `update`, and `leave` come back like any other member's.
+   * This is independent of a message `subscribe`, so a
    * channel used only for messages never opens a presence watcher, and the
    * watcher is dropped again when the last presence listener is removed.
    */
@@ -853,7 +857,8 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
 
   /**
    * Announce this connection as present on the channel, with optional `data`
-   * (a display name, a status) shown to other members. Implicitly attaches
+   * (a display name, a status) shown to other members. Every watcher,
+   * including this connection, receives the `enter` event. Implicitly attaches
    * the channel. The membership is remembered, and the SDK re-enters it
    * automatically after a reconnect. Resolves once the server acks the entry.
    * Rejects with the server's error when the token lacks the presence
@@ -865,8 +870,9 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
   }
 
   /**
-   * Replace the `data` on this connection's presence entry. Other members
-   * receive an `update` event. Resolves once the server acks the update.
+   * Replace the `data` on this connection's presence entry. Every watcher,
+   * including this connection, receives an `update` event. Resolves once the
+   * server acks the update.
    * Rejects with the server's error when the token lacks the presence
    * capability.
    */
@@ -877,7 +883,8 @@ export class Presence extends TypedEventEmitter<PresenceEventType, PresenceEvent
 
   /**
    * Remove this connection's presence entry and stop the automatic re-entry
-   * on reconnect. Resolves once the server acks the leave. Rejects with the
+   * on reconnect. Every watcher, including this connection, receives the
+   * `leave` event. Resolves once the server acks the leave. Rejects with the
    * server's error when the request fails.
    */
   async leave(): Promise<void> {
