@@ -21,6 +21,8 @@ type LpSession = {
   pending: Buffer[];
   waiter: (() => void) | null;
   closed: boolean;
+  /** Channels this session has subscribed to, so publishes fan out like the real edge. */
+  readonly subscriptions: Set<string>;
 };
 
 type LpEdge = {
@@ -30,6 +32,8 @@ type LpEdge = {
   connectCount: number;
   disconnectCount: number;
   readonly publishFrames: ClientFrame[];
+  /** Every client frame the edge received, in arrival order across all requests. */
+  readonly clientFrames: ClientFrame[];
   /** Deliver a server frame to every live session (as a poll body). */
   push(frame: ServerFrame): void;
   close(): Promise<void>;
@@ -70,6 +74,7 @@ async function startFakeLpEdge(): Promise<LpEdge> {
     connectCount: 0,
     disconnectCount: 0,
     publishFrames: [],
+    clientFrames: [],
     push(frame) {
       for (const session of sessions.values()) {
         deliver(session, frame);
@@ -97,7 +102,7 @@ async function startFakeLpEdge(): Promise<LpEdge> {
         response.writeHead(200).end(record({ t: 'err', code: 40101, message: 'bad token' }));
         return;
       }
-      const session: LpSession = { id: `sess-${nextSession++}`, pending: [], waiter: null, closed: false };
+      const session: LpSession = { id: `sess-${nextSession++}`, pending: [], waiter: null, closed: false, subscriptions: new Set() };
       sessions.set(session.id, session);
       // Honor the resume id like the real edge, so presence-stable reconnects
       // are observable in tests.
@@ -116,13 +121,35 @@ async function startFakeLpEdge(): Promise<LpEdge> {
 
     if (request.url === '/lp/send') {
       for (const frame of decodeClientRecords(body)) {
+        edge.clientFrames.push(frame);
         if (frame.t === 'ping') {
           deliver(session, { t: 'pong' });
         } else if ('id' in frame) {
+          if (frame.t === 'sub') {
+            session.subscriptions.add(frame.channel);
+          }
           if (frame.t === 'pub') {
             edge.publishFrames.push(frame);
           }
           deliver(session, { t: 'ack', id: frame.id });
+          // Fan a publish out to every subscriber of the channel, the publisher
+          // included: the edge echoes your own message back to you.
+          if (frame.t === 'pub') {
+            for (const target of sessions.values()) {
+              if (target.subscriptions.has(frame.channel)) {
+                deliver(target, {
+                  t: 'msg',
+                  channel: frame.channel,
+                  name: frame.name,
+                  data: frame.data,
+                  messageId: frame.messageId ?? 'edge-1',
+                  timestamp: Date.now(),
+                  // The real edge forwards batch `messages` opaquely.
+                  ...(frame.messages === undefined ? {} : { messages: frame.messages }),
+                });
+              }
+            }
+          }
         }
       }
       response.writeHead(200).end();
@@ -377,6 +404,28 @@ describe('long-polling transport', () => {
     await vi.waitFor(() => {
       expect(edge.disconnectCount).toBe(1);
     });
+  });
+
+  it('delivers a publisher its own echo on a subscription opened in the same tick', async () => {
+    // subscribe() and publish() in one tick. The send lane serializes both
+    // frames in call order, so the edge subscribes before it publishes and the
+    // publisher gets its own message back, exactly as on the WebSocket.
+    const edge = await startFakeLpEdge();
+    cleanups.push(() => edge.close());
+    const client = new Realtime({ token: 'T', endpoint: edge.url, transport: 'long-polling' });
+    cleanups.push(() => client.close());
+    await client.connect();
+
+    const received: MessageFrame[] = [];
+    const channel = client.channels.get('room:echo');
+    channel.subscribe((message) => received.push(message));
+    await channel.publish('hello', { a: 1 });
+
+    await vi.waitFor(() => {
+      expect(received.map((message) => message.name)).toContain('hello');
+    });
+    const order = edge.clientFrames.filter((frame) => frame.t === 'sub' || frame.t === 'pub').map((frame) => frame.t);
+    expect(order).toEqual(['sub', 'pub']);
   });
 
   it('falls back to long-polling when the WebSocket never opens', async () => {
