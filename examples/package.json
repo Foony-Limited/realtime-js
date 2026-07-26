@@ -7,7 +7,8 @@
   "scripts": {
     "client": "vite",
     "build": "vite build",
-    "bot": "tsx server/bot.ts"
+    "bot": "tsx server/bot.ts",
+    "presence-test": "tsx server/presence-test.ts"
   },
   "dependencies": {
     "react": "19.2.0",
