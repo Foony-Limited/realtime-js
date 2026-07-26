@@ -8,7 +8,7 @@
 
 import { AddressInfo } from 'node:net';
 import { WebSocket as NodeWebSocket, WebSocketServer } from 'ws';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { Cipher, Realtime, TypedEventEmitter, generateRandomKey } from './index.js';
 import type { AuthFrame, ClientFrame, ServerFrame } from './wire.js';
@@ -240,6 +240,7 @@ describe('Connection end-to-end (fake edge)', () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     for (const socket of harness.sockets) {
       try {
         socket.terminate();
@@ -1157,6 +1158,37 @@ describe('Connection end-to-end (fake edge)', () => {
 
     await expect(realtime.connect()).rejects.toThrow('token endpoint down');
     await waitFor(() => realtime.getState() === 'connected', 'recovered after failed token mint');
+    await realtime.close();
+  });
+
+  it('bounds an auth callback that never settles instead of hanging in connecting', async () => {
+    // A token fetch on an HTTP client with no timeout: the request is dropped
+    // on the floor and the promise never settles. Without a deadline the
+    // connect attempt parks in `connecting` with no timer running and no
+    // socket, so nothing ever retries.
+    vi.useFakeTimers();
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: () => new Promise<string>(() => {}),
+    });
+
+    let outcome = 'pending';
+    const connected = realtime.connect().then(
+      () => {
+        outcome = 'resolved';
+      },
+      () => {
+        outcome = 'rejected';
+      },
+    );
+    // A virtual minute is far past any sane deadline.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(outcome).toBe('rejected');
+    await connected;
+    expect(realtime.getState()).toBe('disconnected');
+    vi.useRealTimers();
     await realtime.close();
   });
 

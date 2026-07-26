@@ -246,6 +246,10 @@ export type ConnectionOptions = {
    * again on every reconnect. This is the recommended auth method for
    * browsers and anything long-running, because the SDK can renew the token
    * whenever it needs one. See the [auth docs](https://foony.io/docs/auth).
+   *
+   * The SDK gives it 15 seconds to settle, then fails the attempt and retries
+   * on the reconnect backoff, so a token fetch that hangs cannot park the
+   * connection in `connecting`.
    */
   readonly authCallback?: () => Promise<string> | string;
   /**
@@ -447,6 +451,16 @@ const CLOSE_CODE_CONNECT_TIMEOUT = 4003;
  */
 const CONNECT_TIMEOUT_WITH_FALLBACK_MS = 5_000;
 const CONNECT_TIMEOUT_MS = 15_000;
+
+/**
+ * Deadline on the consumer's `authCallback`. The token fetch runs before any
+ * socket exists, so nothing else in the connection can notice it stalling: a
+ * fetch on an HTTP client with no timeout of its own never rejects when the
+ * request is dropped, and the attempt would sit in `connecting` forever with
+ * no timer running. Matches the forced-transport connect deadline, since the
+ * fetch is plain HTTP and no transport fallback can rescue it.
+ */
+const AUTH_CALLBACK_TIMEOUT_MS = 15_000;
 
 /**
  * How long a client parked on long-polling waits before probing the WebSocket
@@ -1095,7 +1109,33 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     if (!this.options.authCallback) {
       throw new Error('Connection: missing auth method');
     }
-    return { t: 'auth', token: await this.options.authCallback(), ...resume };
+    return { t: 'auth', token: await this.awaitAuthCallback(this.options.authCallback), ...resume };
+  }
+
+  /**
+   * Run the consumer's `authCallback` under a deadline. On expiry this throws
+   * from `doConnect`'s auth phase, which is already the "no socket exists yet"
+   * error path: the state machine moves to `disconnected` and the attempt
+   * falls into the normal reconnect backoff, so the next attempt gets a fresh
+   * token fetch.
+   */
+  private async awaitAuthCallback(callback: () => Promise<string> | string): Promise<string> {
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        // Promise.race keeps a rejection handler on the callback's promise, so
+        // a late rejection from the abandoned fetch is never unhandled.
+        Promise.resolve(callback()),
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(
+            () => reject(new Error(`authCallback timed out after ${AUTH_CALLBACK_TIMEOUT_MS}ms`)),
+            AUTH_CALLBACK_TIMEOUT_MS,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(deadline);
+    }
   }
 
   /** Steady-state message handler, installed after a successful auth. Every server frame

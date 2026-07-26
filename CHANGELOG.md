@@ -3,6 +3,17 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.15.2
+
+### Fixed
+
+- **An `authCallback` that never settles no longer hangs the connection.** The
+  SDK now gives your callback 15 seconds to return a token, then fails the
+  attempt and retries on the normal reconnect backoff. Before, a token fetch
+  on an HTTP client with no timeout of its own (a dropped request that never
+  rejects) left the client in `connecting` for the life of the page, with
+  nothing scheduled to retry.
+
 ## 0.15.1
 
 ### Fixed
