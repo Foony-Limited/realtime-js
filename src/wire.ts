@@ -335,7 +335,10 @@ export type PresenceEventFrame = {
   readonly clientId: string;
   /** Connection id of the member whose presence changed. */
   readonly connectionId: string;
-  /** Presence payload supplied on enter/update, if any. */
+  /**
+   * The member's presence payload, if any. On a `leave` it is the last payload that
+   * member published, so a member list built from these events can still name who left.
+   */
   readonly data?: unknown;
   /** How `data` is encoded (e.g. `cipher+aes-256-gcm/base64`). Absent for plain JSON. */
   readonly encoding?: string;
