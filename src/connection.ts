@@ -29,6 +29,7 @@ import type {
 import { ErrorCode } from './wire.js';
 import { decodeServerFrames, encodeClientFrame, frameBinaryRecord } from './binary.js';
 import { LongPollSocket, endpointToHttpUrl } from './longpoll.js';
+import { forgetWebSocketFailure, readWebSocketFailureAt, rememberWebSocketFailure } from './transportMemory.js';
 
 /** Function returned from listener registration APIs to remove a listener. */
 export type EventUnsubscribeFn = () => void;
@@ -265,10 +266,14 @@ export type ConnectionOptions = {
    * on long-polling only while the WebSocket stays blocked: if the fallback
    * attempt fails the same way (the network was down, not the WebSocket
    * blocked) the next attempt is WebSocket again, and a client parked on
-   * long-polling re-probes the WebSocket about once a minute. `'websocket'`
-   * and `'long-polling'` force one transport and never switch. Long-polling
-   * trades higher latency and per-request overhead for working on networks
-   * that break WebSockets, so prefer `'auto'` outside of tests.
+   * long-polling re-probes the WebSocket about once a minute. In browsers, auto mode also
+   * remembers a recent WebSocket failure per endpoint, so a new connection on a network that
+   * blocks upgrades starts on long-polling rather than waiting out the connect deadline again;
+   * the memory expires on its own and is dropped as soon as a WebSocket connects, so it can
+   * only ever save time, never pin the transport. `'websocket'` and `'long-polling'` force one
+   * transport and never switch, which also opts out of that recovery, so prefer `'auto'`
+   * outside of tests. Long-polling trades higher latency and per-request overhead for working
+   * on networks that break WebSockets.
    *
    * @defaultValue `'auto'`
    */
@@ -584,16 +589,20 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   /** Channels the SDK has asked for presence events on. Re-sent on reconnect. */
   private readonly desiredPresence = new Set<string>();
   /**
-   * The transport connect attempts use. Starts on WebSocket (unless the
-   * `transport` option forces long-polling) and flips to long-polling when an
-   * auto-mode WebSocket attempt fails at the transport level. Never flips
-   * back: a network that broke WebSockets once will keep breaking them, and
-   * flapping between transports would churn presence and resume state.
+   * The transport connect attempts use. In auto mode it starts on WebSocket, or on long-polling
+   * when this browser saw a WebSocket fail here within the re-probe interval (see
+   * transportMemory), and flips to long-polling when an auto-mode WebSocket attempt fails at the
+   * transport level. It flips back when the long-polling attempt dies the same way (the network
+   * was down rather than WebSockets blocked) and on the periodic re-probe, so a transient
+   * failure cannot strand the client on the slower transport. A forced `transport` option pins
+   * this and disables every switch above.
    */
   private activeTransport: 'websocket' | 'long-polling';
   /**
    * When the last WebSocket attempt died at the transport level, driving the
-   * once-a-minute WebSocket re-probe while parked on long-polling.
+   * once-a-minute WebSocket re-probe while parked on long-polling. Seeded from the persisted
+   * transport memory at construction and mirrored back to it, so the re-probe clock survives a
+   * page load instead of restarting from "try WebSocket" every time.
    */
   private lastWebSocketFailureAt = 0;
   /** True once the current connect attempt created its socket (a transport was actually tried). */
@@ -615,7 +624,32 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       throw new Error('Connection: pass exactly one of options.token, options.authCallback, or options.key');
     }
     this.options = options;
-    this.activeTransport = options.transport === 'long-polling' ? 'long-polling' : 'websocket';
+    if (options.transport === 'long-polling') {
+      this.activeTransport = 'long-polling';
+      return;
+    }
+    this.activeTransport = 'websocket';
+    if ((options.transport ?? 'auto') !== 'auto') {
+      return;
+    }
+    // Pick up where the last connection on this browser left off. Starting on long-polling when
+    // a WebSocket failed here moments ago is what keeps a blocked network from costing every
+    // new connection a full connect deadline. Seeding the failure time rather than forcing the
+    // transport keeps this inside auto mode, so connect()'s re-probe still promotes the client
+    // back to WebSocket once the memory ages out.
+    const failedAt = readWebSocketFailureAt(this.transportMemoryKey());
+    if (failedAt > 0 && Date.now() - failedAt < WEBSOCKET_REPROBE_INTERVAL_MS) {
+      this.lastWebSocketFailureAt = failedAt;
+      this.activeTransport = 'long-polling';
+    }
+  }
+
+  /**
+   * Endpoint the transport memory is stored under. Connections to different endpoints must not
+   * share a verdict: one may be blocked while another is fine.
+   */
+  private transportMemoryKey(): string {
+    return this.options.endpoint ?? DEFAULT_REALTIME_ENDPOINT;
   }
 
   /** Current {@link ConnectionState}. Listen on changes with `on(...)`. */
@@ -672,6 +706,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         const stillWanted = this.state !== 'closing' && this.state !== 'closed' && this.state !== 'failed';
         if (transportFailed && fallbackAvailable) {
           this.lastWebSocketFailureAt = Date.now();
+          // Persist it so the next connection this browser builds skips the same dead wait.
+          rememberWebSocketFailure(this.transportMemoryKey());
         }
         if (transportFailed && fallbackAvailable && stillWanted) {
           this.activeTransport = 'long-polling';
@@ -1020,6 +1056,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           this.connectionId = connected.connectionId;
           this.serverClientId = connected.clientId;
           this.reconnectAttempt = 0;
+          if (this.activeTransport === 'websocket') {
+            // WebSockets work here after all, so drop any remembered block rather than making
+            // later connections wait for the memory to age out.
+            this.lastWebSocketFailureAt = 0;
+            forgetWebSocketFailure(this.transportMemoryKey());
+          }
           // Hand future frames over to the steady-state handler.
           ws.removeEventListener('message', onAuthMessage as EventListener);
           ws.addEventListener('message', this.handleMessage);

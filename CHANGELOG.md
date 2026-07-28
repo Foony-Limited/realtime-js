@@ -3,6 +3,23 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.15.3
+
+### Fixed
+
+- **A network that blocks WebSockets no longer costs every connection a stalled
+  connect.** In `'auto'` mode the SDK now remembers per endpoint that a
+  WebSocket attempt just failed, so the next connection starts on long-polling
+  instead of waiting out the connect deadline again. This matters most for apps
+  that open more than one connection, where the wait used to be paid on each of
+  them and again on every page load.
+- **A client on long-polling returns to WebSocket as soon as one works.** The
+  memory above expires on its own and is dropped the moment a WebSocket
+  connects, so a laptop that moves off a restrictive network recovers without a
+  page reload. If you were passing `transport: 'long-polling'` yourself to skip
+  the stall, drop it and use the default `'auto'`: forcing a transport turns off
+  this recovery and keeps the client on the slower one.
+
 ## 0.15.2
 
 ### Fixed

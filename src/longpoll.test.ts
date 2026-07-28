@@ -461,6 +461,66 @@ describe('long-polling transport', () => {
     expect(edge.connectCount).toBe(0);
   });
 
+  it('remembers a blocked WebSocket so the next connection skips the dead attempt', async () => {
+    // The whole point of the persisted memory: an app that builds several connections must not
+    // pay the WebSocket connect deadline on each one, and must not pay it again next page load.
+    const store = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => store.set(key, value),
+      removeItem: (key: string) => store.delete(key),
+      clear: () => store.clear(),
+      key: () => null,
+      length: 0,
+    });
+    cleanups.push(() => vi.unstubAllGlobals());
+
+    const edge = await startFakeLpEdge();
+    cleanups.push(() => edge.close());
+
+    let socketsBuilt = 0;
+    class CountingBlockedWebSocket extends BlockedWebSocket {
+      constructor(url: string) {
+        super(url);
+        socketsBuilt++;
+      }
+    }
+
+    const first = new Realtime({
+      token: 'T',
+      endpoint: edge.url,
+      webSocket: CountingBlockedWebSocket as unknown as typeof WebSocket,
+    });
+    cleanups.push(() => first.close());
+    await first.connect();
+    expect(first.getState()).toBe('connected');
+    expect(socketsBuilt).toBe(1);
+
+    // A second connection to the same endpoint goes straight to long-polling.
+    const second = new Realtime({
+      token: 'T',
+      endpoint: edge.url,
+      webSocket: CountingBlockedWebSocket as unknown as typeof WebSocket,
+    });
+    cleanups.push(() => second.close());
+    await second.connect();
+    expect(second.getState()).toBe('connected');
+    expect(socketsBuilt, 'second connection should not have attempted a WebSocket').toBe(1);
+
+    // The memory is not a life sentence: once it ages past the re-probe interval a new
+    // connection tries a WebSocket again, so a network that recovers is noticed.
+    store.set(`foony-realtime:ws-failed-at:${edge.url}`, String(Date.now() - 10 * 60_000));
+    const third = new Realtime({
+      token: 'T',
+      endpoint: edge.url,
+      webSocket: CountingBlockedWebSocket as unknown as typeof WebSocket,
+    });
+    cleanups.push(() => third.close());
+    await third.connect();
+    expect(third.getState()).toBe('connected');
+    expect(socketsBuilt, 'a stale memory should not stop the client re-probing').toBe(2);
+  });
+
   it('falls back when the WebSocket opens but the handshake reply never arrives', async () => {
     // A middlebox that admits the upgrade and then blackholes frames. The
     // connect attempt must hit a deadline, fail over to long-polling, and
