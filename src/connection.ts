@@ -344,6 +344,13 @@ export type ConnectionState =
    * missed (within retention).
    */
   | 'disconnected'
+  /**
+   * `suspend()` was called: the connection is down and stays down until an
+   * explicit `connect()`. Channels keep their listeners and resume cursors
+   * and re-attach on that connect; channel calls made while suspended wait
+   * for it instead of reconnecting.
+   */
+  | 'suspended'
   /** `close()` was called and the socket is shutting down. */
   | 'closing'
   /** Closed by `close()`. Publishes that were awaiting an ack have been rejected. */
@@ -554,6 +561,14 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private readonly channelDispatchers = new Map<string, ChannelDispatchers>();
   private connectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Present while the connection is suspended by the app. Internal callers
+   * that would lazily dial (a channel attach, a publish) await the gate's
+   * promise, which the next explicit `connect()` releases — so a background
+   * render can never resurrect a suspended connection.
+   */
+  private suspendGate: { readonly promise: Promise<void>; readonly release: () => void } | null = null;
   /**
    * Keep-alive ping timer. Sends a ping every server-advertised `keepAliveMs` so an idle
    * connection (no subscriptions or traffic) is not culled by an intermediary such as
@@ -680,6 +695,13 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * `token` with no `authCallback` to re-mint one.
    */
   async connect(): Promise<void> {
+    if (this.suspendGate) {
+      // The app is resuming a suspended connection: let the parked lazy
+      // callers (attaches, publishes) proceed once this connect lands.
+      const gate = this.suspendGate;
+      this.suspendGate = null;
+      gate.release();
+    }
     if (this.state === 'connected') return;
     this.attachNetworkListeners();
     if (this.connectPromise) return this.connectPromise;
@@ -703,7 +725,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         // identically on any transport and is rethrown instead.
         const transportFailed = this.attemptReachedTransport && !this.attemptSawFrame;
         const fallbackAvailable = (this.options.transport ?? 'auto') === 'auto' && this.activeTransport === 'websocket';
-        const stillWanted = this.state !== 'closing' && this.state !== 'closed' && this.state !== 'failed';
+        const stillWanted = this.state !== 'closing' && this.state !== 'closed' && this.state !== 'failed' && this.state !== 'suspended';
         if (transportFailed && fallbackAvailable) {
           this.lastWebSocketFailureAt = Date.now();
           // Persist it so the next connection this browser builds skips the same dead wait.
@@ -728,6 +750,43 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         this.connectPromise = null;
       });
     return this.connectPromise;
+  }
+
+  /**
+   * Close the connection but keep every channel: listeners, subscriptions,
+   * and resume cursors all survive, and the next explicit `connect()`
+   * re-attaches everything. Requests and publishes still awaiting an ack
+   * reject with a "connection suspended" error; ones made while suspended
+   * wait for that connect instead of reconnecting. Idempotent, and a no-op
+   * once the connection is closing, closed, or failed.
+   */
+  async suspend(): Promise<void> {
+    if (this.state === 'suspended' || this.state === 'closing' || this.state === 'closed' || this.state === 'failed') {
+      return;
+    }
+    if (!this.suspendGate) {
+      let release!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      this.suspendGate = { promise, release };
+    }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.detachNetworkListeners?.();
+    this.detachNetworkListeners = null;
+    this.stopKeepAlive();
+    if (this.socket && (this.socket.readyState === READY_STATE_CONNECTING || this.socket.readyState === READY_STATE_OPEN)) {
+      // Also abort a socket that is still connecting, or a suspend() racing an
+      // in-flight connect() would leave the handshake to complete and resurrect
+      // the connection.
+      safeClose(this.socket, 1000, 'client suspend');
+    }
+    this.setState('suspended');
+    this.failPendingRequests(new Error('connection suspended'));
+    this.failOutstandingPublishes(new Error('connection suspended'));
   }
 
   /**
@@ -772,11 +831,23 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   /**
+   * Like `connect()`, but a suspended connection waits for the app's explicit
+   * `connect()` instead of dialing. Every internal lazy-dial path (attach,
+   * history, fetch, publish) comes through here.
+   */
+  private async ensureConnected(): Promise<void> {
+    while (this.suspendGate) {
+      await this.suspendGate.promise;
+    }
+    return this.connect();
+  }
+
+  /**
    * Send a frame that expects an ack. Returns the matching AckFrame, or
    * rejects with the server's ErrorFrame (wrapped in an Error).
    */
   private async request(frame: AckableFrame): Promise<AckFrame> {
-    await this.connect();
+    await this.ensureConnected();
     const id = this.nextRequestId++;
     const out = { ...frame, id } as ClientFrame;
     return new Promise<AckFrame>((resolve, reject) => {
@@ -796,7 +867,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * dedicated response frame rather than a bare ack.
    */
   private async requestHistory(frame: Omit<HistoryFrame, 'id'>): Promise<HistoryResponseFrame> {
-    await this.connect();
+    await this.ensureConnected();
     const id = this.nextRequestId++;
     const out = { ...frame, id } as ClientFrame;
     return new Promise<HistoryResponseFrame>((resolve, reject) => {
@@ -816,7 +887,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * the `fetchRes` frame (or rejects on `err`).
    */
   private async requestFetch(frame: Omit<FetchFrame, 'id'>): Promise<FetchResponseFrame> {
-    await this.connect();
+    await this.ensureConnected();
     const id = this.nextRequestId++;
     const out = { ...frame, id } as ClientFrame;
     return new Promise<FetchResponseFrame>((resolve, reject) => {
@@ -855,7 +926,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       } else {
         // Buffered: kick a connect so it drains even if no reconnect is pending yet
         // (e.g. the very first publish); reconnect backoff drives subsequent retries.
-        void this.connect().catch(() => {});
+        // A suspended connection stays down: the publish waits at the gate.
+        void this.ensureConnected().catch(() => {});
       }
     });
   }
@@ -991,8 +1063,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       }
       throw error;
     }
-    if (this.state === 'closing' || this.state === 'closed') {
-      // close() ran while the auth frame was being built. Don't resurrect.
+    if (this.state === 'closing' || this.state === 'closed' || this.state === 'suspended') {
+      // close() or suspend() ran while the auth frame was being built. Don't resurrect.
       safeClose(ws, 1000, 'client close');
       throw new Error('connection closed during connect');
     }
@@ -1045,9 +1117,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           return;
         }
         if (parsed.t === 'connected') {
-          if (this.state === 'closing' || this.state === 'closed') {
-            // close() ran while the handshake was in flight. Don't resurrect the
-            // connection into a zombie the app believes is closed.
+          if (this.state === 'closing' || this.state === 'closed' || this.state === 'suspended') {
+            // close() or suspend() ran while the handshake was in flight. Don't
+            // resurrect the connection into a zombie the app believes is down.
             safeClose(ws, 1000, 'client close');
             reject(new Error('connection closed during handshake'));
             return;
@@ -1297,6 +1369,11 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // mappings and reject in-flight acks, history, and fetches so attach,
     // detach, history, presence, and gap-fill callers do not hang forever.
     this.publishRequestIds.clear();
+    if (this.state === 'suspended') {
+      // suspend() already tore down and failed the pending work; the socket's
+      // close event must not mark the connection disconnected or schedule a retry.
+      return;
+    }
     if (this.state === 'closing' || this.state === 'closed') {
       this.setState('closed');
       this.failPendingRequests(new Error('connection closed'));
@@ -1346,7 +1423,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       this.connect().catch(() => {
         // doConnect itself drove the state machine; schedule another attempt
         // unless we've been explicitly closed or hit a terminal auth failure.
-        if (this.state !== 'closed' && this.state !== 'closing' && this.state !== 'failed') {
+        if (this.state !== 'closed' && this.state !== 'closing' && this.state !== 'failed' && this.state !== 'suspended') {
           this.scheduleReconnect();
         }
       });

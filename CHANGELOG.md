@@ -5,6 +5,25 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ## 0.15.3
 
+### Added
+
+- **`realtime.suspend()` closes the connection without losing your channels.**
+  The next `connect()` re-attaches everything and replays missed messages
+  (within retention). Use it to drop the connection while a tab is hidden:
+
+  ```js
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      void realtime.suspend();
+    } else {
+      void realtime.connect();
+    }
+  });
+  ```
+
+  While suspended, `connection.getState()` returns `'suspended'` and channel
+  calls wait for `connect()` instead of reconnecting on their own.
+
 ### Fixed
 
 - **A network that blocks WebSockets no longer costs every connection a stalled

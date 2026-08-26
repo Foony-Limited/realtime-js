@@ -1492,6 +1492,97 @@ describe('Connection end-to-end (fake edge)', () => {
       network.uninstall();
     }
   });
+
+  it('suspend closes the transport and stays down until an explicit connect', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const channel = realtime.channels.get('chat:s');
+    channel.subscribe(() => {});
+    await realtime.connect();
+
+    await realtime.suspend();
+    expect(realtime.getState()).toBe('suspended');
+    await waitFor(() => harness.sockets[0]?.readyState === NodeWebSocket.CLOSED, 'edge saw the close');
+
+    // Well past the reconnect backoff: suspend must not retry on its own.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(harness.sockets.length).toBe(1);
+    expect(realtime.getState()).toBe('suspended');
+
+    await realtime.close();
+  });
+
+  it('suspend keeps channels and their listeners; connect re-attaches with the resume cursor', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const received: unknown[] = [];
+    const states: string[] = [];
+    const channel = realtime.channels.get('chat:s');
+    channel.on('suspended', () => states.push('suspended'));
+    channel.on('attached', () => states.push('attached'));
+    channel.subscribe((message) => received.push(message.data));
+    await realtime.connect();
+    await waitFor(() => harness.subFrames.length === 1, 'initial sub');
+
+    // Establish a resume cursor, then suspend.
+    sendFrame(harness.sockets[0]!, { t: 'msg', channel: 'chat:s', name: 'm', data: { n: 1 }, messageId: 'm-1', seq: 7, timestamp: 1, clientId: 'alice' });
+    await waitFor(() => received.length === 1, 'message before suspend');
+    await realtime.suspend();
+    expect(states).toContain('suspended');
+
+    await realtime.connect();
+    await waitFor(() => harness.subFrames.length === 2, 're-subscribe after connect');
+    // conn is 1-based in the harness: 2 is the resume connection.
+    expect(harness.subFrames[1]).toMatchObject({ channel: 'chat:s', conn: 2, lastSerial: 7 });
+    await waitFor(() => states.filter((state) => state === 'attached').length >= 2, 'channel re-attached');
+
+    // The original listener still receives without re-subscribing.
+    sendFrame(harness.sockets[1]!, { t: 'msg', channel: 'chat:s', name: 'm', data: { n: 2 }, messageId: 'm-2', seq: 8, timestamp: 2, clientId: 'alice' });
+    await waitFor(() => received.length === 2, 'message after resume');
+    expect(received[1]).toEqual({ n: 2 });
+
+    await realtime.close();
+  });
+
+  it('subscribing while suspended does not reopen the transport; connect attaches it', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const received: unknown[] = [];
+    realtime.channels.get('chat:first').subscribe(() => {});
+    await realtime.connect();
+    await realtime.suspend();
+
+    // A background render subscribing a new channel must not resurrect the connection.
+    realtime.channels.get('chat:parked').subscribe((message) => received.push(message.data));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(harness.sockets.length).toBe(1);
+    expect(realtime.getState()).toBe('suspended');
+
+    await realtime.connect();
+    await waitFor(
+      () => harness.subFrames.some((sub) => sub.channel === 'chat:parked' && sub.conn === 2),
+      'parked channel attached on resume',
+    );
+    sendFrame(harness.sockets[1]!, { t: 'msg', channel: 'chat:parked', name: 'm', data: { ok: true }, messageId: 'p-1', seq: 1, timestamp: 1, clientId: 'alice' });
+    await waitFor(() => received.length === 1, 'parked channel delivers after resume');
+
+    await realtime.close();
+  });
 });
 
 /**

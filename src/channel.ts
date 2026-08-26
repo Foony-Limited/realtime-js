@@ -705,8 +705,10 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
 
   /** Drive the state machine from connection lifecycle changes. */
   private onConnectionState(state: ConnectionState, reason?: Error): void {
-    if (state === 'disconnected' && this.channelState === 'attached') {
-      this.transition('suspended', { reason: reason ?? new Error('connection disconnected') });
+    // An app-suspended connection parks the channel the same way a drop does:
+    // 'suspended' channels re-attach (with resume) on the next connect.
+    if ((state === 'disconnected' || state === 'suspended') && this.channelState === 'attached') {
+      this.transition('suspended', { reason: reason ?? new Error(`connection ${state}`) });
       return;
     }
     if (state === 'connected') {

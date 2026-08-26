@@ -164,6 +164,28 @@ export class Realtime {
   }
 
   /**
+   * Close the connection but keep every channel: listeners, subscriptions,
+   * and resume cursors all survive. The next {@link connect | `connect()`}
+   * re-attaches everything and replays missed messages (within retention).
+   * While suspended, channel calls wait for `connect()` instead of
+   * reconnecting on their own. Use this instead of
+   * {@link close | `close()`} when the client will be used again, e.g. while
+   * a browser tab is hidden.
+   *
+   * @example
+   * document.addEventListener('visibilitychange', () => {
+   *   if (document.visibilityState === 'hidden') {
+   *     void realtime.suspend();
+   *   } else {
+   *     void realtime.connect();
+   *   }
+   * });
+   */
+  async suspend(): Promise<void> {
+    await this.connection.suspend();
+  }
+
+  /**
    * Close the WebSocket and release every channel. Resolves once the
    * connection reaches `closed`. Publishes still awaiting an ack reject with
    * a "connection closed" error.
