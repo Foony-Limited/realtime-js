@@ -3,6 +3,25 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.16.0
+
+### Added
+
+- **`channel.resumeFrom(serial)` starts a fresh client from a stored cursor.**
+  If your app keeps messages in its own storage, seed the newest stored
+  `seq` before subscribing and the server replays only what you missed
+  instead of you re-fetching history:
+
+  ```js
+  const channel = client.channels.get('chat:room-1');
+  channel.resumeFrom(storedNewestSeq);
+  channel.subscribe(render);
+  ```
+
+  If the serial has aged out of retention the attach reports
+  `resumed: false`, which means throw the stored copy away and load
+  history fresh.
+
 ## 0.15.3
 
 ### Added

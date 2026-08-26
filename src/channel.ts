@@ -232,6 +232,31 @@ export class Channel extends TypedEventEmitter<ChannelEventType, ChannelStateLis
   }
 
   /**
+   * Seed the resume cursor before the first attach, so a client that restored messages from its
+   * own storage receives only what it missed instead of re-reading history. Pass the
+   * {@link MessageFrame.seq} of the newest stored message. No-op once the channel is attaching or
+   * attached, and never moves an existing cursor backward, so a stale seed cannot skip messages.
+   * If the serial has aged out of retention the attach reports `resumed: false` and the stored
+   * copy should be thrown away.
+   *
+   * @example
+   * const channel = client.channels.get('chat:room-1');
+   * channel.resumeFrom(storedNewestSeq);
+   * channel.subscribe(render);
+   */
+  resumeFrom(serial: number): void {
+    if (!Number.isInteger(serial) || serial <= 0) {
+      return;
+    }
+    if (this.channelState === 'attaching' || this.channelState === 'attached') {
+      return;
+    }
+    if (serial > this.contiguousSerial) {
+      this.contiguousSerial = serial;
+    }
+  }
+
+  /**
    * Ensure the server is subscribed to this channel. `subscribe()` and the
    * presence methods call this implicitly, so calling it yourself is optional.
    * It is useful for surfacing attach errors before the first message arrives.

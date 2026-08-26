@@ -1554,6 +1554,34 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('resumeFrom seeds the resume cursor so the first attach replays from a stored serial', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const received: unknown[] = [];
+    const channel = realtime.channels.get('chat:s');
+    channel.resumeFrom(42);
+    channel.subscribe((message) => received.push(message.data));
+    await realtime.connect();
+    await waitFor(() => harness.subFrames.length === 1, 'initial sub');
+    expect(harness.subFrames[0]).toMatchObject({ channel: 'chat:s', conn: 1, lastSerial: 42 });
+
+    // Live messages advance the cursor past the seed; a later stale seed must not move it back.
+    sendFrame(harness.sockets[0]!, { t: 'msg', channel: 'chat:s', name: 'm', data: { n: 1 }, messageId: 'm-43', seq: 43, timestamp: 1, clientId: 'alice' });
+    await waitFor(() => received.length === 1, 'message after seed');
+    channel.resumeFrom(10);
+    await realtime.suspend();
+    await realtime.connect();
+    await waitFor(() => harness.subFrames.length === 2, 're-subscribe after connect');
+    expect(harness.subFrames[1]).toMatchObject({ channel: 'chat:s', conn: 2, lastSerial: 43 });
+
+    await realtime.close();
+  });
+
   it('subscribing while suspended does not reopen the transport; connect attaches it', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,
