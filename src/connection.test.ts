@@ -65,6 +65,10 @@ type Harness = {
   readonly control: {
     dropNextPublish: boolean;
     dropNextSub: boolean;
+    /** Skip one retained replay, matching an edge KV read failure that still acks the subscribe. */
+    skipNextRetainedReplay: boolean;
+    /** Current document to replay when its channel is successfully subscribed. */
+    retainedDoc: { channel: string; data: unknown } | null;
     dropNextHist: boolean;
     dropNextFetch: boolean;
     /** When true, pings are swallowed instead of answered, simulating a half-dead link. */
@@ -93,6 +97,8 @@ async function startFakeEdge(): Promise<Harness> {
   const control: Harness['control'] = {
     dropNextPublish: false,
     dropNextSub: false,
+    skipNextRetainedReplay: false,
+    retainedDoc: null,
     dropNextHist: false,
     dropNextFetch: false,
     silencePongs: false,
@@ -146,6 +152,14 @@ async function startFakeEdge(): Promise<Harness> {
           // Die in the gap between receiving the sub and acking it, so the attach fails.
           socket.close(1001, 'drop before sub ack');
           return;
+        }
+        if (control.skipNextRetainedReplay) {
+          control.skipNextRetainedReplay = false;
+        } else if (control.retainedDoc?.channel === frame.channel) {
+          sendFrame(socket, {
+            t: 'msg', channel: frame.channel, name: 'doc', data: control.retainedDoc.data,
+            messageId: `doc-${subFrames.length}`, timestamp: Date.now(), clientId: 'foony-sync',
+          });
         }
       }
       if (frame.t === 'pub') {
@@ -1552,6 +1566,60 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(received[1]).toEqual({ n: 2 });
 
     await realtime.close();
+  });
+
+  it.each([false, true])('receives live currency after resume, retained replay missing: %s', async (skipNextRetainedReplay) => {
+    harness.control.keepAliveMs = 20;
+    const channelName = 'db:userItems:alice';
+    const initialItems = { currency: 100, premiumCurrency: 10 };
+    const updatedItems = { currency: 200, premiumCurrency: 20 };
+    harness.control.retainedDoc = { channel: channelName, data: initialItems };
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const received: unknown[] = [];
+    const channel = realtime.channels.get(channelName);
+    channel.subscribe('doc', (message) => received.push(message.data));
+
+    try {
+      await realtime.connect();
+      await waitFor(() => received.length === 1, 'initial currency document');
+      expect(received[0]).toEqual(initialItems);
+      await realtime.suspend();
+
+      // The account changes while the tab is suspended. The edge can skip
+      // the retained document after a KV read failure and still ack the sub.
+      harness.control.retainedDoc = { channel: channelName, data: updatedItems };
+      harness.control.skipNextRetainedReplay = skipNextRetainedReplay;
+      const pingsBeforeResume = harness.pings.length;
+      await realtime.connect();
+      await waitFor(() => harness.subFrames.length >= 2, 'subscription restore attempt');
+      await waitFor(() => harness.pings.length > pingsBeforeResume, 'healthy connection after resume');
+      expect(realtime.getState()).toBe('connected');
+      await waitFor(() => channel.state === 'attached', 'channel attached after resume');
+
+      await realtime.connect();
+      const balanceAfterResume = received.at(-1);
+      // This models the edge's behavior before the fix. The server regression test
+      // requires replayRetained to recover from the failed document read.
+      expect(balanceAfterResume).toEqual(skipNextRetainedReplay ? initialItems : updatedItems);
+
+      // A later deposit or withdrawal arrives over the same live connection
+      // and refreshes the balance, matching the reported recovery behavior.
+      const liveItems = { currency: 201, premiumCurrency: 20 };
+      sendFrame(harness.sockets[1]!, {
+        t: 'msg', channel: channelName, name: 'doc', data: liveItems,
+        messageId: 'doc-live', timestamp: Date.now(), clientId: 'foony-sync',
+      });
+      await waitFor(() => (received.at(-1) as typeof liveItems).currency === liveItems.currency, 'live balance update');
+      expect(received.at(-1)).toEqual(liveItems);
+    } finally {
+      await realtime.close();
+    }
   });
 
   it('resumeFrom seeds the resume cursor so the first attach replays from a stored serial', async () => {
