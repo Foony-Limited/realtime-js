@@ -1029,7 +1029,7 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-/** Build a per-member message frame from a batch frame. The member id is `<batchId>:<index>`. */
+/** Build a per-member message frame from a batch frame. The member id is `<batchId>:<index>`, and its `seq` is the batch's. */
 function memberFrame(base: MessageFrame, member: BatchMember, index: number): MessageFrame {
   return {
     t: 'msg',
@@ -1040,6 +1040,9 @@ function memberFrame(base: MessageFrame, member: BatchMember, index: number): Me
     messageId: `${base.messageId}:${index}`,
     ...(base.clientId === undefined ? {} : { clientId: base.clientId }),
     ...(member.encoding === undefined ? {} : { encoding: member.encoding }),
+    // The server stores a batch as one record with one serial, so every member carries it. Without
+    // it, history() gave batch members no cursor to page back from.
+    ...(base.seq === undefined ? {} : { seq: base.seq }),
     ...(base.ephemeral === true ? { ephemeral: true } : {}),
   };
 }

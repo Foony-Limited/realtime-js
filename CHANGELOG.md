@@ -3,6 +3,15 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.16.2
+
+### Fixed
+
+- **`history()` now returns `seq` on messages that were published as a batch.**
+  Before, those messages came back without one, so you had no cursor to page
+  back from them with `before`, and scrollback stopped at the first page. The
+  messages of one batch share the batch's `seq`.
+
 ## 0.16.1
 
 ### Fixed

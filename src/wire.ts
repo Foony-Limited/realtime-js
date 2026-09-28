@@ -279,7 +279,8 @@ export type MessageFrame = {
    * Contiguous per-channel serial (0/absent for ephemeral/retained/unsequenced messages). The
    * SDK uses it to detect gaps (serial != last+1), as the migration-safe resume cursor, and as
    * history's `before` cursor to page backward from this message. For a bundle the outer serial
-   * is absent and each member carries its own.
+   * is absent and each member carries its own. The messages of one batch (a `publish([...])`)
+   * share the batch's serial, because the server stores the batch as one record.
    */
   readonly seq?: number;
   /** Batch members; when set, this frame carries a batch and `name`/`data` are ignored. */

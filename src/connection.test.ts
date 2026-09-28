@@ -191,6 +191,23 @@ async function startFakeEdge(): Promise<Harness> {
           socket.close(1001, 'drop before hist response');
           return;
         }
+        if (frame.channel === 'chat:batched') {
+          // One stored batch record (serial 7, two messages) and one single message (serial 8).
+          sendFrame(socket, {
+            t: 'histRes',
+            id: frame.id,
+            channel: frame.channel,
+            messages: [
+              {
+                t: 'msg', channel: frame.channel, name: '', data: null, messageId: 'b-7', timestamp: 3, clientId: 'server', seq: 7,
+                messages: [{ name: 'a', data: { n: 1 } }, { name: 'b', data: { n: 2 } }],
+              },
+              { t: 'msg', channel: frame.channel, name: 'c', data: { n: 3 }, messageId: 's-8', timestamp: 4, clientId: 'server', seq: 8 },
+            ],
+            more: true,
+          });
+          return;
+        }
         const histRes: ServerFrame = {
           t: 'histRes',
           id: frame.id,
@@ -324,6 +341,24 @@ describe('Connection end-to-end (fake edge)', () => {
     expect(page.more).toBe(true);
     expect(page.messages.map((message) => message.messageId)).toEqual(['h-0', 'h-1']);
     expect(page.messages[0]?.data).toEqual({ n: 0 });
+    await realtime.close();
+  });
+
+  it('keeps a batch serial on each of its messages in history, so you can page back from them', async () => {
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    await realtime.connect();
+
+    const page = await realtime.channels.get('chat:batched').history({ limit: 50 });
+    expect(page.messages.map((message) => [message.messageId, message.seq])).toEqual([
+      ['b-7:0', 7],
+      ['b-7:1', 7],
+      ['s-8', 8],
+    ]);
     await realtime.close();
   });
 
