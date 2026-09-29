@@ -179,6 +179,17 @@ npm test
 Runs wire unit tests plus an in-process end-to-end test that drives the
 SDK against a fake edge built on `ws`. No external services required.
 
+## Releases
+
+Update `package.json`, `package-lock.json`, and `CHANGELOG.md`, then push to `main`.
+The [publish workflow](.github/workflows/publish.yml) builds and tests the SDK,
+then publishes the version if it is not already on npm. Stable versions use the
+`latest` tag. Prerelease versions use `next`.
+
+You can retry a failed release with **Run workflow** on GitHub's Actions page.
+Publishing uses npm's trusted publisher for this repository and `publish.yml`.
+It does not need an npm token in GitHub secrets.
+
 ## License
 
 [Apache-2.0](./LICENSE) © Foony Limited
