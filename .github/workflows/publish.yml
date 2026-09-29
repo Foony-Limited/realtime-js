@@ -34,7 +34,9 @@ jobs:
           package-manager-cache: false
 
       - name: Use npm with trusted publishing support
-        run: npm install --global npm@12.1.0
+        run: |
+          npm install --prefix "$RUNNER_TEMP/npm" --no-save --ignore-scripts --no-audit --no-fund npm@12.1.0
+          echo "$RUNNER_TEMP/npm/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Check the package version on npm
         id: release
