@@ -326,7 +326,9 @@ export type ConnectionState =
   | 'initialized'
   /**
    * The WebSocket is opening and the auth handshake is in flight. Publishes
-   * made now are queued when `queueMessages` is on (the default).
+   * made now are queued when `queueMessages` is on (the default). Channels
+   * attached and history requested now go out right after the auth step,
+   * without waiting for the server's reply.
    */
   | 'connecting'
   /**
@@ -387,6 +389,21 @@ export type ConnectionStateListener = ConnectionEventListener;
 type PendingRequest = {
   readonly resolve: (frame: AckFrame) => void;
   readonly reject: (error: Error) => void;
+};
+
+/** A request made while a connect attempt is under way (see `Connection.handshakeRequests`). */
+type HandshakeRequest = {
+  /** The frame, with its request id. The same frame goes out again on each attempt's socket. */
+  readonly frame: ClientFrame & { readonly id: number };
+  /** Moves the request into the map its answer settles it from, once `connected` arrives. */
+  readonly track: () => void;
+  readonly reject: (error: Error) => void;
+};
+
+/** A socket opened while `authCallback` runs, and when it opened (null until it does). */
+type EarlySocket = {
+  readonly socket: WebSocket;
+  openedAt: number | null;
 };
 
 /** Internal record kept for every in-flight history request (resolved by `histRes`). */
@@ -481,8 +498,17 @@ const CONNECT_TIMEOUT_WITH_FALLBACK_MS = 5_000;
 const CONNECT_TIMEOUT_MS = 15_000;
 
 /**
- * Deadline on the consumer's `authCallback`. The token fetch runs before any
- * socket exists, so nothing else in the connection can notice it stalling: a
+ * The longest an early socket (opened while `authCallback` runs) may sit open without an auth
+ * frame and still be used. The edge closes a socket that sends no auth frame within 5 s of
+ * opening (handleAuthHandshake in services/realtime-saas, whose
+ * TestAuthFrameThreeSecondsAfterOpenIsAccepted holds it to that), so a token that comes later
+ * goes out on a fresh socket instead. The 2 s left over covers the auth frame's trip to the edge.
+ */
+const EARLY_SOCKET_MAX_IDLE_MS = 3_000;
+
+/**
+ * Deadline on the consumer's `authCallback`. The connect deadline only starts once the token is
+ * in hand, so nothing else in the connection can notice the fetch stalling: a
  * fetch on an HTTP client with no timeout of its own never rejects when the
  * request is dropped, and the attempt would sit in `connecting` forever with
  * no timer running. Matches the forced-transport connect deadline, since the
@@ -569,6 +595,17 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private serverClientId: string | null = null;
   private nextRequestId = 1;
   private readonly pending = new Map<number, PendingRequest>();
+  /**
+   * Requests (attaches, presence, history) made while a connect attempt is under way. Each goes out
+   * right after the attempt's auth frame instead of after `connected`: the edge reads a
+   * connection's frames in order, so it handles them right after auth, and the caller saves a
+   * round trip. They stay here until `connected` moves them to `pending`, so a failed attempt
+   * sends them again after the next attempt's auth frame (the long-polling fallback included).
+   * They reject when the connect they joined rejects, as they did when they waited for it.
+   */
+  private readonly handshakeRequests: HandshakeRequest[] = [];
+  /** The socket whose auth frame went out and whose `connected` reply has not come yet, or null. */
+  private authSentSocket: WebSocket | null = null;
   private readonly pendingHistory = new Map<number, PendingHistoryRequest>();
   private readonly pendingFetch = new Map<number, PendingFetchRequest>();
   private readonly channelDispatchers = new Map<string, ChannelDispatchers>();
@@ -866,7 +903,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * rejects with the server's ErrorFrame (wrapped in an Error).
    */
   private async request(frame: AckableFrame): Promise<AckFrame> {
-    await this.ensureConnected();
+    while (this.suspendGate) {
+      await this.suspendGate.promise;
+    }
+    if (this.state !== 'connected') {
+      return this.requestDuringHandshake<AckFrame>(frame, (id, resolve, reject) => this.pending.set(id, { resolve, reject }));
+    }
     const id = this.nextRequestId++;
     const out = { ...frame, id } as ClientFrame;
     return new Promise<AckFrame>((resolve, reject) => {
@@ -881,12 +923,55 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   }
 
   /**
+   * Queue a request while a connect attempt is under way (starting one if needed), to go out
+   * right after the attempt's auth frame. `track` files it where its answer settles it once the
+   * attempt connects. See `handshakeRequests`.
+   */
+  private requestDuringHandshake<T>(
+    frame: AckableFrame | Omit<HistoryFrame, 'id'>,
+    track: (id: number, resolve: (value: T) => void, reject: (error: Error) => void) => void,
+  ): Promise<T> {
+    const out = { ...frame, id: this.nextRequestId++ } as HandshakeRequest['frame'];
+    return new Promise<T>((resolve, reject) => {
+      const queued: HandshakeRequest = { frame: out, track: () => track(out.id, resolve, reject), reject };
+      this.handshakeRequests.push(queued);
+      if (this.authSentSocket !== null && this.authSentSocket === this.socket) {
+        this.sendHandshakeRequest(queued);
+      }
+      this.connect().catch((error: unknown) => {
+        const index = this.handshakeRequests.indexOf(queued);
+        if (index >= 0) {
+          this.handshakeRequests.splice(index, 1);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+    });
+  }
+
+  /**
+   * Send one queued handshake request on the current socket. A socket that already died throws
+   * here: the request stays queued, and the attempt's failure sends it again or rejects it.
+   */
+  private sendHandshakeRequest(queued: HandshakeRequest): void {
+    try {
+      this.sendRaw(queued.frame);
+    } catch {
+      // Left queued on purpose, see above.
+    }
+  }
+
+  /**
    * Send a `hist` frame and resolve with the matching `histRes`, or reject
    * with the server's error. Unlike `request`, history is correlated to a
    * dedicated response frame rather than a bare ack.
    */
   private async requestHistory(frame: Omit<HistoryFrame, 'id'>): Promise<HistoryResponseFrame> {
-    await this.ensureConnected();
+    while (this.suspendGate) {
+      await this.suspendGate.promise;
+    }
+    if (this.state !== 'connected') {
+      return this.requestDuringHandshake<HistoryResponseFrame>(frame, (id, resolve, reject) => this.pendingHistory.set(id, { resolve, reject }));
+    }
     const id = this.nextRequestId++;
     const out = { ...frame, id } as ClientFrame;
     return new Promise<HistoryResponseFrame>((resolve, reject) => {
@@ -1057,18 +1142,29 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // the transport level, not at the protocol level.
     this.attemptReachedTransport = false;
     this.attemptSawFrame = false;
-    // Build the auth frame BEFORE opening the socket. createAuthFrame may await an async
-    // authCallback (a token fetch); if that await straddled socket creation, the WebSocket
-    // could fire 'open' before the listener below was attached — the event would be lost,
-    // the auth frame never sent, and the connection would hang until it was dropped
-    // (surfacing as a 1006 during the handshake). Fetching first removes that window.
+    // Open the socket while createAuthFrame awaits the authCallback (a token fetch): the upgrade
+    // takes several round trips through a CDN, and waiting for the token first paid for both one
+    // after the other. Only the early socket's 'open' time is watched until the token is in hand.
+    // The handshake's listeners attach after that, and the readyState check below sends the auth
+    // frame when 'open' already fired. A socket that closed, or sat open too long for the edge to
+    // still take an auth frame, is replaced by a fresh one (useHandshakeSocket).
+    const authFramePromise = this.createAuthFrame();
+    // Handled below. This only stops an early makeSocket failure leaving it unhandled.
+    authFramePromise.catch(() => {});
+    let earlySocket: EarlySocket | null = null;
     let authFrame: AuthFrame;
     let ws: WebSocket;
     try {
-      authFrame = await this.createAuthFrame();
-      ws = await this.makeSocket();
+      earlySocket = await this.openEarlySocket();
+      authFrame = await authFramePromise;
+      ws = await this.useHandshakeSocket(earlySocket);
+      // Set only now: a token failure is not a transport failure, so it must not move the
+      // client to long-polling (see connect()).
       this.attemptReachedTransport = true;
     } catch (error) {
+      if (earlySocket) {
+        safeClose(earlySocket.socket, 1000, 'auth failed');
+      }
       // No socket exists yet, so no close event will drive the state machine.
       // Mirror handleClose here: mark disconnected and schedule the retry, or a
       // transient token-endpoint failure would wedge the state at `connecting`
@@ -1119,6 +1215,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           ws.send(frameBinaryRecord(encodeClientFrame(authFrame)));
         } catch (err) {
           reject(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
+        // The edge handles these right after the auth frame (see handshakeRequests).
+        this.authSentSocket = ws;
+        for (const queued of this.handshakeRequests) {
+          this.sendHandshakeRequest(queued);
         }
       };
 
@@ -1144,6 +1246,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
             return;
           }
           const connected = parsed as ConnectedFrame;
+          // Their frames went out behind the auth frame, so their acks come from here on,
+          // possibly in this same message (dispatched below).
+          this.authSentSocket = null;
+          for (const queued of this.handshakeRequests.splice(0)) {
+            queued.track();
+          }
           this.connectionId = connected.connectionId;
           this.serverClientId = connected.clientId;
           this.reconnectAttempt = 0;
@@ -1210,6 +1318,38 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         onOpen();
       }
     });
+  }
+
+  /** Open the attempt's socket before the auth frame is ready, noting when it opens. */
+  private async openEarlySocket(): Promise<EarlySocket> {
+    const early: EarlySocket = { socket: await this.makeSocket(), openedAt: null };
+    early.socket.addEventListener(
+      'open',
+      () => {
+        early.openedAt = Date.now();
+      },
+      { once: true },
+    );
+    // Node's `ws` throws on an 'error' event nobody listens to, and the handshake's own error
+    // listener only attaches once the token is in hand. A failure until then shows in the
+    // socket's readyState, and useHandshakeSocket replaces the socket.
+    early.socket.addEventListener('error', () => {});
+    return early;
+  }
+
+  /**
+   * Return the early socket for the handshake, or a fresh socket when it closed while the token
+   * was on its way or has sat open longer than the edge waits for an auth frame.
+   */
+  private async useHandshakeSocket(early: EarlySocket): Promise<WebSocket> {
+    const { socket, openedAt } = early;
+    const isStillOpening = socket.readyState === READY_STATE_CONNECTING;
+    const isFreshlyOpen = socket.readyState === READY_STATE_OPEN && (openedAt === null || Date.now() - openedAt < EARLY_SOCKET_MAX_IDLE_MS);
+    if (isStillOpening || isFreshlyOpen) {
+      return socket;
+    }
+    safeClose(socket, 1000, 'token came too late for this socket');
+    return this.makeSocket();
   }
 
   private async makeSocket(): Promise<WebSocket> {
@@ -1383,6 +1523,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
     this.closedSockets.add(ws);
     this.socket = null;
+    this.authSentSocket = null;
     // Any restore retry scheduled against the dead socket's connection is obsolete:
     // the next reconnect runs a fresh restore pass for every desired subscription.
     this.restoreGeneration += 1;

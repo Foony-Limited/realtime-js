@@ -257,13 +257,15 @@ class SilentWebSocket extends FakeSocketBase {
  */
 function makeFetchLpEdge(): {
   fetchStub: typeof fetch;
-  state: { connectCount: number; killSession: () => void };
+  state: { connectCount: number; killSession: () => void; sentFrames: ClientFrame[] };
 } {
   let sessionDead = false;
   let pending: Buffer[] = [];
   let wake: (() => void) | null = null;
   const state = {
     connectCount: 0,
+    /** Every frame the client sent on /lp/send, in order. */
+    sentFrames: [] as ClientFrame[],
     // Turns every later poll/send into a 410, waking a held poll, the way the
     // real edge sheds a session. A later connect mints a fresh session.
     killSession(): void {
@@ -293,6 +295,7 @@ function makeFetchLpEdge(): {
         return new Response(null, { status: 410 });
       }
       for (const frame of decodeClientRecords(raw)) {
+        state.sentFrames.push(frame);
         if (frame.t === 'ping') {
           deliver({ t: 'pong' });
         } else if ('id' in frame) {
@@ -552,6 +555,27 @@ describe('long-polling transport', () => {
     await connected;
     expect(client.getState()).toBe('connected');
     expect(state.connectCount).toBe(1);
+  });
+
+  it('sends a subscribe made during the WebSocket handshake again over the long-polling fallback', async () => {
+    // The sub went out behind the auth frame on a WebSocket that never answered. The fallback
+    // connection must send it again after its own auth frame, or the channel never attaches.
+    vi.useFakeTimers();
+    cleanups.push(() => vi.useRealTimers());
+    const { fetchStub, state } = makeFetchLpEdge();
+    const client = new Realtime({
+      token: 'T',
+      endpoint: 'https://blackhole.example',
+      webSocket: SilentWebSocket as unknown as typeof WebSocket,
+      fetch: fetchStub,
+    });
+    cleanups.push(() => client.close());
+    const channel = client.channels.get('room:fallback');
+    channel.subscribe(() => {});
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(client.getState()).toBe('connected');
+    expect(channel.state).toBe('attached');
+    expect(state.sentFrames.filter((frame) => frame.t === 'sub' && frame.channel === 'room:fallback')).toHaveLength(1);
   });
 
   it('bounds a forced-websocket handshake instead of hanging in connecting', async () => {

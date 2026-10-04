@@ -3,6 +3,16 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.16.3
+
+### Changed
+
+- **Connecting is faster.** The socket now opens while your `authCallback` is
+  still fetching the token, and channels you attach (and `history()` calls)
+  made while connecting go out right after the auth step instead of after the
+  server's reply. A first page load gets its channel data one round trip
+  sooner, plus the time the token fetch used to add before the socket opened.
+
 ## 0.16.2
 
 ### Fixed

@@ -59,6 +59,14 @@ type Harness = {
   /** Receipt times of every keep-alive ping the edge received. */
   readonly pings: number[];
   /**
+   * What the edge saw and sent, in order: "<connection index>:open" when a socket connects,
+   * "<index>:<frame type>" for each client frame (with the channel for a `sub`, e.g. "1:sub
+   * chat:1"), and "<index>:connected" when it sends the `connected` reply.
+   */
+  readonly frameLog: string[];
+  /** When each socket connected to the edge, by connection index (1 for the first), in ms (Date.now). */
+  readonly openTimes: number[];
+  /**
    * Mutable test controls: drop the next publish/sub before acking (to simulate a socket
    * dying mid-request), and the keepAliveMs the edge advertises in its connected frame.
    */
@@ -80,6 +88,12 @@ type Harness = {
     fetchReply: ((channel: string, fromSerial: number) => { messages: unknown[]; resumed: boolean }) | null;
     /** When set, the connected frame is coalesced with these frames into ONE WebSocket message. */
     coalesceWithConnected: ServerFrame[] | null;
+    /**
+     * When above 0, the edge waits this long (ms) before it answers an auth frame with `connected`,
+     * and holds every frame that arrives meanwhile until then, as the real edge only reads the
+     * frames after auth once the handshake is done.
+     */
+    delayConnectedMs: number;
   };
 };
 
@@ -96,6 +110,8 @@ async function startFakeEdge(): Promise<Harness> {
   const fetchFrames: Harness['fetchFrames'] = [];
   const histFrames: Harness['histFrames'] = [];
   const pings: Harness['pings'] = [];
+  const frameLog: Harness['frameLog'] = [];
+  const openTimes: Harness['openTimes'] = [];
   const control: Harness['control'] = {
     dropNextPublish: false,
     dropNextSub: false,
@@ -108,13 +124,26 @@ async function startFakeEdge(): Promise<Harness> {
     keepAliveMs: 30_000,
     fetchReply: null,
     coalesceWithConnected: null,
+    delayConnectedMs: 0,
   };
   server.on('connection', (socket) => {
     sockets.push(socket);
     let nextConnIndex = sockets.length;
+    openTimes.push(Date.now());
+    frameLog.push(`${nextConnIndex}:open`);
+    /** Frames that arrived while a delayed `connected` reply is pending, handled after it. */
+    let heldFrames: ClientFrame[] | null = null;
     socket.on('message', (raw) => {
       // Every client frame arrives binary (the SDK is a binary connection).
       const frame = decodeClient(raw as Buffer);
+      frameLog.push(`${nextConnIndex}:${frame.t}${frame.t === 'sub' ? ` ${frame.channel}` : ''}`);
+      if (heldFrames) {
+        heldFrames.push(frame);
+        return;
+      }
+      handleClientFrame(frame);
+    });
+    function handleClientFrame(frame: ClientFrame): void {
       if (frame.t === 'auth') {
         const auth = frame as AuthFrame;
         authFrames.push(auth);
@@ -130,10 +159,26 @@ async function startFakeEdge(): Promise<Harness> {
           keepAliveMs: control.keepAliveMs,
           clientId: 'alice',
         };
-        if (control.coalesceWithConnected) {
-          sendCoalesced(socket, [connected, ...control.coalesceWithConnected]);
+        const sendConnected = (): void => {
+          frameLog.push(`${nextConnIndex}:connected`);
+          if (control.coalesceWithConnected) {
+            sendCoalesced(socket, [connected, ...control.coalesceWithConnected]);
+          } else {
+            sendFrame(socket, connected);
+          }
+        };
+        if (control.delayConnectedMs > 0) {
+          heldFrames = [];
+          setTimeout(() => {
+            sendConnected();
+            const held = heldFrames ?? [];
+            heldFrames = null;
+            for (const heldFrame of held) {
+              handleClientFrame(heldFrame);
+            }
+          }, control.delayConnectedMs);
         } else {
-          sendFrame(socket, connected);
+          sendConnected();
         }
         return;
       }
@@ -269,9 +314,9 @@ async function startFakeEdge(): Promise<Harness> {
           sendFrame(socket, evt);
         }
       }
-    });
+    }
   });
-  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, presSubFrames, presFrames, fetchFrames, histFrames, pings, control };
+  return { authFrames, server, endpoint: `ws://127.0.0.1:${address.port}`, sockets, publishFrames, subFrames, presSubFrames, presFrames, fetchFrames, histFrames, pings, frameLog, openTimes, control };
 }
 
 describe('Connection end-to-end (fake edge)', () => {
@@ -952,6 +997,151 @@ describe('Connection end-to-end (fake edge)', () => {
     ]);
     expect(harness.authFrames.map((frame) => frame.token)).toContain('GOOD');
     expect(realtime.getConnectionId()).toBe('conn-1');
+    await realtime.close();
+  });
+
+  it('opens the socket while authCallback is still fetching the token', async () => {
+    // The upgrade takes several round trips through a CDN, so waiting for the token first made
+    // every page load pay for both one after the other.
+    let tokenAt = 0;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: async () => {
+        await delay(150);
+        tokenAt = Date.now();
+        return 'GOOD';
+      },
+    });
+    await realtime.connect();
+    expect(harness.sockets).toHaveLength(1);
+    expect(harness.openTimes[0]).toBeLessThan(tokenAt);
+    expect(harness.authFrames.map((frame) => frame.token)).toEqual(['GOOD']);
+    await realtime.close();
+  });
+
+  it('opens a fresh socket when the token comes later than the edge waits for an auth frame', { timeout: 10_000 }, async () => {
+    // The edge drops a socket that sends no auth frame within 5 s of opening. A token that comes
+    // after 3 s goes out on a new socket instead, as it did before the socket opened early.
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: async () => {
+        await delay(3_300);
+        return 'GOOD';
+      },
+    });
+    await realtime.connect();
+    expect(realtime.getState()).toBe('connected');
+    expect(harness.frameLog).toEqual(['1:open', '2:open', '2:auth', '2:connected']);
+    await realtime.close();
+  });
+
+  it('does not count a failed token fetch as a blocked WebSocket', async () => {
+    // The early socket opened fine, so the transport works. Falling back to long-polling here
+    // would park the client on the slower transport for a token problem.
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      fetch: (async () => {
+        throw new Error('long-polling must not be tried');
+      }) as typeof fetch,
+      authCallback: async () => {
+        await delay(50);
+        throw new Error('token endpoint down');
+      },
+    });
+    await expect(realtime.connect()).rejects.toThrow(/token endpoint down/u);
+    expect(harness.authFrames).toHaveLength(0);
+    await waitFor(() => harness.sockets.every((socket) => socket.readyState === NodeWebSocket.CLOSED), 'the early socket to close');
+    await realtime.close();
+  });
+
+  it('survives an early socket that fails while the token is still on its way', async () => {
+    // Node's `ws` throws on an 'error' event nobody listens to, and the handshake's own error
+    // listener only attaches once the token is in hand.
+    const realtime = new Realtime({
+      endpoint: 'ws://127.0.0.1:1',
+      transport: 'websocket',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: async () => {
+        await delay(200);
+        return 'GOOD';
+      },
+    });
+    await expect(realtime.connect()).rejects.toThrow();
+    await realtime.close();
+  });
+
+  it('sends a subscribe right after the auth frame, before the connected reply', async () => {
+    // The edge reads a connection's frames in order, so a sub behind the auth frame is handled
+    // right after auth. Waiting for `connected` first cost every first page load a round trip.
+    harness.control.delayConnectedMs = 150;
+    harness.control.retainedDoc = { channel: 'db:users-public:alice', data: { username: 'Alice' } };
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const channel = realtime.channels.get('db:users-public:alice');
+    const received: unknown[] = [];
+    channel.subscribe('doc', (message) => received.push(message.data));
+    await waitFor(() => channel.state === 'attached', 'the channel to attach');
+    expect(harness.frameLog).toEqual(['1:open', '1:auth', '1:sub db:users-public:alice', '1:connected']);
+    expect(harness.subFrames).toHaveLength(1);
+    await waitFor(() => received.length === 1, 'the retained doc');
+    expect(received[0]).toEqual({ username: 'Alice' });
+    await realtime.close();
+  });
+
+  it('sends a subscribe made after the auth frame went out without waiting for connected', async () => {
+    harness.control.delayConnectedMs = 200;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const connecting = realtime.connect();
+    await waitFor(() => harness.frameLog.includes('1:auth'), 'the auth frame');
+    const channel = realtime.channels.get('chat:late');
+    channel.subscribe(() => {});
+    await connecting;
+    await waitFor(() => channel.state === 'attached', 'the channel to attach');
+    expect(harness.frameLog).toEqual(['1:open', '1:auth', '1:sub chat:late', '1:connected']);
+    await realtime.close();
+  });
+
+  it('sends a history request right after the auth frame, before the connected reply', async () => {
+    harness.control.delayConnectedMs = 150;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const page = await realtime.channels.get('chat:1').history({ limit: 50 });
+    expect(page.messages.map((message) => message.messageId)).toEqual(['h-0', 'h-1']);
+    expect(harness.frameLog).toEqual(['1:open', '1:auth', '1:hist', '1:connected']);
+    await realtime.close();
+  });
+
+  it('rejects a subscribe made during a handshake the edge refuses, as it did before', async () => {
+    harness.control.delayConnectedMs = 0;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'BAD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+    });
+    const channel = realtime.channels.get('chat:refused');
+    const attach = channel.attach();
+    await expect(attach).rejects.toThrow(/auth failed: 40101/u);
     await realtime.close();
   });
 
