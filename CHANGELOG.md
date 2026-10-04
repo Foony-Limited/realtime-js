@@ -13,6 +13,14 @@ All notable changes to `@foony/realtime`. Format loosely follows
   server's reply. A first page load gets its channel data one round trip
   sooner, plus the time the token fetch used to add before the socket opened.
 
+### Fixed
+
+- **A channel no longer stays in `attaching` after a failed first connect.**
+  If the very first connect failed (for example `authCallback` threw once),
+  channels and presence you had asked for during it were never subscribed
+  when a later connect succeeded, so their data never arrived. They are now
+  subscribed as soon as the connection comes up.
+
 ## 0.16.2
 
 ### Fixed

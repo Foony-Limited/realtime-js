@@ -400,6 +400,11 @@ type HandshakeRequest = {
   readonly reject: (error: Error) => void;
 };
 
+/** Names a queued handshake request by frame type and channel (e.g. "sub chat:room-1"). */
+function handshakeKey(frame: ClientFrame): string {
+  return `${frame.t} ${'channel' in frame ? frame.channel : ''}`;
+}
+
 /** A socket opened while `authCallback` runs, and when it opened (null until it does). */
 type EarlySocket = {
   readonly socket: WebSocket;
@@ -640,6 +645,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   private reconnectAttempt = 0;
   /** True once the first handshake has completed, so we can tell a reconnect from the first connect. */
   private hasConnectedBefore = false;
+  /**
+   * True when a failed connect attempt rejected a request (an attach, a presence call) before the
+   * first handshake completed. The first connect then restores what the app asked for, as a
+   * reconnect does: nothing else would send those again, and their channels would wait forever.
+   */
+  private droppedBeforeFirstConnect = false;
   /**
    * Set when a handshake fails with an auth error we cannot recover from (a bad
    * or expired credential with no `authCallback` to re-mint). The pending socket
@@ -942,6 +953,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
         const index = this.handshakeRequests.indexOf(queued);
         if (index >= 0) {
           this.handshakeRequests.splice(index, 1);
+          if (!this.hasConnectedBefore) {
+            this.droppedBeforeFirstConnect = true;
+          }
           reject(error instanceof Error ? error : new Error(String(error)));
         }
       });
@@ -1249,8 +1263,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           // Their frames went out behind the auth frame, so their acks come from here on,
           // possibly in this same message (dispatched below).
           this.authSentSocket = null;
+          const inFlight = new Set<string>();
           for (const queued of this.handshakeRequests.splice(0)) {
             queued.track();
+            inFlight.add(handshakeKey(queued.frame));
           }
           this.connectionId = connected.connectionId;
           this.serverClientId = connected.clientId;
@@ -1274,7 +1290,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
           }
           const isReconnect = this.hasConnectedBefore;
           this.hasConnectedBefore = true;
-          this.restoreSubscriptionsOnReconnect(isReconnect);
+          this.restoreSubscriptionsOnReconnect(isReconnect, inFlight);
           this.flushOutstandingPublishes();
         } else if (parsed.t === 'err') {
           const errFrame = parsed as ErrorFrame;
@@ -1593,27 +1609,40 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }, delay);
   }
 
-  private restoreSubscriptionsOnReconnect(isReconnect: boolean): void {
-    // Only on an actual reconnect. On the first connect the app's own attach()
-    // and presence calls have their frames in flight already (their requests
-    // await connect()), so restoring here would send duplicate subs, and the
-    // duplicate's ack would surface as a spurious `update` on the channel.
-    if (!isReconnect) {
+  /**
+   * Re-send what the app has asked for: subs, presence watchers and presence entries. Runs on a
+   * reconnect, and on a first connect after a failed attempt dropped requests
+   * (`droppedBeforeFirstConnect`). On a first connect the app's own attach() and presence calls
+   * have their frames in flight already, and a duplicate's ack would surface as a spurious
+   * `update` on the channel, so a plain first connect restores nothing, and the one after a
+   * failed attempt skips what is already queued behind its auth frame (`inFlight`, keyed by
+   * handshakeKey).
+   */
+  private restoreSubscriptionsOnReconnect(isReconnect: boolean, inFlight: ReadonlySet<string>): void {
+    if (!isReconnect && !this.droppedBeforeFirstConnect) {
       return;
     }
+    this.droppedBeforeFirstConnect = false;
+    const isWanted = (frameType: string, channel: string): boolean => isReconnect || !inFlight.has(`${frameType} ${channel}`);
     // Re-issue a `sub` for every remembered channel, carrying its resume cursor so the
     // server replays whatever was published during the disconnect, then report the
     // resume outcome (replayed vs discontinuity) back to the channel.
     for (const channel of this.desiredSubscriptions) {
-      this.restoreSubscription(channel, 0);
+      if (isWanted('sub', channel)) {
+        this.restoreSubscription(channel, 0);
+      }
     }
     // Re-open presence watchers for channels the app is watching presence on.
     for (const channel of this.desiredPresence) {
-      this.request({ t: 'presSub', channel }).catch(() => {});
+      if (isWanted('presSub', channel)) {
+        this.request({ t: 'presSub', channel }).catch(() => {});
+      }
     }
     // Re-announce presence membership: each channel re-enters whatever it had entered.
-    for (const dispatchers of this.channelDispatchers.values()) {
-      dispatchers.reenterPresence();
+    for (const [channel, dispatchers] of this.channelDispatchers) {
+      if (isWanted('pres', channel)) {
+        dispatchers.reenterPresence();
+      }
     }
   }
 

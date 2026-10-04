@@ -1183,6 +1183,54 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('attaches a channel subscribed while the very first connect failed, once a connect succeeds', async () => {
+    // The failed attempt fails the channel's attach. Nothing restored it, because the restore
+    // pass only ran on a reconnect, and the next successful connect still counted as the first:
+    // the channel sat in `attaching` and its data never came, until a page reload.
+    let calls = 0;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error('token endpoint blip');
+        }
+        return 'GOOD';
+      },
+    });
+    const channel = realtime.channels.get('chat:first');
+    channel.subscribe(() => {});
+    await waitFor(() => channel.state === 'attached', 'the channel to attach after the failed first connect');
+    expect(harness.subFrames.filter((sub) => sub.channel === 'chat:first')).toHaveLength(1);
+    await realtime.close();
+  });
+
+  it('watches presence asked for while the very first connect failed, once a connect succeeds', async () => {
+    let calls = 0;
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      initialReconnectDelayMs: 10,
+      maxReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      authCallback: async () => {
+        calls += 1;
+        if (calls === 1) {
+          throw new Error('token endpoint blip');
+        }
+        return 'GOOD';
+      },
+    });
+    const channel = realtime.channels.get('chat:presence-first');
+    channel.presence.subscribe(() => {});
+    await waitFor(() => harness.presSubFrames.some((frame) => frame.channel === 'chat:presence-first'), 'the presence watch');
+    await delay(50);
+    expect(harness.presSubFrames.filter((frame) => frame.channel === 'chat:presence-first')).toHaveLength(1);
+    await realtime.close();
+  });
+
   it('does not request presence when a channel is only used for messages', async () => {
     const realtime = new Realtime({
       endpoint: harness.endpoint,
