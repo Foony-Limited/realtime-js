@@ -3,6 +3,16 @@
 All notable changes to `@foony/realtime`. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com). Versions are semver.
 
+## 0.16.4
+
+### Fixed
+
+- **`earlySocket`: a slow page load no longer delays the connect.** When your
+  page's socket has already closed or has been open for 3 seconds or more by
+  the time the SDK starts, the SDK now opens its own socket while your
+  `authCallback` fetches the token. Before, it opened that socket only after
+  the token came back.
+
 ## 0.16.3
 
 ### Added

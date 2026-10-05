@@ -585,6 +585,17 @@ function serverError(code: number, message: string): Error & { code: number } {
 }
 
 /**
+ * Whether an early socket can still carry the handshake: it is still opening, or it opened less
+ * than {@link EARLY_SOCKET_MAX_IDLE_MS} ago. A closed socket, or one the edge is about to drop for
+ * sending no auth frame, cannot.
+ */
+function canTakeAuthFrame({ socket, openedAt }: EarlySocket): boolean {
+  const isStillOpening = socket.readyState === READY_STATE_CONNECTING;
+  const isFreshlyOpen = socket.readyState === READY_STATE_OPEN && (openedAt === null || Date.now() - openedAt < EARLY_SOCKET_MAX_IDLE_MS);
+  return isStillOpening || isFreshlyOpen;
+}
+
+/**
  * Close a socket without ever throwing. `WebSocket.close()` throws synchronously
  * on a reserved/invalid code, and in a message-event listener that throw escapes
  * to `process.nextTick` and kills the process. We never want a teardown to crash
@@ -1390,7 +1401,9 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
   /**
    * Hand out the page's own socket (`options.earlySocket`) once, so only the first attempt can
    * use it. A connection on long-polling closes it instead: it would never get an auth frame, and
-   * the edge would hold it until its auth deadline.
+   * the edge would hold it until its auth deadline. A page socket that is already of no use (a
+   * slow page load outlived it) is closed here too, so the attempt dials its own socket next to
+   * the token fetch and not after it.
    */
   private takePageSocket(): EarlySocket | null {
     const pageSocket = this.pageSocket;
@@ -1400,6 +1413,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     }
     if (this.activeTransport === 'long-polling') {
       safeClose(pageSocket.socket, 1000, 'connecting over long-polling');
+      return null;
+    }
+    if (!canTakeAuthFrame(pageSocket)) {
+      safeClose(pageSocket.socket, 1000, 'page socket closed or too old');
       return null;
     }
     // The same setting makeSocket gives its sockets, so handleMessage gets ArrayBuffers.
@@ -1412,13 +1429,10 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * was on its way or has sat open longer than the edge waits for an auth frame.
    */
   private async useHandshakeSocket(early: EarlySocket): Promise<WebSocket> {
-    const { socket, openedAt } = early;
-    const isStillOpening = socket.readyState === READY_STATE_CONNECTING;
-    const isFreshlyOpen = socket.readyState === READY_STATE_OPEN && (openedAt === null || Date.now() - openedAt < EARLY_SOCKET_MAX_IDLE_MS);
-    if (isStillOpening || isFreshlyOpen) {
-      return socket;
+    if (canTakeAuthFrame(early)) {
+      return early.socket;
     }
-    safeClose(socket, 1000, 'token came too late for this socket');
+    safeClose(early.socket, 1000, 'token came too late for this socket');
     return this.makeSocket();
   }
 

@@ -1149,6 +1149,48 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('dials the fresh socket during the token fetch when the page socket has already closed', async () => {
+    // A slow page load can outlive the page socket. Finding that out only once the token is in
+    // hand would put the dial after the token fetch instead of next to it.
+    const socket = new NodeWebSocket(harness.endpoint);
+    await waitFor(() => socket.readyState === NodeWebSocket.OPEN, 'the page socket to open');
+    const openedAt = Date.now();
+    socket.close();
+    await waitFor(() => socket.readyState === NodeWebSocket.CLOSED, 'the page socket to close');
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt },
+      authCallback: async () => {
+        await waitFor(() => harness.frameLog.includes('2:open'), 'the fresh socket to open while the closed page socket waits for a token');
+        return 'GOOD';
+      },
+    });
+    await realtime.connect();
+    expect(harness.frameLog).toEqual(['1:open', '2:open', '2:auth', '2:connected']);
+    await realtime.close();
+  });
+
+  it('dials the fresh socket during the token fetch when the page socket has sat open too long', async () => {
+    const socket = new NodeWebSocket(harness.endpoint);
+    await waitFor(() => socket.readyState === NodeWebSocket.OPEN, 'the page socket to open');
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt: Date.now() - 3_300 },
+      authCallback: async () => {
+        await waitFor(() => harness.frameLog.includes('2:open'), 'the fresh socket to open while the old page socket waits for a token');
+        return 'GOOD';
+      },
+    });
+    await realtime.connect();
+    expect(harness.frameLog).toEqual(['1:open', '2:open', '2:auth', '2:connected']);
+    await waitFor(() => socket.readyState === NodeWebSocket.CLOSED, 'the old page socket to close');
+    await realtime.close();
+  });
+
   it('dials its own socket on a reconnect after taking over the page socket', async () => {
     const socket = new NodeWebSocket(harness.endpoint);
     const realtime = new Realtime({
