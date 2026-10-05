@@ -260,6 +260,29 @@ export type ConnectionOptions = {
    */
   readonly webSocket?: typeof WebSocket;
   /**
+   * A WebSocket to `endpoint` that the page opened before the SDK loaded, for example from an
+   * inline script in its HTML. The first connect takes it over instead of opening its own, so
+   * the socket opens while the SDK is still downloading. Set `openedAt` to `Date.now()` in the
+   * socket's 'open' handler and leave it `null` until then. The SDK reads it when it connects,
+   * so pass the same object the handler updates.
+   *
+   * The SDK opens its own socket instead when this one has closed or has been open for 3 seconds
+   * or more, because the edge closes a socket that sends no auth frame within 5 seconds. It
+   * closes this one when the connection starts on long-polling.
+   *
+   * @example
+   * ```ts
+   * // In an inline script in the page's HTML:
+   * const earlySocket = { socket: new WebSocket('wss://realtime.foony.io'), openedAt: null };
+   * earlySocket.socket.onopen = () => {
+   *   earlySocket.openedAt = Date.now();
+   * };
+   * // Later, when the SDK has loaded:
+   * const realtime = new Realtime({ authCallback, earlySocket });
+   * ```
+   */
+  readonly earlySocket?: EarlySocket;
+  /**
    * Which transport to use. `'auto'` (the default) connects over WebSocket
    * and falls back to HTTP long-polling when the WebSocket cannot be
    * established (for example a proxy that blocks upgrades). The client stays
@@ -405,9 +428,14 @@ function handshakeKey(frame: ClientFrame): string {
   return `${frame.t} ${'channel' in frame ? frame.channel : ''}`;
 }
 
-/** A socket opened while `authCallback` runs, and when it opened (null until it does). */
-type EarlySocket = {
+/**
+ * A socket opened before its auth frame is ready, and when it opened (`Date.now()`, null until it
+ * does): the SDK's own while `authCallback` runs, or the page's (`ConnectionOptions.earlySocket`).
+ */
+export type EarlySocket = {
+  /** The socket, open or still connecting, with no frame sent on it yet. */
   readonly socket: WebSocket;
+  /** When the socket's 'open' event fired, as `Date.now()` in ms. Null until it fires. */
   openedAt: number | null;
 };
 
@@ -687,6 +715,8 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
    * page load instead of restarting from "try WebSocket" every time.
    */
   private lastWebSocketFailureAt = 0;
+  /** The page's own socket (`options.earlySocket`) until the first connect attempt takes it. */
+  private pageSocket: EarlySocket | null;
   /** True once the current connect attempt created its socket (a transport was actually tried). */
   private attemptReachedTransport = false;
   /** True once the current connect attempt received any server frame (the transport works). */
@@ -706,6 +736,7 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
       throw new Error('Connection: pass exactly one of options.token, options.authCallback, or options.key');
     }
     this.options = options;
+    this.pageSocket = options.earlySocket ?? null;
     if (options.transport === 'long-polling') {
       this.activeTransport = 'long-polling';
       return;
@@ -1336,9 +1367,12 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     });
   }
 
-  /** Open the attempt's socket before the auth frame is ready, noting when it opens. */
+  /**
+   * Get the attempt's socket before the auth frame is ready, noting when it opens: the page's own
+   * socket on the first attempt, or else a new one.
+   */
   private async openEarlySocket(): Promise<EarlySocket> {
-    const early: EarlySocket = { socket: await this.makeSocket(), openedAt: null };
+    const early: EarlySocket = this.takePageSocket() ?? { socket: await this.makeSocket(), openedAt: null };
     early.socket.addEventListener(
       'open',
       () => {
@@ -1351,6 +1385,26 @@ export class Connection extends TypedEventEmitter<ConnectionEventType, Connectio
     // socket's readyState, and useHandshakeSocket replaces the socket.
     early.socket.addEventListener('error', () => {});
     return early;
+  }
+
+  /**
+   * Hand out the page's own socket (`options.earlySocket`) once, so only the first attempt can
+   * use it. A connection on long-polling closes it instead: it would never get an auth frame, and
+   * the edge would hold it until its auth deadline.
+   */
+  private takePageSocket(): EarlySocket | null {
+    const pageSocket = this.pageSocket;
+    this.pageSocket = null;
+    if (!pageSocket) {
+      return null;
+    }
+    if (this.activeTransport === 'long-polling') {
+      safeClose(pageSocket.socket, 1000, 'connecting over long-polling');
+      return null;
+    }
+    // The same setting makeSocket gives its sockets, so handleMessage gets ArrayBuffers.
+    pageSocket.socket.binaryType = 'arraybuffer';
+    return pageSocket;
   }
 
   /**

@@ -72,6 +72,7 @@ export {
   type ConnectionOptions,
   type ConnectionState,
   type ConnectionStateListener,
+  type EarlySocket,
   type EventEmitter,
   type EventUnsubscribeFn,
   type MessageListener,

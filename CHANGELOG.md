@@ -5,6 +5,28 @@ All notable changes to `@foony/realtime`. Format loosely follows
 
 ## 0.16.3
 
+### Added
+
+- **`earlySocket` option: connect with a socket your page already opened.**
+  Open the WebSocket from an inline script in your HTML, and the first connect
+  takes it over instead of opening its own. The socket then opens while the SDK
+  is still downloading. The SDK opens its own socket if yours has closed or has
+  been open for 3 seconds or more.
+
+  ```html
+  <script>
+    const socket = new WebSocket('wss://realtime.foony.io');
+    window.earlySocket = { socket, openedAt: null };
+    socket.onopen = () => {
+      window.earlySocket.openedAt = Date.now();
+    };
+  </script>
+  ```
+
+  ```ts
+  const realtime = new Realtime({ authCallback, earlySocket: window.earlySocket });
+  ```
+
 ### Changed
 
 - **Connecting is faster.** The socket now opens while your `authCallback` is

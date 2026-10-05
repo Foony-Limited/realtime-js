@@ -1077,6 +1077,115 @@ describe('Connection end-to-end (fake edge)', () => {
     await realtime.close();
   });
 
+  it('takes over a socket the page opened before the SDK loaded', async () => {
+    // A page can open the socket from its HTML, so the upgrade's round trips overlap the script
+    // download instead of starting after it.
+    const socket = new NodeWebSocket(harness.endpoint);
+    const earlySocket = { socket: socket as unknown as WebSocket, openedAt: null as number | null };
+    socket.once('open', () => {
+      earlySocket.openedAt = Date.now();
+    });
+    await waitFor(() => earlySocket.openedAt !== null, 'the page socket to open');
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket,
+    });
+    await realtime.connect();
+    expect(realtime.getState()).toBe('connected');
+    expect(harness.frameLog).toEqual(['1:open', '1:auth', '1:connected']);
+    await realtime.close();
+  });
+
+  it('takes over a page socket that is still opening', async () => {
+    const socket = new NodeWebSocket(harness.endpoint);
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt: null },
+    });
+    await realtime.connect();
+    expect(harness.frameLog).toEqual(['1:open', '1:auth', '1:connected']);
+    await realtime.close();
+  });
+
+  it('opens a fresh socket when the page socket has sat open too long', async () => {
+    // The edge drops a socket that sends no auth frame within 5 s of opening, so an old page
+    // socket is replaced the same way as an old socket of the SDK's own.
+    const socket = new NodeWebSocket(harness.endpoint);
+    await waitFor(() => socket.readyState === NodeWebSocket.OPEN, 'the page socket to open');
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt: Date.now() - 3_300 },
+    });
+    await realtime.connect();
+    expect(harness.frameLog).toEqual(['1:open', '2:open', '2:auth', '2:connected']);
+    await waitFor(() => socket.readyState === NodeWebSocket.CLOSED, 'the page socket to close');
+    await realtime.close();
+  });
+
+  it('opens a fresh socket when the page socket has already closed', async () => {
+    const socket = new NodeWebSocket(harness.endpoint);
+    await waitFor(() => socket.readyState === NodeWebSocket.OPEN, 'the page socket to open');
+    const openedAt = Date.now();
+    socket.close();
+    await waitFor(() => socket.readyState === NodeWebSocket.CLOSED, 'the page socket to close');
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      autoReconnect: false,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt },
+    });
+    await realtime.connect();
+    expect(harness.frameLog).toEqual(['1:open', '2:open', '2:auth', '2:connected']);
+    await realtime.close();
+  });
+
+  it('dials its own socket on a reconnect after taking over the page socket', async () => {
+    const socket = new NodeWebSocket(harness.endpoint);
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      initialReconnectDelayMs: 10,
+      webSocket: NodeWebSocket as unknown as typeof WebSocket,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt: null },
+    });
+    await realtime.connect();
+    harness.sockets[0].terminate();
+    await waitFor(() => harness.frameLog.includes('2:connected'), 'the reconnect');
+    expect(harness.frameLog).toEqual(['1:open', '1:auth', '1:connected', '2:open', '2:auth', '2:connected']);
+    await realtime.close();
+  });
+
+  it('closes the page socket when the connection uses long-polling', async () => {
+    // A client that starts on long-polling never sends an auth frame on the page socket, so
+    // closing it frees the edge at once instead of after its 5 s auth deadline.
+    const socket = new NodeWebSocket(harness.endpoint);
+    await waitFor(() => socket.readyState === NodeWebSocket.OPEN, 'the page socket to open');
+    const realtime = new Realtime({
+      endpoint: harness.endpoint,
+      token: 'GOOD',
+      transport: 'long-polling',
+      autoReconnect: false,
+      fetch: (async () => {
+        throw new Error('no long-polling edge in this test');
+      }) as typeof fetch,
+      earlySocket: { socket: socket as unknown as WebSocket, openedAt: Date.now() },
+    });
+    await expect(realtime.connect()).rejects.toThrow();
+    await waitFor(() => socket.readyState === NodeWebSocket.CLOSED, 'the page socket to close');
+    expect(harness.authFrames).toHaveLength(0);
+    await realtime.close();
+  });
+
   it('sends a subscribe right after the auth frame, before the connected reply', async () => {
     // The edge reads a connection's frames in order, so a sub behind the auth frame is handled
     // right after auth. Waiting for `connected` first cost every first page load a round trip.
